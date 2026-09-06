@@ -83,12 +83,13 @@ function scannerExecutionCosts(
 }
 
 export async function prewarmScannerExecutionMints(mints: readonly string[]): Promise<void> {
-  if (!CONFIG.botWalletAddress || mints.length === 0) return;
+  const walletAddress = CONFIG.botWalletAddress;
+  if (!walletAddress || mints.length === 0) return;
   await runScannerRpc(
     'scanner.prefilter.prewarmExecutionMints',
     () => preloadExecutionPreflight(
       scannerPolicyConnection,
-      new PublicKey(CONFIG.botWalletAddress),
+      new PublicKey(walletAddress),
       [MINTS.USDC, ...mints],
     ),
     'HIGH',
