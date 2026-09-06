@@ -4,6 +4,7 @@ import { isFullFillQuote, type Quote, type QuoteProviderName } from '../aggregat
 import { CONFIG, DECIMALS, LAMPORTS_PER_SOL, MINTS } from '../config.js';
 import { fromAtomic } from '../math.js';
 import { calculateEstimatedRoundTripProfit, type EstimatedCostInput } from '../profit.js';
+import { runScannerRpc } from '../scanner-rpc-limiter.js';
 import {
   categorizeProfit,
   classifyRoute,
@@ -49,7 +50,10 @@ export interface ExecutablePrefilterResult {
 
 // Scanner-side policy reads use the scanner RPC. The isolated executor keeps
 // its own dedicated connection and repeats every execution-authorizing check.
-const scannerPolicyConnection = new Connection(CONFIG.rpcUrl, 'confirmed');
+const scannerPolicyConnection = new Connection(CONFIG.rpcUrl, {
+  commitment: 'confirmed',
+  disableRetryOnRateLimit: true,
+});
 
 function poolOverlap(a: Quote, b: Quote): boolean | null {
   const aPools = new Set(a.poolIds);
@@ -80,10 +84,14 @@ function scannerExecutionCosts(
 
 export async function prewarmScannerExecutionMints(mints: readonly string[]): Promise<void> {
   if (!CONFIG.botWalletAddress || mints.length === 0) return;
-  await preloadExecutionPreflight(
-    scannerPolicyConnection,
-    new PublicKey(CONFIG.botWalletAddress),
-    [MINTS.USDC, ...mints],
+  await runScannerRpc(
+    'scanner.prefilter.prewarmExecutionMints',
+    () => preloadExecutionPreflight(
+      scannerPolicyConnection,
+      new PublicKey(CONFIG.botWalletAddress),
+      [MINTS.USDC, ...mints],
+    ),
+    'HIGH',
   );
 }
 
@@ -96,10 +104,14 @@ async function classifyIntermediate(mint: string): Promise<{
     status: 'REJECTED', rentLamports: 0, reason: 'BOT_WALLET_ADDRESS is required for executable prefiltering',
   };
   const wallet = new PublicKey(CONFIG.botWalletAddress);
-  const [analysis, ata] = await Promise.all([
-    getCachedExecutionMintAnalysis(scannerPolicyConnection, mint),
-    getCachedExecutionAta(scannerPolicyConnection, wallet, mint),
-  ]);
+  const [analysis, ata] = await runScannerRpc(
+    `scanner.prefilter.tokenPolicy.${mint}`,
+    () => Promise.all([
+      getCachedExecutionMintAnalysis(scannerPolicyConnection, mint),
+      getCachedExecutionAta(scannerPolicyConnection, wallet, mint),
+    ]),
+    'HIGH',
+  );
   if (analysis.programId === TOKEN_2022_PROGRAM_ID.toBase58()) {
     return { status: 'TOKEN_2022', rentLamports: ata.creationRentLamports };
   }
