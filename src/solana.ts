@@ -8,24 +8,15 @@ import {
   DECIMALS,
 } from './config.js';
 import { log } from './logger.js';
+import { runScannerRpc } from './scanner-rpc-limiter.js';
 
 /**
  * Read-only Solana RPC access via the official @solana/kit SDK.
  *
- * We use the RPC for two harmless, read-only things:
- *   1. A connectivity/health check (getSlot).
- *   2. ESTIMATING a realistic network fee from recent prioritization fees.
- *
- * LIMITATION (Issue 1): The fee returned by estimateNetworkFeeLamports() is
- * an ESTIMATE only.  The exact network fee of an eventual two-swap
- * transaction depends on:
- *   - The actual compute units consumed (varies per route/pool)
- *   - The priority fee bid at submission time
- *   - The number of signatures in the transaction
- * Determining the exact fee would require constructing and simulating the
- * actual transaction, which this read-only scanner deliberately does not do.
- *
- * We never build, sign, simulate-for-submission, or submit a transaction.
+ * Scanner-side RPC work is admitted through one adaptive limiter so Orca,
+ * Meteora, wallet/discovery reads, and fee sampling cannot independently
+ * overload the same public endpoint. The isolated executor has its own RPC and
+ * does not use this module-level limiter.
  */
 
 const solanaRpcs = CONFIG.rpcUrls.map((url) => createSolanaRpc(mainnet(url)));
@@ -49,7 +40,11 @@ export async function checkRpc(): Promise<bigint> {
     const index = (activeRpcIndex + offset) % solanaRpcs.length;
     try {
       recordRpcRequests();
-      const slot = await solanaRpcs[index]!.getSlot().send();
+      const slot = await runScannerRpc(
+        `scanner.health.getSlot.${index}`,
+        () => solanaRpcs[index]!.getSlot().send(),
+        'LOW',
+      );
       if (index !== activeRpcIndex) rpcMetrics.failovers++;
       activeRpcIndex = index;
       solanaRpc = solanaRpcs[index]!;
@@ -69,11 +64,18 @@ export async function verifyCanonicalTokenMints(): Promise<void> {
     { symbol: 'SOL/WSOL', mint: CONFIG.scanTokens.includes('SOL') ? MINTS.SOL : '', decimals: DECIMALS.SOL },
     { symbol: 'USDT', mint: CONFIG.scanTokens.includes('USDT') ? MINTS.USDT : '', decimals: DECIMALS.USDT },
   ].filter((token) => token.mint !== '');
-  const connection = new Connection(rpcMetrics.activeEndpoint, 'confirmed');
+  const connection = new Connection(rpcMetrics.activeEndpoint, {
+    commitment: 'confirmed',
+    disableRetryOnRateLimit: true,
+  });
   recordRpcRequests();
-  const accounts = await connection.getMultipleAccountsInfo(
-    expected.map((token) => new PublicKey(token.mint)),
-    'confirmed',
+  const accounts = await runScannerRpc(
+    'scanner.bootstrap.verifyCanonicalTokenMints',
+    () => connection.getMultipleAccountsInfo(
+      expected.map((token) => new PublicKey(token.mint)),
+      'confirmed',
+    ),
+    'HIGH',
   );
   expected.forEach((token, index) => {
     const account = accounts[index];
@@ -89,12 +91,9 @@ export async function verifyCanonicalTokenMints(): Promise<void> {
  * ESTIMATE the lamports a two-swap arb transaction would cost.
  *
  * Formula: base signature fee + (priority fee per CU × assumed CUs).
- *
- * This is an ESTIMATE for profitability math only — the scanner never
- * actually pays any fee.  The estimate uses the median of recent
- * prioritization fees from the RPC (or a configured fallback).
- *
- * @returns Estimated fee in lamports (NOT exact — see module-level docs).
+ * Scanner fee sampling is intentionally LOW priority; when the scanner RPC is
+ * saturated the configured conservative fallback is preferable to delaying an
+ * executable-candidate policy read.
  */
 export async function estimateNetworkFeeLamports(): Promise<number> {
   return (await estimateNetworkFeeBreakdown()).totalLamports;
@@ -111,12 +110,15 @@ export async function estimateNetworkFeeBreakdown(): Promise<EstimatedNetworkFee
 
   try {
     recordRpcRequests();
-    const recent = await solanaRpc.getRecentPrioritizationFees().send();
+    const recent = await runScannerRpc(
+      'scanner.fees.getRecentPrioritizationFees',
+      () => solanaRpc.getRecentPrioritizationFees().send(),
+      'LOW',
+    );
     const fees = recent
       .map((r) => Number(r.prioritizationFee))
       .filter((n) => Number.isFinite(n) && n > 0);
     if (fees.length > 0) {
-      // Median is more robust than the mean against spikes.
       fees.sort((a, b) => a - b);
       const mid = Math.floor(fees.length / 2);
       const median =
