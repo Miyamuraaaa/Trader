@@ -96,6 +96,12 @@ export async function getQuotesFromProviders(
   params: QuoteParams,
 ): Promise<ProviderQuoteResult[]> {
   const settled = await Promise.allSettled(providers.map(async (provider) => {
+    // A provider already in cooldown cannot contribute a fresh discovery quote.
+    // Skip it before pair discovery so one degraded direct provider cannot hold
+    // the entire five-provider first-leg Promise.allSettled open.
+    if (provider.isRateLimited()) {
+      throw new Error(`${provider.name} provider is cooling down`);
+    }
     if (!await provider.supportsPair(params.inputMint, params.outputMint)) {
       throw new Error(`${provider.name} does not support this pair`);
     }
@@ -108,9 +114,11 @@ export async function getQuotesFromProviders(
       return { provider: provider.name, quote: result.value };
     }
     const error = result.reason instanceof Error ? result.reason : new Error(String(result.reason));
-    log.warn(`${provider.name} quote unavailable; continuing with other providers`, {
-      reason: error.message,
-    });
+    const expectedBackpressure = /cooling down|scanner rpc backpressure/i.test(error.message);
+    (expectedBackpressure ? log.debug : log.warn)(
+      `${provider.name} quote unavailable; continuing with other providers`,
+      { reason: error.message },
+    );
     return { provider: provider.name, error };
   });
 }
