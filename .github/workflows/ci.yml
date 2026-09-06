@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  # CI is always non-live and must not inherit generic runner MODE values.
+  EXECUTION_MODE: paper
+  # Keep the fixture below the absolute cap so the allocation test exercises
+  # MAX_TRADE_PERCENT rather than being pre-empted by MAX_TRADE_USDC.
+  MAX_TRADE_USDC: 1
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        id: test
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          # Production rejects Unix signer files broader than chmod 600. Make
+          # temporary test keypairs inherit the same secure permission policy.
+          umask 077
+          npm test -- --reporter=verbose 2>&1 | tee test-output.log
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.log
+
+      - name: Fail if tests failed
+        if: steps.test.outcome == 'failure'
+        run: exit 1
+
+      - name: Build
+        run: npm run build

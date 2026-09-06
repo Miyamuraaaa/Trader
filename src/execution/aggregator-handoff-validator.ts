@@ -41,6 +41,7 @@ import {
 import { createExecutionConnection } from './execution-connection.js';
 import { ExecutionNetworkProfiler } from './network-profiler.js';
 import { executionQuoteAgeLimit } from './quote-freshness.js';
+import { compareExecutionRouteAlignment } from './execution-route-alignment.js';
 
 export interface AggregatorHandoffValidationResult {
   candidate: AggregatorAtomicHandoff;
@@ -54,7 +55,6 @@ export interface AggregatorHandoffValidationResult {
   signed?: LocallySignedExecution;
   approvedSignedExecution?: ApprovedSignedExecution;
 }
-
 
 function reject(
   base: Pick<AggregatorHandoffValidationResult, 'candidate' | 'identity'>,
@@ -78,7 +78,7 @@ export async function validateAggregatorHandoffForApproval(
   const identity = aggregatorHandoffIdentity(candidate);
   const base = { candidate, identity };
   const journal = options.journal ?? new PersistentExecutionJournal();
-  // Keep the request-level trace even when a route fails.  A positive
+  // Keep the request-level trace even when a route fails. A positive
   // candidate that expires is actionable only when we can distinguish a slow
   // provider build from a slow execution RPC or a local construction issue.
   let profiler: ExecutionNetworkProfiler | undefined;
@@ -109,7 +109,7 @@ export async function validateAggregatorHandoffForApproval(
       || candidate.outputMint !== MINTS.USDC) {
       throw new Error('Aggregator executor requires a complete USDC -> intermediate -> USDC cycle');
     }
-    let inputAmount = BigInt(candidate.proposedInputAmount);
+    const inputAmount = BigInt(candidate.proposedInputAmount);
     const cap = BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC));
     if (inputAmount > cap) throw new Error('Candidate exceeds FIRST_LIVE_MAX_INPUT_USDC');
     const signer = options.signer ?? await loadDedicatedSigner('dry-run');
@@ -166,13 +166,20 @@ export async function validateAggregatorHandoffForApproval(
         ? candidate.scannerPools[0]
         : candidate.providers[1] === 'orca' ? candidate.scannerPools[1] : undefined,
     });
+    const routeAlignment = compareExecutionRouteAlignment(candidate, plan);
     logExecutionStage(identity, 'BUILD_END', candidate.detectedAt, {
       freshnessEvidenceAt: plan.quoteReceivedAt,
       freshnessEvidenceAtIso: new Date(plan.quoteReceivedAt).toISOString(),
       quoteAgeMs: Date.now() - plan.quoteReceivedAt, type: plan.type,
       freshnessLimitMs: executionQuoteAgeLimit(plan),
       networkRequests: profiler.timings,
+      routeAlignment: routeAlignment.code,
+      scannerPools: routeAlignment.scannerPools,
+      executorPools: routeAlignment.executorPools,
     });
+    if (!routeAlignment.passed) {
+      throw new Error(`${routeAlignment.code}: ${routeAlignment.reason}`);
+    }
     await transition('INSPECTING');
     const inspection = inspectAtomicTransaction(plan);
     if (!inspection.passed) throw new Error(`Aggregator inspection failed: ${inspection.reasons.join('; ')}`);

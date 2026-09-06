@@ -6,7 +6,7 @@ export type ExecutionRejectionCategory =
   | 'SLIPPAGE_MOVED' | 'SIMULATION_FAILED' | 'INSUFFICIENT_BALANCE'
   | 'UNSUPPORTED_ROUTE' | 'TOKEN_POLICY' | 'TRANSACTION_TOO_LARGE'
   | 'COMPUTE_LIMIT' | 'RPC_TIMEOUT' | 'JOURNAL_BLOCKED' | 'STARTUP_FAILURE'
-  | 'VALIDATION_FAILED';
+  | 'ROUTE_DIVERGED' | 'VALIDATION_FAILED';
 
 export interface LatestExecutionStage {
   stage: string;
@@ -75,6 +75,9 @@ export function classifyExecutionRejection(reason: string): ExecutionRejectionCa
   if (/timeout|HTTP 429|rate limit|ECONN|fetch failed/i.test(reason)) return 'RPC_TIMEOUT';
   if (/journal|lock|reconciliation|duplicate/i.test(reason)) return 'JOURNAL_BLOCKED';
   if (/startup|IPC|signer is unavailable/i.test(reason)) return 'STARTUP_FAILURE';
+  if (/EXECUTION_ROUTE_CHANGED|SCANNER_POOL_EVIDENCE|MISSING_EXECUTOR_ROUTE_EVIDENCE|PROVIDER_ORDER_MISMATCH|MINT_PATH_MISMATCH|AMOUNT_CHAIN_MISMATCH/i.test(reason)) {
+    return 'ROUTE_DIVERGED';
+  }
   return 'VALIDATION_FAILED';
 }
 

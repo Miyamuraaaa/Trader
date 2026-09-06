@@ -138,6 +138,10 @@ async function constrainedQuote(
   return quote;
 }
 
+function exactPoolEvidence(quote: Quote): string[] {
+  return [...new Set(quote.poolIds)];
+}
+
 /**
  * Requotes a broad positive observation using the exact provider surface and
  * deterministic min-output propagation used by the live executor.
@@ -174,6 +178,14 @@ export async function buildExecutableCandidateFromRaw(
     if (sell.inAmount !== buy.otherAmountThreshold) {
       return { status: 'ROUTE_POLICY_REJECTED', reason: 'Executable prefilter lost exact minimum-output propagation' };
     }
+    const buyPools = exactPoolEvidence(buy);
+    const sellPools = exactPoolEvidence(sell);
+    if (buyPools.length !== 1 || sellPools.length !== 1) {
+      return {
+        status: 'ROUTE_POLICY_REJECTED',
+        reason: `Executable prefilter requires exactly one auditable pool per leg; observed ${buyPools.length}/${sellPools.length}`,
+      };
+    }
     const quoteSkewMs = Math.abs(sell.responseTimestamp - buy.responseTimestamp);
     const stale = quoteSkewMs > CONFIG.maxQuoteAgeMs;
     const liquidityOverlap = poolOverlap(buy, sell);
@@ -208,7 +220,7 @@ export async function buildExecutableCandidateFromRaw(
     return { status: 'EXECUTABLE_CANDIDATE', route };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const policy = /escaped the audited|partial executable|same pool|propagation/i.test(reason);
+    const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);
     return { status: policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason };
   }
 }
