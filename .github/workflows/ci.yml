@@ -10,9 +10,11 @@ permissions:
   contents: read
 
 env:
-  # GitHub runners may expose generic MODE variables through the environment.
-  # Tests must never inherit an ambiguous runtime mode; keep CI explicitly non-live.
+  # CI is always non-live and must not inherit generic runner MODE values.
   EXECUTION_MODE: paper
+  # Keep the fixture below the absolute cap so the allocation test exercises
+  # MAX_TRADE_PERCENT rather than being pre-empted by MAX_TRADE_USDC.
+  MAX_TRADE_USDC: 1
 
 jobs:
   verify:
@@ -40,6 +42,9 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # Production rejects Unix signer files broader than chmod 600. Make
+          # temporary test keypairs inherit the same secure permission policy.
+          umask 077
           npm test -- --reporter=verbose 2>&1 | tee test-output.log
 
       - name: Upload test output
