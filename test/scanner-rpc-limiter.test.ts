@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { ScannerRpcLimiter } from '../src/scanner-rpc-limiter.js';
+import {
+  ScannerRpcBackpressureError,
+  ScannerRpcLimiter,
+} from '../src/scanner-rpc-limiter.js';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -60,5 +63,43 @@ describe('shared scanner RPC limiter', () => {
     expect(limiter.snapshot().effectiveConcurrency).toBe(1);
     await limiter.run('healthy-2', async () => 2);
     expect(limiter.snapshot().effectiveConcurrency).toBe(2);
+  });
+
+  it('rejects queued and new scanner work immediately while a 429 cooldown is active', async () => {
+    const limiter = new ScannerRpcLimiter({
+      maxConcurrency: 1,
+      minIntervalMs: 0,
+      baseCooldownMs: 20,
+      maxCooldownMs: 20,
+      recoverySuccesses: 1,
+    });
+    let release!: () => void;
+    const blocker = new Promise<void>((resolve) => { release = resolve; });
+    let queuedRan = false;
+    let newTaskRan = false;
+
+    const first = limiter.run('rate-limited', async () => {
+      await blocker;
+      throw new Error('429 Too Many Requests');
+    });
+    const queued = limiter.run('queued', async () => {
+      queuedRan = true;
+      return 1;
+    });
+
+    release();
+    await expect(first).rejects.toThrow('429');
+    await expect(queued).rejects.toBeInstanceOf(ScannerRpcBackpressureError);
+    expect(queuedRan).toBe(false);
+    expect(limiter.snapshot().queued).toBe(0);
+
+    await expect(limiter.run('new-during-cooldown', async () => {
+      newTaskRan = true;
+      return 2;
+    })).rejects.toBeInstanceOf(ScannerRpcBackpressureError);
+    expect(newTaskRan).toBe(false);
+
+    await sleep(25);
+    await expect(limiter.run('healthy-after-cooldown', async () => 3)).resolves.toBe(3);
   });
 });
