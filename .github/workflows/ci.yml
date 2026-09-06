@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # GitHub runners may expose generic MODE variables through the environment.
+  # Tests must never inherit an ambiguous runtime mode; keep CI explicitly non-live.
+  EXECUTION_MODE: paper
+
 jobs:
   verify:
     runs-on: ubuntu-latest
