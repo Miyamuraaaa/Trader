@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArbScanner Live Terminal</title>
+    <script>
+        // Suppress Tailwind CDN warning
+        const originalWarn = console.warn;
+        console.warn = function(...args) {
+            if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com should not be used in production')) return;
+            originalWarn.apply(console, args);
+        };
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        slate: { 850: '#151f32', 900: '#0f172a', 950: '#020617' }
+                    }
+                }
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { background-color: #020617; color: #f8fafc; font-family: 'Inter', sans-serif; }
+        .glass-panel { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(51, 65, 85, 0.5); }
+        .hide-scroll::-webkit-scrollbar { display: none; }
+        .pulse-dot { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+    </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden">
+    
+    <!-- Top Navigation -->
+    <header class="h-16 glass-panel border-b border-slate-800 flex items-center justify-between px-6 shrink-0 z-10">
+        <div class="flex items-center gap-3">
+            <svg class="w-6 h-6 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+            <h1 class="text-xl font-bold tracking-tight text-white">ArbScanner<span class="text-slate-500 font-normal ml-2">Terminal</span></h1>
+        </div>
+        <div class="flex items-center gap-6">
+            <button id="reset-paper-button" onclick="resetPaperAccount()" class="px-3 py-1.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 border border-rose-500/50 rounded text-xs font-bold uppercase tracking-wider transition-colors">
+                Reset Paper Account
+            </button>
+            <div class="flex flex-col items-end border-r border-slate-700 pr-4">
+                <div class="text-[10px] uppercase tracking-widest text-slate-500 font-bold">MODE</div>
+                <div id="mode-label" class="text-amber-500 font-bold text-xs uppercase tracking-wider">PAPER TRADING — NO REAL FUNDS</div>
+            </div>
+            <div class="flex items-center gap-2 px-3 py-1.5 glass-panel rounded-full text-sm">
+                <div id="status-dot" class="w-2.5 h-2.5 rounded-full bg-rose-500"></div>
+                <span id="status-text" class="text-slate-300 font-medium">Disconnected</span>
+            </div>
+            <div class="text-right flex gap-6">
+                <div>
+                    <div class="text-[10px] uppercase tracking-widest text-slate-500 font-semibold">Live Wallet Balance</div>
+                    <div id="live-wallet-total" class="font-mono font-bold text-slate-400 text-lg leading-tight">Loading…</div>
+                    <div id="live-wallet-assets" class="text-[10px] font-mono text-slate-500 mt-0.5">Read-only wallet</div>
+                </div>
+                <div id="paper-balance-panel">
+                    <div class="text-[10px] uppercase tracking-widest text-amber-500 font-semibold">Paper Reference Balance</div>
+                    <div id="nav-balance" class="font-mono font-bold text-emerald-400 text-lg leading-tight">$0.00</div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content Layout -->
+    <main class="flex-1 flex overflow-hidden p-6 gap-6">
+        
+        <!-- Left Column: Metrics & Charts -->
+        <div class="w-[380px] shrink-0 flex flex-col gap-4 overflow-y-auto hide-scroll pb-6">
+            
+            <!-- KPI Grid -->
+            <div id="execution-kpis" class="grid grid-cols-3 gap-3">
+                <div class="glass-panel rounded-xl p-3 col-span-3 flex justify-between items-center bg-slate-800/20">
+                    <div id="realized-pnl-label" class="text-xs uppercase tracking-widest text-amber-500 font-bold">PAPER REALIZED PNL</div>
+                    <div id="kpi-pnl" class="text-xl font-mono font-bold text-slate-300">0.0000</div>
+                </div>
+                
+                <div class="glass-panel rounded-xl p-3 text-center">
+                    <div class="text-[9px] uppercase tracking-widest text-slate-500 font-semibold mb-1">Win Rate</div>
+                    <div id="kpi-winrate" class="text-base font-mono font-bold text-slate-300">0.0%</div>
+                    <div class="text-[10px] font-mono font-bold mt-0.5">
+                        <span id="kpi-won" class="text-emerald-500">0</span><span class="text-slate-600 mx-1">/</span><span id="kpi-lost" class="text-rose-500">0</span>
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl p-3 text-center">
+                    <div class="text-[9px] uppercase tracking-widest text-slate-500 font-semibold mb-1">Expectancy</div>
+                    <div id="kpi-expectancy" class="text-base font-mono font-bold text-slate-300">0.00</div>
+                    <div class="text-[10px] font-mono font-bold mt-0.5 text-slate-400">
+                        PF: <span id="kpi-profitfactor">0.00</span>
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl p-3 text-center">
+                    <div class="text-[9px] uppercase tracking-widest text-slate-500 font-semibold mb-1">Evals/Min</div>
+                    <div class="text-base font-mono font-bold text-indigo-400">
+                        <span id="kpi-evals">0</span>
+                    </div>
+                    <div class="text-[10px] font-mono font-bold mt-0.5 text-slate-500">
+                        Total: <span id="kpi-max-evals">0</span>
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl p-3 text-center">
+                    <div class="text-[9px] uppercase tracking-widest text-slate-500 font-semibold mb-1">Volume</div>
+                    <div id="kpi-volume" class="text-base font-mono font-bold text-slate-300">0.00</div>
+                </div>
+
+                <div class="glass-panel rounded-xl p-3 text-center col-span-2">
+                    <div class="text-[9px] uppercase tracking-widest text-slate-500 font-semibold mb-1">Max Drawdown</div>
+                    <div id="kpi-drawdown" class="text-base font-mono font-bold text-rose-400">0.00</div>
+                </div>
+            </div>
+
+            <!-- Pipeline Stats -->
+            <div class="glass-panel rounded-xl p-3 flex justify-between text-[10px] font-mono text-slate-400">
+                <div>Eval: <span id="kpi-detected" class="text-blue-400">0</span></div>
+                <div>Rej: <span id="kpi-rejected" class="text-rose-400">0</span></div>
+                <div>Exp: <span id="kpi-expired" class="text-amber-400">0</span></div>
+                <div>Fail: <span id="kpi-failed" class="text-red-500">0</span></div>
+            </div>
+
+            <section class="glass-panel rounded-xl p-3">
+                <div class="flex items-center justify-between mb-3">
+                    <h2 class="text-xs font-semibold text-slate-300 uppercase tracking-wider">Executable Opportunities</h2>
+                    <span id="executable-ready-count" class="rounded bg-slate-800 px-2 py-1 text-[10px] font-mono font-bold text-slate-400">READY: 0</span>
+                </div>
+                <div id="executable-opportunities" class="space-y-3 text-sm text-slate-400">
+                    No READY_TO_EXECUTE opportunities yet
+                </div>
+            </section>
+
+            <!-- Chart: PnL Area -->
+            <div id="execution-pnl-panel" class="glass-panel rounded-xl p-3 flex-1 min-h-[160px] flex flex-col">
+                <div class="flex items-center gap-2 mb-2">
+                    <svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
+                    <h2 id="pnl-chart-label" class="text-xs font-semibold text-slate-300 uppercase tracking-wider">Paper Realized PnL</h2>
+                </div>
+                <div id="pnlChart" class="flex-1 relative w-full" style="min-height: 100px;"></div>
+            </div>
+
+            <!-- Chart: API RPS -->
+            <div class="glass-panel rounded-xl p-3 flex-1 min-h-[140px] flex flex-col">
+                <div class="flex items-center justify-between mb-2">
+                    <div class="flex items-center gap-2">
+                        <svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                        <h2 class="text-xs font-semibold text-slate-300 uppercase tracking-wider">Jupiter RPS</h2>
+                    </div>
+                    <div id="kpi-throttle" class="text-[9px] px-1.5 py-0.5 rounded uppercase font-bold bg-slate-800 text-slate-400">IDLE</div>
+                </div>
+                <div id="rpsChart" class="flex-1 relative w-full" style="min-height: 80px;"></div>
+            </div>
+            
+        </div>
+
+        <!-- Right Column: Tables -->
+        <div class="flex-1 flex flex-col gap-4 min-w-0">
+            
+            <!-- Opportunities Table -->
+            <div class="glass-panel rounded-xl overflow-hidden flex flex-col flex-1">
+                <div class="p-4 border-b border-slate-800/80 bg-slate-900/50 flex items-center justify-between">
+                    <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                        <svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                        Live Route Evaluations <span class="text-[9px] text-amber-500">READ-ONLY</span>
+                    </h2>
+                    <span id="scan-progress" class="text-[10px] font-mono text-slate-500">Starting scanner...</span>
+                </div>
+                <div class="overflow-y-auto hide-scroll flex-1 p-2">
+                    <table class="w-full text-left text-sm">
+                        <thead class="text-[10px] text-slate-500 uppercase tracking-widest sticky top-0 bg-[#0f172ab3] backdrop-blur-md z-10">
+                            <tr>
+                                <th class="px-4 py-3 font-medium">Time</th>
+                                <th class="px-4 py-3 font-medium">Route</th>
+                                <th class="px-4 py-3 font-medium">Size</th>
+                                <th class="px-4 py-3 font-medium">Expected Net</th>
+                                <th class="px-4 py-3 font-medium">Worst Case</th>
+                                <th class="px-4 py-3 font-medium">Decision</th>
+                                <th class="px-4 py-3 font-medium">Data Confidence</th>
+                            </tr>
+                        </thead>
+                        <tbody id="opps-body" class="font-mono text-xs divide-y divide-slate-800/50">
+                            <tr><td colspan="7" class="p-8 text-center text-slate-600 font-sans">Waiting for the first completed quote matrix...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Quote confirmation table -->
+            <div id="execution-trades-panel" class="glass-panel rounded-xl overflow-hidden flex flex-col flex-1">
+                <div class="p-4 border-b border-slate-800/80 bg-slate-900/50 flex items-center justify-between">
+                    <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                        <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"></path></svg>
+                        <span id="execution-log-label">Paper Quote Confirmation Logs</span>
+                    </h2>
+                </div>
+                <div class="overflow-y-auto hide-scroll flex-1 p-2">
+                    <table class="w-full text-left text-sm">
+                        <thead class="text-[10px] text-slate-500 uppercase tracking-widest sticky top-0 bg-[#0f172ab3] backdrop-blur-md z-10">
+                            <tr>
+                                <th class="px-4 py-3 font-medium">Status</th>
+                                <th class="px-4 py-3 font-medium">Size</th>
+                                <th id="execution-pnl-column" class="px-4 py-3 font-medium">Confirmed Quote PnL</th>
+                                <th class="px-4 py-3 font-medium">Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trades-body" class="font-mono text-xs divide-y divide-slate-800/50">
+                            <tr><td colspan="4" class="p-8 text-center text-slate-600 font-sans">Waiting for the first paper decision...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <script>
+        // TradingView Lightweight Charts Initialization
+        
+        // PnL Chart
+        const pnlContainer = document.getElementById('pnlChart');
+        const pnlChart = LightweightCharts.createChart(pnlContainer, {
+            layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#64748b', fontFamily: 'JetBrains Mono' },
+            grid: { vertLines: { color: 'rgba(30, 41, 59, 0.5)' }, horzLines: { color: 'rgba(30, 41, 59, 0.5)' } },
+            rightPriceScale: { borderVisible: false },
+            timeScale: { borderVisible: false, timeVisible: true, secondsVisible: true },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
+                vertLine: { color: '#334155', style: 0, labelBackgroundColor: '#0f172a' },
+                horzLine: { color: '#334155', style: 0, labelBackgroundColor: '#0f172a' },
+            },
+        });
+        
+        const pnlSeries = pnlChart.addAreaSeries({
+            topColor: 'rgba(16, 185, 129, 0.4)',
+            bottomColor: 'rgba(16, 185, 129, 0.0)',
+            lineColor: '#10b981',
+            lineWidth: 2,
+            priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+        });
+
+        // Resize handler for PnL Chart
+        new ResizeObserver(entries => {
+            if (entries.length === 0 || entries[0].target !== pnlContainer) return;
+            const newRect = entries[0].contentRect;
+            pnlChart.applyOptions({ height: newRect.height, width: newRect.width });
+        }).observe(pnlContainer);
+
+        // RPS Chart
+        const rpsContainer = document.getElementById('rpsChart');
+        const rpsChart = LightweightCharts.createChart(rpsContainer, {
+            layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#64748b', fontFamily: 'JetBrains Mono' },
+            grid: { vertLines: { color: 'rgba(30, 41, 59, 0.5)' }, horzLines: { color: 'rgba(30, 41, 59, 0.5)' } },
+            rightPriceScale: { borderVisible: false },
+            timeScale: { borderVisible: false, timeVisible: true, secondsVisible: true },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
+                vertLine: { color: '#334155', style: 0, labelBackgroundColor: '#0f172a' },
+                horzLine: { color: '#334155', style: 0, labelBackgroundColor: '#0f172a' },
+            },
+        });
+
+        const rpsSeries = rpsChart.addHistogramSeries({
+            color: '#3b82f6',
+            priceFormat: { type: 'volume' },
+        });
+
+        // Resize handler for RPS Chart
+        new ResizeObserver(entries => {
+            if (entries.length === 0 || entries[0].target !== rpsContainer) return;
+            const newRect = entries[0].contentRect;
+            rpsChart.applyOptions({ height: newRect.height, width: newRect.width });
+        }).observe(rpsContainer);
+
+        let startBalance = 10000;
+        let isConnected = false;
+        let runtimeMode = 'paper';
+        let currentLiveApproval = null;
+        let currentLiveApprovals = new Map();
+        let manualApprovalMockEnabled = false;
+        const WALLET_REFRESH_MS = 15000;
+
+        function html(value) {
+            return String(value ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[c]);
+        }
+
+        function isLocalApprovalDashboard() {
+            return window.location.hostname === '127.0.0.1' && window.location.port === '3000';
+        }
+
+        function developerMockApproval() {
+            return {
+                mock: true, state: 'READY_TO_EXECUTE', executionId: 'developer-ui-mock',
+                messageHash: 'mock-message-fingerprint-no-broadcast', approvalToken: 'mock-no-broadcast',
+                providers: ['raptor', 'jupiter'], routeType: 'DEVELOPER_UI_MOCK',
+                intermediateMint: 'MockToken111111111111111111111111111111111', inputUsdc: '0.05',
+                expectedOutputAtomic: '50600', minimumOutputAtomic: '50400', conservativeNetUsdc: '0.0004',
+                roiBps: '80', confidenceScore: 95, quoteAgeMs: 42, candidateToReadyLatencyMs: 318,
+                simulation: { passed: true, unitsConsumed: 65432, transactionBytes: 912 },
+                expiresAt: Date.now() + 600000, updatedAt: Date.now(),
+            };
+        }
+
+        function renderLiveApproval(approval) {
+            const target = document.getElementById('executable-opportunities');
+            const count = document.getElementById('executable-ready-count');
+            if (runtimeMode !== 'live' && !manualApprovalMockEnabled) {
+                currentLiveApproval = null;
+                currentLiveApprovals.clear();
+                count.textContent = 'READY: 0';
+                target.textContent = 'Manual approval is available only in LIVE mode.';
+                return;
+            }
+            if (!isLocalApprovalDashboard()) {
+                currentLiveApproval = null;
+                currentLiveApprovals.clear();
+                count.textContent = 'READY: 0';
+                target.innerHTML = '<div class="rounded border border-amber-500/40 bg-amber-500/10 p-3 text-amber-200">Manual approval is unavailable from this hostname. Open <span class="font-mono">http://127.0.0.1:3000</span>.</div>';
+                return;
+            }
+            const effective = approval || (manualApprovalMockEnabled ? developerMockApproval() : null);
+            const approvals = effective ? (Array.isArray(effective) ? effective : [effective]) : [];
+            currentLiveApprovals = new Map(approvals.map(item => [item.executionId, item]));
+            currentLiveApproval = approvals[0] || null;
+            const readyCount = approvals.filter(item => item.state === 'READY_TO_EXECUTE').length;
+            count.textContent = `READY: ${readyCount}`;
+            count.className = `rounded px-2 py-1 text-[10px] font-mono font-bold ${readyCount > 0 ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-800 text-slate-400'}`;
+            if (!approvals.length) {
+                target.textContent = 'No READY_TO_EXECUTE opportunities yet';
+                return;
+            }
+            target.innerHTML = approvals
+                .sort((a, b) => Number(b.conservativeNetUsdc || 0) - Number(a.conservativeNetUsdc || 0))
+                .map((item) => renderExecutableOpportunityCard(item)).join('');
+        }
+
+        function renderExecutableOpportunityCard(approval) {
+            const ready = approval.state === 'READY_TO_EXECUTE';
+            const expected = Number(approval.expectedOutputAtomic || 0) / 1_000_000;
+            const net = Number(approval.conservativeNetUsdc || 0);
+            const shortMint = `${String(approval.intermediateMint || '').slice(0, 8)}…${String(approval.intermediateMint || '').slice(-6)}`;
+            const fields = [
+                ['Route', approval.routeType || 'Atomic cycle'],
+                ['Providers', `${approval.providers?.[0] || '?'} → ${approval.providers?.[1] || '?'}`],
+                ['Token/mint', shortMint],
+                ['Trade size', `$${approval.inputUsdc} USDC`],
+                ['Expected output', `${expected.toFixed(6)} USDC`],
+                ['Conservative net', `${net >= 0 ? '+' : ''}${approval.conservativeNetUsdc} USDC`],
+                ['ROI', `${(Number(approval.roiBps || 0) / 100).toFixed(4)}%`],
+                ['Confidence', approval.confidenceScore === null || approval.confidenceScore === undefined ? 'n/a' : `${approval.confidenceScore}/100`],
+                ['Quote age', `${approval.quoteAgeMs} ms`],
+                ['Candidate → ready', `${approval.candidateToReadyLatencyMs} ms`],
+                ['Simulation', approval.simulation?.passed ? `PASS · ${approval.simulation.unitsConsumed || '?'} CU` : 'FAILED'],
+            ];
+            const status = approval.mock ? 'DEVELOPER MOCK — NO BROADCAST' : approval.state.replaceAll('_', ' ');
+            const statusClass = ready ? 'text-emerald-300' : approval.state === 'CONFIRMED' ? 'text-emerald-300' : 'text-amber-300';
+            const safeId = html(approval.executionId);
+            return `<article class="rounded-lg border ${ready ? 'border-emerald-500/50 bg-emerald-500/5' : 'border-slate-700 bg-slate-900/50'} p-3">
+                <div class="mb-2 flex items-center justify-between gap-2"><span class="text-[10px] font-bold uppercase tracking-wider ${statusClass}">${html(status)}</span><span class="font-mono text-[10px] text-slate-500">${html(approval.executionId)}</span></div>
+                <div class="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">${fields.map(([label, value]) => `<span class="text-slate-500">${html(label)}</span><span class="truncate text-right font-mono text-slate-200" title="${html(value)}">${html(value)}</span>`).join('')}</div>
+                <div class="mt-2 text-[10px] text-slate-400">${html(approval.reason || (approval.mock ? 'Developer fixture only. No IPC or broadcaster request is possible.' : ready ? 'One late-click same-route refresh is allowed; no stale bytes are submitted.' : 'This opportunity cannot be reused.'))}</div>
+                ${ready ? `<div class="mt-3 grid grid-cols-2 gap-2"><button onclick="acceptLiveApproval('${safeId}')" class="rounded bg-emerald-500 px-2 py-2 text-xs font-bold text-slate-950 transition hover:bg-emerald-400">ACCEPT &amp; EXECUTE</button><button onclick="rejectLiveApproval('${safeId}')" class="rounded border border-rose-400 bg-rose-500/10 px-2 py-2 text-xs font-bold text-rose-300 transition hover:bg-rose-500/20">REJECT</button></div>` : ''}
+            </article>`;
+        }
+
+        async function submitLiveApproval(action, executionId) {
+            const approval = currentLiveApprovals.get(executionId);
+            if (!approval || approval.state !== 'READY_TO_EXECUTE') return;
+            if (approval.mock) {
+                approval.state = action === 'accept' ? 'CONFIRMED' : 'REJECTED';
+                approval.reason = action === 'accept'
+                    ? 'Developer mock accepted locally. No IPC request or transaction broadcast occurred.'
+                    : 'Developer mock rejected locally. No IPC request or transaction broadcast occurred.';
+                renderLiveApproval(approval);
+                return;
+            }
+            try {
+                const response = await fetch(`/api/live-approval/${action}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+                    body: JSON.stringify({ executionId: approval.executionId, messageHash: approval.messageHash, approvalToken: approval.approvalToken }),
+                });
+                const result = await response.json();
+                if (result.view) renderLiveApproval(result.view);
+                if (!result.ok && result.view) {
+                    result.view.reason = result.error || result.view.reason || 'Approval rejected';
+                    renderLiveApproval(result.view);
+                }
+            } catch (error) {
+                approval.reason = `Approval request failed: ${error instanceof Error ? error.message : String(error)}`;
+                renderLiveApproval(approval);
+            }
+        }
+
+        function acceptLiveApproval(executionId) { void submitLiveApproval('accept', executionId); }
+        function rejectLiveApproval(executionId) { void submitLiveApproval('reject', executionId); }
+
+        // Helper for animated number counting
+        function animateValue(obj, start, end, duration, formatStr) {
+            let startTimestamp = null;
+            const step = (timestamp) => {
+                if (!startTimestamp) startTimestamp = timestamp;
+                const progress = Math.min((timestamp - startTimestamp) / duration, 1);
+                const current = start + progress * (end - start);
+                
+                if (formatStr === 'money') {
+                    obj.textContent = (current > 0 ? '+' : '') + current.toFixed(4);
+                } else if (formatStr === 'percent') {
+                    obj.textContent = current.toFixed(1) + '%';
+                } else if (formatStr === 'balance') {
+                    obj.textContent = '$' + current.toFixed(2);
+                } else {
+                    obj.textContent = Math.floor(current);
+                }
+                
+                if (progress < 1) {
+                    window.requestAnimationFrame(step);
+                }
+            };
+            window.requestAnimationFrame(step);
+        }
+
+        function updateConnectionState(connected) {
+            isConnected = connected;
+            const dot = document.getElementById('status-dot');
+            const txt = document.getElementById('status-text');
+            if (connected) {
+                dot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500 pulse-dot';
+                txt.textContent = 'Live System';
+                txt.className = 'text-emerald-400 font-bold tracking-wide';
+            } else {
+                dot.className = 'w-2.5 h-2.5 rounded-full bg-rose-500';
+                txt.textContent = 'Disconnected';
+                txt.className = 'text-slate-400 font-medium';
+            }
+        }
+
+        function applyRuntimeMode(mode) {
+            if (!mode || mode === runtimeMode) return;
+            runtimeMode = mode;
+            const hidden = mode === 'live' || mode === 'dry-run';
+            ['reset-paper-button', 'paper-balance-panel']
+                .forEach(id => document.getElementById(id)?.classList.toggle('hidden', hidden));
+            const label = document.getElementById('mode-label');
+            const pnlLabel = document.getElementById('realized-pnl-label');
+            const chartLabel = document.getElementById('pnl-chart-label');
+            const logLabel = document.getElementById('execution-log-label');
+            const pnlColumn = document.getElementById('execution-pnl-column');
+            if (mode === 'live') {
+                label.textContent = 'LIVE EXECUTION — REAL FUNDS AT RISK';
+                label.className = 'text-rose-400 font-bold text-xs uppercase tracking-wider';
+                pnlLabel.textContent = 'REALIZED ON-CHAIN PNL';
+                chartLabel.textContent = 'Realized On-Chain PnL';
+                logLabel.textContent = 'Live Execution Decision Journal';
+                pnlColumn.textContent = 'Realized PnL';
+            } else if (mode === 'dry-run') {
+                label.textContent = 'DRY RUN — NO BROADCAST';
+                label.className = 'text-amber-500 font-bold text-xs uppercase tracking-wider';
+                pnlLabel.textContent = 'REALIZED PNL — NO BROADCAST';
+                chartLabel.textContent = 'Dry-Run Execution Journal PnL';
+                logLabel.textContent = 'Dry-Run Execution Journal';
+                pnlColumn.textContent = 'Realized PnL';
+            } else {
+                label.textContent = 'PAPER TRADING — NO REAL FUNDS';
+                label.className = 'text-amber-500 font-bold text-xs uppercase tracking-wider';
+                pnlLabel.textContent = 'PAPER REALIZED PNL';
+                chartLabel.textContent = 'Paper Realized PnL';
+                logLabel.textContent = 'Paper Quote Confirmation Logs';
+                pnlColumn.textContent = 'Confirmed Quote PnL';
+            }
+        }
+
+        function setLiveWalletState(total, assets, stateClass, title) {
+            const totalEl = document.getElementById('live-wallet-total');
+            const assetsEl = document.getElementById('live-wallet-assets');
+            totalEl.textContent = total;
+            totalEl.className = `font-mono font-bold text-lg leading-tight ${stateClass}`;
+            assetsEl.textContent = assets;
+            assetsEl.title = title || '';
+        }
+
+        async function refreshLiveWallet() {
+            try {
+                const response = await fetch('/api/wallet', { cache: 'no-store' });
+                const body = await response.json();
+                if (!response.ok) throw new Error(body.error || `Wallet API returned ${response.status}`);
+                const usdc = Number(body.usdcAmountAtomic) / 1_000_000;
+                const sol = body.solDisplay;
+                const assets = `${sol} SOL · ${usdc.toFixed(6)} USDC`;
+                const address = body.address || 'configured wallet';
+                if (body.usdEstimate && Number.isFinite(body.usdEstimate.totalUsd)) {
+                    const quoteAgeSeconds = Math.max(0, Math.floor((Date.now() - body.usdEstimate.solPriceObservedAt) / 1000));
+                    setLiveWalletState(
+                        `$${body.usdEstimate.totalUsd.toFixed(2)}`,
+                        `${assets} · SOL $${body.usdEstimate.solPriceUsd.toFixed(2)} (${quoteAgeSeconds}s)`,
+                        'text-emerald-400',
+                        `Read-only wallet ${address}; SOL price from ${body.usdEstimate.solPriceProvider}`,
+                    );
+                } else {
+                    setLiveWalletState(
+                        'USD estimate unavailable',
+                        `${assets} · waiting for a fresh scanner SOL/USDC quote`,
+                        'text-amber-400',
+                        `Read-only wallet ${address}`,
+                    );
+                }
+            } catch (error) {
+                const reason = error instanceof Error ? error.message : String(error);
+                setLiveWalletState('Wallet unavailable', `Balance retrieval failed: ${reason}`, 'text-rose-400', reason);
+            }
+        }
+
+        function renderOpps(opps) {
+            const body = document.getElementById('opps-body');
+            if (!opps || opps.length === 0) {
+                body.innerHTML = '<tr><td colspan="7" class="p-8 text-center text-slate-600 font-sans">Scanning is active; waiting for the first completed quote matrix.</td></tr>';
+                return;
+            }
+            body.innerHTML = opps.map(opp => {
+                const time = new Date(opp.timestamp).toLocaleTimeString();
+                const expected = Number(opp.expected_profit_usdc);
+                const worstCase = Number(opp.worst_case_profit_usdc);
+                const exp = (expected > 0 ? '+' : '') + expected.toFixed(4);
+                const wc = (worstCase > 0 ? '+' : '') + worstCase.toFixed(4);
+                const profitColor = expected > 0 ? 'text-emerald-400' : 'text-rose-400';
+                const tier = opp.validation_tier || 'OBSERVATION';
+                const decision = [opp.opportunity_state, tier, opp.category, opp.decision_status].filter(Boolean).join(' · ');
+                const decisionColor = tier === 'CONSERVATIVE_CANDIDATE'
+                    ? 'text-emerald-400' : tier === 'QUOTE_CANDIDATE'
+                    ? 'text-sky-400' : opp.decision_status === 'RISK_REJECTED' || opp.category === 'NEGATIVE'
+                    ? 'text-rose-400' : 'text-amber-400';
+                const confColor = opp.confidence_score >= 70 ? 'bg-emerald-500' : opp.confidence_score >= 40 ? 'bg-amber-500' : 'bg-rose-500';
+                return `
+                    <tr class="hover:bg-slate-800/30 transition-colors">
+                        <td class="px-4 py-2.5 text-slate-400">${time}</td>
+                        <td class="px-4 py-2.5 text-indigo-300 uppercase">${opp.buy_provider || '?'} → ${opp.sell_provider || '?'}</td>
+                        <td class="px-4 py-2.5 text-slate-300">$${opp.trade_size_usdc}</td>
+                        <td class="px-4 py-2.5 ${profitColor} font-bold">${exp}</td>
+                        <td class="px-4 py-2.5 text-slate-500">${wc}</td>
+                        <td class="px-4 py-2.5 ${decisionColor} text-[10px] font-bold">${decision}</td>
+                        <td class="px-4 py-2.5">
+                            <div class="flex items-center gap-2">
+                                <div class="w-16 h-1 bg-slate-800 rounded-full overflow-hidden">
+                                    <div class="h-full ${confColor}" style="width: ${opp.confidence_score}%"></div>
+                                </div>
+                                <span class="text-slate-400">${opp.confidence_score}</span>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderTrades(trades) {
+            const body = document.getElementById('trades-body');
+            if (!trades || trades.length === 0) {
+                const message = runtimeMode === 'paper'
+                    ? 'No paper decisions recorded yet.'
+                    : runtimeMode === 'live'
+                        ? 'Live executor armed — waiting for an execution-eligible atomic Orca opportunity. Scanner quotes are shown above but are not real executions.'
+                        : 'No real execution records. Dry-run cannot broadcast.';
+                body.innerHTML = `<tr><td colspan="4" class="p-8 text-center text-slate-600 font-sans">${message}</td></tr>`;
+                return;
+            }
+            body.innerHTML = trades.map(t => {
+                let badgeClass = 'bg-blue-500/10 text-blue-400 border border-blue-500/20';
+                if (t.status === 'ACCEPTED') badgeClass = 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
+                if (t.status === 'REJECTED') badgeClass = 'bg-rose-500/10 text-rose-300 border border-rose-500/20';
+                
+                const quotedPnl = runtimeMode === 'paper' ? t.confirmed_quote_profit_usdc : t.realizedPnlUsdc;
+                const pnl = Number(quotedPnl);
+                const pnlClass = pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-rose-400' : 'text-slate-500';
+                const pnlText = quotedPnl !== null && quotedPnl !== undefined ? (pnl > 0 ? '+'+pnl.toFixed(4) : pnl.toFixed(4)) : '-';
+                const size = runtimeMode === 'paper' ? t.trade_size_usdc : t.inputUsdc;
+                const reason = runtimeMode === 'paper'
+                    ? (t.rejection_reason || 'Success')
+                    : (t.reason || (t.signature ? `Signature ${t.signature.slice(0, 12)}…` : '-'));
+
+                return `
+                    <tr class="hover:bg-slate-800/30 transition-colors">
+                        <td class="px-4 py-2.5">
+                            <span class="px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider ${badgeClass}">${t.status}</span>
+                        </td>
+                        <td class="px-4 py-2.5 text-slate-300">$${Number(size || 0).toFixed(2)}</td>
+                        <td class="px-4 py-2.5 font-bold ${pnlClass}">${pnlText}</td>
+                        <td class="px-4 py-2.5 text-slate-500 truncate max-w-[200px]" title="${reason}">${reason}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function connectWs() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            // Fallback to localhost:3000 if opened directly as file, otherwise use host
+            const host = window.location.hostname ? window.location.host : 'localhost:3000';
+            const ws = new WebSocket(`${protocol}//${host}`);
+
+            ws.onopen = () => updateConnectionState(true);
+            ws.onclose = () => {
+                updateConnectionState(false);
+                setTimeout(connectWs, 2000);
+            };
+
+            ws.onmessage = (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    if (data.type === 'LIVE_APPROVAL_UPDATE') {
+                        renderLiveApproval(data.approval);
+                        return;
+                    }
+                    if (data.type === 'INIT' || data.type === 'LIVE_UPDATE') {
+                        const p = data.payload;
+                        applyRuntimeMode(p.executionMode);
+                        manualApprovalMockEnabled = p.manualApprovalMockEnabled === true;
+                        renderLiveApproval(p.approval);
+                        
+                        // Top Nav
+                        if (p.balance !== undefined) {
+                            const currentBalance = parseFloat(document.getElementById('nav-balance').textContent.replace('$', '')) || startBalance;
+                            if (currentBalance !== p.balance) {
+                                animateValue(document.getElementById('nav-balance'), currentBalance, p.balance, 500, 'balance');
+                            }
+                            
+                        }
+
+                        // Stats
+                        if (p.stats) {
+                            if (Number(p.stats.startingBalance) > 0) {
+                                startBalance = Number(p.stats.startingBalance);
+                            }
+                            const totalPnl = p.stats.totalPnl || 0;
+                            const pnlEl = document.getElementById('kpi-pnl');
+                            const currentPnl = parseFloat(pnlEl.textContent.replace('+', '')) || 0;
+                            if (currentPnl !== totalPnl) {
+                                animateValue(pnlEl, currentPnl, totalPnl, 500, 'money');
+                            }
+                            pnlSeries.update({ time: Math.floor(Date.now() / 1000), value: totalPnl });
+                            pnlEl.className = `text-2xl font-mono font-bold ${totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`;
+
+                            document.getElementById('kpi-won').textContent = p.stats.winCount || 0;
+                            document.getElementById('kpi-lost').textContent = p.stats.lossCount || 0;
+                            
+                            const wr = p.stats.completedTrades ? ((p.stats.winCount / p.stats.completedTrades) * 100) : 0;
+                            const currentWr = parseFloat(document.getElementById('kpi-winrate').textContent.replace('%', '')) || 0;
+                            if (currentWr !== wr) {
+                                animateValue(document.getElementById('kpi-winrate'), currentWr, wr, 500, 'percent');
+                            }
+                            document.getElementById('kpi-winrate').className = `text-xl font-mono font-bold ${wr >= 50 ? 'text-emerald-400' : wr >= 30 ? 'text-amber-400' : 'text-rose-400'}`;
+
+                            document.getElementById('kpi-expectancy').textContent = (p.stats.expectancy > 0 ? '+' : '') + (p.stats.expectancy || 0).toFixed(4);
+                            document.getElementById('kpi-profitfactor').textContent = (p.stats.profitFactor || 0).toFixed(2);
+                            document.getElementById('kpi-drawdown').textContent = (p.stats.maxDrawdown || 0).toFixed(4);
+                            
+                            if (document.getElementById('kpi-volume')) {
+                                document.getElementById('kpi-volume').textContent = (p.stats.totalVolume || 0).toFixed(2);
+                            }
+
+                            document.getElementById('kpi-detected').textContent = p.stats.totalOpps || 0;
+                            document.getElementById('kpi-rejected').textContent = p.stats.rejectedTrades || 0;
+                            document.getElementById('kpi-expired').textContent = p.stats.expiredTrades || 0;
+                            document.getElementById('kpi-failed').textContent = p.stats.failedTrades || 0;
+                            
+                            if (p.stats.apiStats) {
+                                const api = p.stats.apiStats;
+                                if (document.getElementById('kpi-evals')) {
+                                    document.getElementById('kpi-evals').textContent = api.evaluationsPerMin || 0;
+                                    document.getElementById('kpi-max-evals').textContent = api.scanner?.routesEvaluated || 0;
+                                }
+
+                                if (api.scanner) {
+                                    const scan = api.scanner;
+                                    const size = scan.currentTradeSizeUsdc === null ? '' : ` · $${scan.currentTradeSizeUsdc}`;
+                                    const totals = ` · ${scan.routesEvaluated || 0} routes`;
+                                    document.getElementById('scan-progress').textContent = `${scan.currentPhase || 'IDLE'}${size}${totals}`;
+                                    document.getElementById('scan-progress').className = `text-[10px] font-mono ${scan.currentPhase === 'ERROR' ? 'text-rose-400' : 'text-slate-500'}`;
+                                }
+                                
+                                const throttleEl = document.getElementById('kpi-throttle');
+                                throttleEl.textContent = api.throttleState || 'IDLE';
+                                throttleEl.className = `text-[10px] px-2 py-0.5 rounded uppercase font-bold ${api.throttleState === 'BACKOFF' ? 'bg-rose-500/20 text-rose-400' : api.throttleState === 'ACTIVE' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-800 text-slate-400'}`;
+
+                                // RPS Chart
+                                const now = Math.floor(Date.now() / 1000);
+                                rpsSeries.update({ time: now, value: api.currentRps || 0 });
+                            }
+                        }
+
+                        // Tables
+                        if (p.opportunities) renderOpps(p.opportunities);
+                        if (p.trades) renderTrades(p.trades);
+                    }
+                } catch (err) {
+                    console.error(err);
+                }
+            };
+        }
+
+        connectWs();
+        refreshLiveWallet();
+        setInterval(refreshLiveWallet, WALLET_REFRESH_MS);
+        function resetPaperAccount() {
+            if (confirm("Are you sure you want to completely wipe the virtual paper trading database?")) {
+                fetch('/api/reset', { method: 'POST' })
+                    .then(res => res.json())
+                    .then(data => alert(data.message))
+                    .catch(err => alert("Error: " + err));
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies/build
+node_modules/
+dist/
+coverage/
+
+# Runtime data
+data/
+*.log
+
+# Wallet/key files
+bot.json
+test-bot.json
+*.key
+*.pem

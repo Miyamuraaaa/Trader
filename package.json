@@ -1,0 +1,56 @@
+{
+  "name": "sol-arb-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live-market Solana arbitrage scanner with an isolated, guarded continuous atomic Orca executor.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "scan:once": "tsx src/scan-once.ts",
+    "scan:live": "tsx src/scan-live.ts",
+    "execution:validate": "tsx src/execution-validate.ts",
+    "execution:handoff-validate": "tsx src/execution-handoff-validate.ts",
+    "execution:aggregator-validate": "tsx src/execution-aggregator-validate.ts",
+    "execution:jupiter-raptor-validate": "tsx src/execution-aggregator-validate.ts --jupiter-raptor",
+    "execution:mixed-validate": "tsx src/execution-mixed-validate.ts",
+    "execution:latency-benchmark": "tsx src/execution-latency-benchmark.ts",
+    "execution:jito-benchmark": "tsx src/execution-jito-benchmark.ts",
+    "execution:orca-jupiter-validate": "tsx src/execution-mixed-validate.ts --direction=orca-jupiter",
+    "execution:jupiter-orca-validate": "tsx src/execution-mixed-validate.ts --direction=jupiter-orca",
+    "execution:live": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@meteora-ag/dlmm": "^1.9.14",
+    "@orca-so/whirlpools-client": "^7.0.0",
+    "@orca-so/whirlpools-core": "^3.1.1",
+    "@solana/kit": "^6.9.0",
+    "@solana/signers": "^6.10.0",
+    "@solana/web3.js": "^1.98.4",
+    "better-sqlite3": "^13.0.3",
+    "bn.js": "^5.2.5",
+    "cors": "^2.8.6",
+    "decimal.js": "^10.6.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "ws": "^8.21.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/bn.js": "^5.2.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.5.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.11"
+  }
+}
