@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { CONFIG } from './config.js';
 import { HttpError } from './http.js';
 import { log } from './logger.js';
+import { runScannerRpc } from './scanner-rpc-limiter.js';
 import type { ProviderAvailabilityState, Quote, QuotePriority, QuoteProviderName } from './aggregators/types.js';
 
 export interface ProviderHealth {
@@ -24,6 +25,10 @@ export interface ProviderHealth {
  * It serializes a provider's requests, coalesces identical work, caches briefly,
  * and opens a temporary circuit after repeated failures. It never retries by
  * itself; HTTP retries remain bounded in getJson so there is only one retry layer.
+ *
+ * Orca and Meteora quote tasks are additionally admitted through the shared
+ * scanner RPC limiter because both logical providers fan out into the same
+ * scanner-side Solana RPC. Jupiter/Raptor remain independent HTTP paths.
  */
 export class QuoteProviderRuntime {
   private readonly queue: Array<{
@@ -87,7 +92,10 @@ export class QuoteProviderRuntime {
       const started = Date.now();
 
       try {
-        const quote = await task();
+        const runTask = () => task();
+        const quote = this.provider === 'orca' || this.provider === 'meteora'
+          ? await runScannerRpc(`${this.provider}.quote`, runTask, priority)
+          : await runTask();
         this.counters.successes++;
         this.consecutiveFailures = 0;
         this.latencyTotalMs += Date.now() - started;

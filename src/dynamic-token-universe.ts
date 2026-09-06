@@ -4,6 +4,7 @@ import { CONFIG } from './config.js';
 import { getJupiterJson } from './jupiter.js';
 import { log } from './logger.js';
 import { recordRpcRequests, rpcMetrics } from './solana.js';
+import { runScannerRpc } from './scanner-rpc-limiter.js';
 import { MINTS } from './tokens.js';
 
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
@@ -130,11 +131,18 @@ async function fetchCategory(category: 'toptrending' | 'toptraded' | 'toporganic
 
 async function verifyOnChain(candidates: RawDiscoveredToken[]): Promise<RawDiscoveredToken[]> {
   if (candidates.length === 0) return [];
-  const connection = new Connection(rpcMetrics.activeEndpoint, 'confirmed');
+  const connection = new Connection(rpcMetrics.activeEndpoint, {
+    commitment: 'confirmed',
+    disableRetryOnRateLimit: true,
+  });
   recordRpcRequests();
-  const accounts = await connection.getMultipleAccountsInfo(
-    candidates.map((token) => new PublicKey(token.id)),
-    'confirmed',
+  const accounts = await runScannerRpc(
+    'scanner.discovery.verifyDynamicMints',
+    () => connection.getMultipleAccountsInfo(
+      candidates.map((token) => new PublicKey(token.id)),
+      'confirmed',
+    ),
+    'LOW',
   );
   return candidates.filter((token, index) => {
     const account = accounts[index];
