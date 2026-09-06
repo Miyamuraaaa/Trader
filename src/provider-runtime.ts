@@ -2,7 +2,11 @@ import crypto from 'crypto';
 import { CONFIG } from './config.js';
 import { HttpError } from './http.js';
 import { log } from './logger.js';
-import { runScannerRpc } from './scanner-rpc-limiter.js';
+import {
+  isScannerRpcBackpressureError,
+  runScannerRpc,
+  scannerRpcLimiter,
+} from './scanner-rpc-limiter.js';
 import type { ProviderAvailabilityState, Quote, QuotePriority, QuoteProviderName } from './aggregators/types.js';
 
 export interface ProviderHealth {
@@ -105,6 +109,11 @@ export class QuoteProviderRuntime {
         });
         return quote;
       } catch (error) {
+        // Shared scanner-RPC cooldown is deliberate admission control, not a
+        // provider failure. Counting it as another provider error would open a
+        // second circuit and lengthen the outage after the RPC is healthy.
+        if (isScannerRpcBackpressureError(error)) throw error;
+
         this.counters.failures++;
         this.consecutiveFailures++;
         const rateLimited = (error instanceof HttpError && error.status === 429)
@@ -128,10 +137,16 @@ export class QuoteProviderRuntime {
   }
 
   isCoolingDown(): boolean {
-    return Date.now() < this.cooldownUntil;
+    if (Date.now() < this.cooldownUntil) return true;
+    return (this.provider === 'orca' || this.provider === 'meteora')
+      && scannerRpcLimiter.isCoolingDown();
   }
 
   health(): ProviderHealth {
+    const sharedCooldownRemainingMs = this.provider === 'orca' || this.provider === 'meteora'
+      ? scannerRpcLimiter.snapshot().cooldownRemainingMs
+      : 0;
+    const ownCooldownRemainingMs = Math.max(0, this.cooldownUntil - Date.now());
     const state: ProviderAvailabilityState = this.isCoolingDown()
       ? 'COOLDOWN'
       : this.counters.failures > 0 && this.counters.successes === 0
@@ -144,7 +159,7 @@ export class QuoteProviderRuntime {
         ? 0
         : this.latencyTotalMs / this.counters.successes,
       circuitOpen: this.isCoolingDown(),
-      cooldownRemainingMs: Math.max(0, this.cooldownUntil - Date.now()),
+      cooldownRemainingMs: Math.max(ownCooldownRemainingMs, sharedCooldownRemainingMs),
       state,
     };
   }

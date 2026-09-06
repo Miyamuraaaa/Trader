@@ -2,6 +2,20 @@ import { log } from './logger.js';
 
 export type ScannerRpcPriority = 'HIGH' | 'LOW';
 
+export class ScannerRpcBackpressureError extends Error {
+  readonly code = 'SCANNER_RPC_BACKPRESSURE';
+
+  constructor(readonly cooldownRemainingMs: number) {
+    super(`Scanner RPC backpressure active for ${Math.max(0, Math.ceil(cooldownRemainingMs))}ms`);
+    this.name = 'ScannerRpcBackpressureError';
+  }
+}
+
+export function isScannerRpcBackpressureError(error: unknown): error is ScannerRpcBackpressureError {
+  return error instanceof ScannerRpcBackpressureError
+    || (error instanceof Error && error.name === 'ScannerRpcBackpressureError');
+}
+
 export interface ScannerRpcLimiterOptions {
   maxConcurrency: number;
   minIntervalMs: number;
@@ -53,6 +67,12 @@ function isRateLimit(error: unknown): boolean {
  * policy reads all compete for the same public scanner RPC capacity. Keeping
  * one limiter here prevents independent provider schedulers from creating a
  * retry storm. The isolated live executor never imports or uses this limiter.
+ *
+ * A scanner quote that waits through a multi-second RPC cooldown is stale by
+ * definition and can stall every concurrent scan cycle. Therefore cooldown is
+ * fail-fast: work already queued when a 429 arrives is rejected immediately,
+ * and new work is rejected until the cooldown expires. Healthy work then
+ * restores shared concurrency gradually.
  */
 export class ScannerRpcLimiter {
   private readonly queue: Array<QueueEntry<unknown>> = [];
@@ -83,6 +103,11 @@ export class ScannerRpcLimiter {
   }
 
   run<T>(label: string, task: () => Promise<T>, priority: ScannerRpcPriority = 'LOW'): Promise<T> {
+    const cooldownRemainingMs = this.cooldownRemainingMs();
+    if (cooldownRemainingMs > 0) {
+      return Promise.reject(new ScannerRpcBackpressureError(cooldownRemainingMs));
+    }
+
     return new Promise<T>((resolve, reject) => {
       this.queue.push({
         label,
@@ -100,6 +125,10 @@ export class ScannerRpcLimiter {
     });
   }
 
+  isCoolingDown(): boolean {
+    return this.cooldownRemainingMs() > 0;
+  }
+
   snapshot(): ScannerRpcLimiterSnapshot {
     return {
       queued: this.queue.length,
@@ -109,19 +138,26 @@ export class ScannerRpcLimiter {
       rateLimits429: this.rateLimits429,
       successfulTasks: this.successfulTasks,
       failedTasks: this.failedTasks,
-      cooldownRemainingMs: Math.max(0, this.cooldownUntil - Date.now()),
+      cooldownRemainingMs: this.cooldownRemainingMs(),
       last429At: this.last429At,
     };
   }
 
+  private cooldownRemainingMs(): number {
+    return Math.max(0, this.cooldownUntil - Date.now());
+  }
+
   private drain(): void {
     if (this.timer || this.active >= this.effectiveConcurrency || this.queue.length === 0) return;
+
+    const cooldownRemainingMs = this.cooldownRemainingMs();
+    if (cooldownRemainingMs > 0) {
+      this.rejectQueuedForBackpressure(cooldownRemainingMs);
+      return;
+    }
+
     const now = Date.now();
-    const waitMs = Math.max(
-      0,
-      this.cooldownUntil - now,
-      this.options.minIntervalMs - (now - this.lastStartAt),
-    );
+    const waitMs = Math.max(0, this.options.minIntervalMs - (now - this.lastStartAt));
     if (waitMs > 0) {
       this.timer = setTimeout(() => {
         this.timer = undefined;
@@ -167,17 +203,29 @@ export class ScannerRpcLimiter {
       this.options.baseCooldownMs * 2 ** Math.max(0, this.cooldownLevel - 1),
     );
     this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + cooldownMs);
+    const queued = this.queue.length;
+    this.rejectQueuedForBackpressure(cooldownMs);
     log.warn('Scanner RPC limiter entered adaptive cooldown after rate limit', {
       label,
       cooldownMs,
       effectiveConcurrency: this.effectiveConcurrency,
-      queued: this.queue.length,
+      rejectedQueued: queued,
     });
+  }
+
+  private rejectQueuedForBackpressure(cooldownRemainingMs: number): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    if (this.queue.length === 0) return;
+    const error = new ScannerRpcBackpressureError(cooldownRemainingMs);
+    for (const queued of this.queue.splice(0)) queued.reject(error);
   }
 
   private onSuccess(label: string): void {
     this.successfulTasks++;
-    if (Date.now() < this.cooldownUntil || this.effectiveConcurrency >= this.options.maxConcurrency) return;
+    if (this.isCoolingDown() || this.effectiveConcurrency >= this.options.maxConcurrency) return;
     this.healthySince429++;
     if (this.healthySince429 < this.options.recoverySuccesses) return;
     this.healthySince429 = 0;

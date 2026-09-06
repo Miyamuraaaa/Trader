@@ -26,6 +26,8 @@ const subscriptions = new Map<string, number>();
 const cached = new Map<string, CachedDirectAccount>();
 let listener: MarketChangeListener | undefined;
 let updates = 0;
+let subscriptionCapLogAt = 0;
+let subscriptionCapSkips = 0;
 
 export function setDirectMarketChangeListener(value: MarketChangeListener | undefined): void {
   listener = value;
@@ -51,9 +53,15 @@ export async function watchDirectMarketAccounts(
     owners.set(owner, { pair, invalidate });
     if (subscriptions.has(value)) continue;
     if (subscriptions.size >= CONFIG.directMarketStreamMaxSubscriptions) {
-      log.debug('Direct market-state subscription cap reached', {
-        cap: CONFIG.directMarketStreamMaxSubscriptions,
-      });
+      subscriptionCapSkips++;
+      if (Date.now() - subscriptionCapLogAt >= 10_000) {
+        log.debug('Direct market-state subscription cap reached', {
+          cap: CONFIG.directMarketStreamMaxSubscriptions,
+          deferredAddresses: subscriptionCapSkips,
+        });
+        subscriptionCapSkips = 0;
+        subscriptionCapLogAt = Date.now();
+      }
       continue;
     }
     const id = connection.onAccountChange(new PublicKey(value), (account, context) => {
@@ -99,5 +107,7 @@ export async function stopDirectMarketStream(): Promise<void> {
   watchers.clear();
   cached.clear();
   listener = undefined;
+  subscriptionCapLogAt = 0;
+  subscriptionCapSkips = 0;
   await Promise.allSettled(ids.map((id) => connection.removeAccountChangeListener(id)));
 }
