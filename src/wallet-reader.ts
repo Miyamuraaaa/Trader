@@ -3,6 +3,7 @@ import { CONFIG, LAMPORTS_PER_SOL, MINTS } from './config.js';
 import { assertAtomicAmount } from './aggregators/types.js';
 import { fromAtomic } from './math.js';
 import { recordRpcRequests, rpcMetrics } from './solana.js';
+import { runScannerRpc } from './scanner-rpc-limiter.js';
 
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
@@ -85,14 +86,21 @@ function formatAtomic(amount: string, decimals: number): string {
 export async function readBotWallet(address = CONFIG.botWalletAddress): Promise<ReadOnlyWalletSnapshot> {
   if (!address) throw new Error('BOT_WALLET_ADDRESS is not configured');
   const owner = new PublicKey(address);
-  const connection = new Connection(rpcMetrics.activeEndpoint, 'confirmed');
+  const connection = new Connection(rpcMetrics.activeEndpoint, {
+    commitment: 'confirmed',
+    disableRetryOnRateLimit: true,
+  });
   recordRpcRequests(4);
-  const [slot, lamports, classic, token2022] = await Promise.all([
-    connection.getSlot('confirmed'),
-    connection.getBalance(owner, 'confirmed'),
-    connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, 'confirmed'),
-    connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, 'confirmed'),
-  ]);
+  const [slot, lamports, classic, token2022] = await runScannerRpc(
+    'scanner.dashboard.walletSnapshot',
+    () => Promise.all([
+      connection.getSlot('confirmed'),
+      connection.getBalance(owner, 'confirmed'),
+      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, 'confirmed'),
+      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, 'confirmed'),
+    ]),
+    'LOW',
+  );
   const balances = new Map<string, WalletTokenBalance>();
   mergeTokenAccounts(classic.value, 'spl-token', balances);
   mergeTokenAccounts(token2022.value, 'token-2022', balances);
