@@ -81,7 +81,7 @@ export class QuoteProviderRuntime {
       this.counters.deduplicatedRequests++;
       return inFlight.then((quote) => ({ ...quote, id: crypto.randomUUID() }));
     }
-    if (this.queue.length >= this.maxQueue && priority !== 'HIGH') {
+    if (this.queue.length >= this.maxQueue) {
       throw new Error(`${this.provider} quote queue is at bounded discovery capacity`);
     }
 

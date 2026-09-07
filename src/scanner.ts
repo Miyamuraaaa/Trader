@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { ScannerFirstLegBulkheads, ScannerBackgroundLane } from './scanner-bulkheads.js';
 import { CONFIG, DECIMALS, MINTS } from './config.js';
 import {
   getProviderQuote,
@@ -68,6 +69,9 @@ import {
 const executionEngine: ExecutionEngine = CONFIG.executionMode === 'paper'
   ? new PaperExecutionEngine()
   : new DisabledPaperExecutionEngine();
+
+const firstLegBulkheads = new ScannerFirstLegBulkheads(getQuotesFromProviders);
+const directBackgroundLane = new ScannerBackgroundLane(4);
 
 export function getExecutionEngine(): ExecutionEngine {
   return executionEngine;
@@ -716,6 +720,7 @@ function triggerOrcaCrossPoolScan(estimatedNetworkCostsUsdc: {
 export async function scanOnce(
   preferredCycle?: ScanCycle,
   scheduledTradeSizes: number[] = nextTradeSizes(),
+  backgroundDirect = false,
 ): Promise<void> {
   const cycle = nextScanCycle(preferredCycle);
   if (!cycle) {
@@ -785,33 +790,30 @@ export async function scanOnce(
 
       const buyAmount = toAtomic(tradeSizeUsdc, DECIMALS.USDC);
       const allProviders = getEnabledProviders();
+      const releaseDirect = backgroundDirect && !CONFIG.directDexOnly ? directBackgroundLane.reserve() : undefined;
       const scanProviders = CONFIG.directDexOnly
         ? allProviders.filter((provider) => provider.kind === 'direct')
-        : allProviders;
-      const buyResults = await getQuotesFromProviders(scanProviders, {
+        : backgroundDirect && !releaseDirect ? allProviders.filter((provider) => provider.kind === 'aggregator') : allProviders;
+      const firstLegs = firstLegBulkheads.start(scanProviders, {
         inputMint: cycle.inputMint,
         outputMint: cycle.intermediateMint,
         amountAtomic: buyAmount,
         slippageBps: CONFIG.slippageBps,
         dexes: CONFIG.buyDexes.length > 0 ? CONFIG.buyDexes : undefined,
         priority: cycle.tier === 'HOT' ? 'HIGH' : 'LOW',
+      }, CONFIG.scannerDirectLaneDeadlineMs, (lane, elapsed) => {
+        scannerStats.lanes[`${lane}FirstLegMs`] = elapsed;
       });
-      recordProviderQuoteResults(buyResults);
-      if (CONFIG.verboseScanOutput || CONFIG.debug) {
-        printQuoteComparison(cycle.inputMint, cycle.intermediateMint, buyAmount, buyResults);
-      }
-      const buyQuotes = availableOrLog(buyResults, `${cycle.startingToken} -> ${cycle.intermediateToken}`);
-      if (buyQuotes.length === 0) continue;
-      for (const quote of buyQuotes) {
-        insertQuote(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`));
-      }
+      const persistFirstLegs = (results: ProviderQuoteResult[]) => {
+        recordProviderQuoteResults(results);
+        for (const quote of successfulQuotes(results).filter(isFullFillQuote)) insertQuote(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`));
+        return results;
+      };
 
       const directProviders = scanProviders.filter((provider) => provider.kind === 'direct');
-      const directNames = new Set(directProviders.map((provider) => provider.name));
-      const directFirstLegs = buyResults.filter((result) => directNames.has(result.provider));
+      const directFirstLegsPromise = firstLegs.direct.then(persistFirstLegs);
       const aggregatorProviders = scanProviders.filter((provider) => provider.kind === 'aggregator');
-      const aggregatorNames = new Set(aggregatorProviders.map((provider) => provider.name));
-      const aggregatorFirstLegs = buyResults.filter((result) => aggregatorNames.has(result.provider));
+      const aggregatorFirstLegsPromise = firstLegs.aggregator.then(persistFirstLegs);
       const observableRoutes: RoundTripResult[] = [];
       let persisted = false;
       let executionCandidateChosen = false;
@@ -828,7 +830,7 @@ export async function scanOnce(
       // remains responsible for pacing/concurrency, so a slow Jupiter/Raptor
       // request cannot serialize direct-DEX route discovery.
       const fastMatrixPromise = !CONFIG.directDexOnly && aggregatorProviders.length >= 2
-        ? buildRoundTripMatrix(
+        ? aggregatorFirstLegsPromise.then((aggregatorFirstLegs) => buildRoundTripMatrix(
           aggregatorFirstLegs,
           aggregatorProviders,
           {
@@ -840,9 +842,9 @@ export async function scanOnce(
           },
           estimatedNetworkCostsUsdc,
           spreadPrefilter(aggregatorFirstLegs),
-        )
+        ))
         : undefined;
-      const directMatrixPromise = buildRoundTripMatrix(
+      const directMatrixPromise = directFirstLegsPromise.then((directFirstLegs) => buildRoundTripMatrix(
         directFirstLegs,
         directProviders,
         {
@@ -854,9 +856,10 @@ export async function scanOnce(
         },
         estimatedNetworkCostsUsdc,
         spreadPrefilter(directFirstLegs),
-      );
+        CONFIG.scannerDirectLaneDeadlineMs,
+      ));
       const mixedMatrixPromise = !CONFIG.directDexOnly
-        ? buildRoundTripMatrix(
+        ? firstLegs.mixed.then((buyResults) => buildRoundTripMatrix(
           buyResults,
           scanProviders,
           {
@@ -872,15 +875,17 @@ export async function scanOnce(
             const sellIsAggregator = sellProvider.kind === 'aggregator';
             return buyIsAggregator !== sellIsAggregator;
           }),
-        )
+          CONFIG.scannerDirectLaneDeadlineMs,
+        ))
         : undefined;
 
       // Preserve the original Jupiter <-> Raptor behavior as a fast lane. This
       // matrix is evaluated and published before any RPC-heavy direct-DEX work.
+      try {
       if (!CONFIG.directDexOnly && aggregatorProviders.length >= 2) {
         scannerStats.currentPhase = 'JUPITER_RAPTOR_FAST_LANE';
         const fastMatrix = await fastMatrixPromise!;
-        recordMatrixEvaluations(fastMatrix.routes);
+        recordMatrixEvaluations(fastMatrix.routes, 'aggregator');
         completedRoutes += fastMatrix.routes.length;
         observableRoutes.push(...fastMatrix.routes);
         if (CONFIG.verboseScanOutput || CONFIG.debug) printRoundTripMatrix('JUPITER <-> RAPTOR FAST LANE', fastMatrix);
@@ -913,9 +918,17 @@ export async function scanOnce(
         }
       }
 
+      } catch (error) {
+        releaseDirect?.();
+        // Both promises already have allSettled quote isolation. Observe any outer failure too.
+        void directMatrixPromise.catch(() => undefined); void mixedMatrixPromise?.catch(() => undefined);
+        throw error;
+      }
+      completedSize = completedSize || completedRoutes > 0;
+      const completeDirectWork = async () => {
       scannerStats.currentPhase = 'DIRECT_MATRIX';
       const directMatrix = await directMatrixPromise;
-      recordMatrixEvaluations(directMatrix.routes);
+      recordMatrixEvaluations(directMatrix.routes, 'direct');
       completedRoutes += directMatrix.routes.length;
       if (CONFIG.verboseScanOutput || CONFIG.debug) printRoundTripMatrix('DIRECT CROSS-DEX OPPORTUNITIES', directMatrix);
       for (const route of directMatrix.routes) {
@@ -945,7 +958,7 @@ export async function scanOnce(
       if (!CONFIG.directDexOnly) {
         scannerStats.currentPhase = 'MIXED_PROVIDER_MATRIX';
         const mixedMatrix = await mixedMatrixPromise!;
-        recordMatrixEvaluations(mixedMatrix.routes);
+        recordMatrixEvaluations(mixedMatrix.routes, 'mixed');
         completedRoutes += mixedMatrix.routes.length;
         observableRoutes.push(...mixedMatrix.routes);
         if (CONFIG.verboseScanOutput || CONFIG.debug) printRoundTripMatrix('AGGREGATOR <-> DIRECT DEX ROUTES', mixedMatrix);
@@ -992,6 +1005,13 @@ export async function scanOnce(
         if (observed) await persistRoute(observed);
       }
       scannerStats.tradeSizesCompleted++;
+      };
+      if (backgroundDirect && !CONFIG.directDexOnly) {
+        // P0 publication and the NEXT aggregator cycle never await this RPC lane.
+        void completeDirectWork().catch((error: unknown) => {
+          log.warn('Direct/mixed scanner lane failed independently', { reason: error instanceof Error ? error.message : String(error) });
+        }).finally(() => releaseDirect?.());
+      } else await completeDirectWork();
     }
 
     insertHealth(timestamp, 'scanner', completedSize ? 'OK' : 'DEGRADED', null, 0, 0);
@@ -1002,6 +1022,7 @@ export async function scanOnce(
     }
     consecutiveFailures = completedSize ? 0 : consecutiveFailures + 1;
     scannerStats.scansCompleted++;
+    laneEvents.push({ at: Date.now(), lane: 'cycle', count: 1, stale: 0, duration: Date.now() - Date.parse(timestamp) });
     scannerStats.lastScanCompletedAt = new Date().toISOString();
     scannerStats.currentPhase = completedSize ? 'IDLE' : 'DEGRADED';
     scannerStats.currentTradeSizeUsdc = null;
@@ -1035,6 +1056,7 @@ export async function scanOnce(
 }
 
 export const scannerStats: {
+  lanes: { aggregatorFirstLegMs: number; directFirstLegMs: number; aggregatorFastLaneEvals60s: number; directLaneEvals60s: number; mixedLaneEvals60s: number; completedScans60s: number; scannerCycleP50: number; scannerCycleP90: number; staleByLane60s: Record<string, number> };
   evaluationsThisMinute: number;
   routesEvaluated: number;
   tradeSizesCompleted: number;
@@ -1072,6 +1094,7 @@ export const scannerStats: {
     rateLimitsPerMinute: number;
   }>;
 } = {
+  lanes: { aggregatorFirstLegMs: 0, directFirstLegMs: 0, aggregatorFastLaneEvals60s: 0, directLaneEvals60s: 0, mixedLaneEvals60s: 0, completedScans60s: 0, scannerCycleP50: 0, scannerCycleP90: 0, staleByLane60s: {} },
   evaluationsThisMinute: 0,
   routesEvaluated: 0,
   tradeSizesCompleted: 0,
@@ -1100,6 +1123,7 @@ export const scannerStats: {
 };
 
 const evaluationBuckets: Array<{ timestamp: number; count: number }> = [];
+const laneEvents: Array<{ at: number; lane: string; count: number; stale: number; duration: number }> = [];
 type PairBucket = {
   timestamp: number;
   pair: string;
@@ -1160,7 +1184,8 @@ function recordPairEvaluation(
   refreshDiscoveryMetrics();
 }
 
-function recordMatrixEvaluations(routes: RoundTripResult[]): void {
+function recordMatrixEvaluations(routes: RoundTripResult[], lane: 'aggregator' | 'direct' | 'mixed'): void {
+  laneEvents.push({ at: Date.now(), lane, count: routes.length, stale: routes.filter((r) => r.stale).length, duration: 0 });
   recordRouteEvaluations(routes.length);
   const dynamicByMint = new Map(getDynamicTokens().map((token) => [token.mint, token]));
   const token2022Program = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -1205,6 +1230,16 @@ function recordHandoff(route: RoundTripResult): void {
 
 function refreshDiscoveryMetrics(now = Date.now()): void {
   const cutoff = now - 60_000;
+  while (laneEvents[0] && laneEvents[0].at < cutoff) laneEvents.shift();
+  const sum = (lane: string) => laneEvents.filter((e) => e.lane === lane).reduce((n, e) => n + e.count, 0);
+  scannerStats.lanes.aggregatorFastLaneEvals60s = sum('aggregator');
+  scannerStats.lanes.directLaneEvals60s = sum('direct');
+  scannerStats.lanes.mixedLaneEvals60s = sum('mixed');
+  scannerStats.lanes.completedScans60s = sum('cycle');
+  const durations = laneEvents.filter((e) => e.lane === 'cycle').map((e) => e.duration).sort((a, b) => a - b);
+  scannerStats.lanes.scannerCycleP50 = durations[Math.max(0, Math.ceil(durations.length * .5) - 1)] ?? 0;
+  scannerStats.lanes.scannerCycleP90 = durations[Math.max(0, Math.ceil(durations.length * .9) - 1)] ?? 0;
+  scannerStats.lanes.staleByLane60s = Object.fromEntries(['aggregator', 'direct', 'mixed'].map((lane) => [lane, laneEvents.filter((e) => e.lane === lane).reduce((n, e) => n + e.stale, 0)]));
   while (pairBuckets[0] && pairBuckets[0].timestamp < cutoff) pairBuckets.shift();
   while (providerQuoteBuckets[0] && providerQuoteBuckets[0].timestamp < cutoff) providerQuoteBuckets.shift();
   const pairs: typeof scannerStats.providerPairs = {};
@@ -1312,7 +1347,7 @@ export async function scanLoop(): Promise<void> {
       await waitForMarketEventOrInterval();
       continue;
     }
-    await Promise.allSettled(cycles.map((cycle) => scanOnce(cycle, nextTradeSizes())));
+    await Promise.allSettled(cycles.map((cycle) => scanOnce(cycle, nextTradeSizes(), true)));
     if (!running) break;
     if (pendingMarketCycles.size === 0) await waitForMarketEventOrInterval();
   }

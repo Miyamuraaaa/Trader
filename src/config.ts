@@ -276,6 +276,8 @@ export const CONFIG = {
   maxExecutionConsecutiveFailures: num('MAX_EXECUTION_CONSECUTIVE_FAILURES', 2, 10),
   maxSessionLossUsdc: num('MAX_SESSION_LOSS_USDC', 0.25),
   maxConcurrentExecutions: num('MAX_CONCURRENT_EXECUTIONS', 1, 1),
+  // Scanner-only soft budget. Never used for executor freshness/approval.
+  scannerDirectLaneDeadlineMs: num('SCANNER_DIRECT_LANE_DEADLINE_MS', 1000, 10_000),
   minSolFeeReserve: num('MIN_SOL_FEE_RESERVE', 0.002),
   maxExecutionQuoteAgeMs: num('MAX_EXECUTION_QUOTE_AGE_MS', 1200),
   raptorExecutionQuoteAgeMs: num('RAPTOR_EXECUTION_QUOTE_AGE_MS', 1800, 1800),

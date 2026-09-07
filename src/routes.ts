@@ -1,4 +1,5 @@
 import type { ProviderQuoteResult } from './aggregators/index.js';
+import { scannerDeadline } from './scanner-bulkheads.js';
 import {
   getRouteLabels,
   isFullFillQuote,
@@ -130,14 +131,18 @@ export async function buildRoundTripMatrix(
   },
   estimatedNetworkFeeUsdc: number | EstimatedCostInput,
   include: (buy: Quote, sellProvider: QuoteProvider) => boolean = () => true,
+  scannerBudgetMs?: number,
 ): Promise<RoundTripMatrix> {
+  const deadlineAt = scannerBudgetMs === undefined ? undefined : Date.now() + scannerBudgetMs;
   const buys = firstLegResults.flatMap((result) =>
     result.quote && isFullFillQuote(result.quote) ? [result.quote] : [],
   );
   const supported = await Promise.allSettled(sellProviders.map(async (provider) => ({
     provider,
-    supported: typeof provider.supportsPair !== 'function'
-      || await provider.supportsPair(baseParams.intermediateMint, baseParams.startingMint),
+    supported: provider.isRateLimited?.() ? false : typeof provider.supportsPair !== 'function'
+      || await (scannerBudgetMs === undefined
+        ? provider.supportsPair(baseParams.intermediateMint, baseParams.startingMint)
+        : scannerDeadline(provider.supportsPair(baseParams.intermediateMint, baseParams.startingMint), scannerBudgetMs, false)),
   })));
   const supportedSellProviders = supported.flatMap((result) =>
     result.status === 'fulfilled' && result.value.supported ? [result.value.provider] : [],
@@ -147,7 +152,8 @@ export async function buildRoundTripMatrix(
     .map((sellProvider) => ({ buy, sellProvider })));
 
   const settled = await Promise.allSettled(jobs.map(async ({ buy, sellProvider }) => {
-    const sellQuote = await sellProvider.getQuote({
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) throw new Error('SCANNER_SECOND_LEG_SOFT_DEADLINE');
+    const work = sellProvider.getQuote({
       inputMint: baseParams.intermediateMint,
       outputMint: baseParams.startingMint,
       amountAtomic: buy.outAmount, // exact integer output from leg 1
@@ -155,6 +161,9 @@ export async function buildRoundTripMatrix(
       dexes: baseParams.dexes,
       priority: baseParams.priority,
     });
+    const sellQuote = deadlineAt === undefined ? await work
+      : await scannerDeadline<Quote | undefined>(work, Math.max(0, deadlineAt - Date.now()), undefined);
+    if (!sellQuote) throw new Error('SCANNER_SECOND_LEG_SOFT_DEADLINE');
     if (!isFullFillQuote(sellQuote)) {
       throw new Error(`${sellProvider.name} returned a partial second-leg fill`);
     }
