@@ -1,6 +1,10 @@
 import { exact } from '../math.js';
 import { isExecutableProviderPair } from './executable-route-policy.js';
 import type { QuoteProviderName } from '../aggregators/types.js';
+/** This table contains scanner history, never executor journal states. */
+export function scannerLifecycleDisplay(state: unknown): unknown {
+  return state === 'EXPIRED' ? 'MARKET_SIGNAL_ENDED' : state;
+}
 export function scannerDisplayEligibility(row: Record<string, unknown>, liveCapUsdc: number): string {
   try {
     if (exact(String(row.trade_size_usdc)).gt(liveCapUsdc)) return 'ABOVE_LIVE_CAP';

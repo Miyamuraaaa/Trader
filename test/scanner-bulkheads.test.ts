@@ -46,6 +46,19 @@ describe('TEST DATA: scanner independent first-leg lanes', () => {
     await vi.advanceTimersByTimeAsync(100); expect((await lanes.direct)[0]?.error?.message).toContain('SOFT_DEADLINE');
     await vi.runAllTimersAsync();
   });
+  it('dispatches each positive aggregator route before the direct/mixed lane and history work', async () => {
+    vi.useFakeTimers(); const j = provider('jupiter', 10), r = provider('raptor', 10), d = provider('orca', 1000);
+    const original = r.getQuote;
+    r.getQuote = async (p) => ({ ...await original(p), outAmount: '50000', otherAmountThreshold: '49000' });
+    const lanes = bulkheads().start([j, r, d], params, 2000);
+    let directComplete = false; void lanes.direct.then(() => { directComplete = true; });
+    const events: string[] = [];
+    const matrix = lanes.aggregator.then((quotes) => buildRoundTripMatrix(quotes, [j, r], { intermediateMint: 'TEST_TOKEN', startingMint: 'TEST_USDC', slippageBps: 5 }, 0, () => true, undefined,
+      (route) => { if (route.profit.estimatedNetProfitUsdc.gt(0)) events.push('PREFILTER_STARTED'); })).then(() => events.push('HISTORY'));
+    await vi.advanceTimersByTimeAsync(25); await matrix;
+    expect(events[0]).toBe('PREFILTER_STARTED'); expect(directComplete).toBe(false);
+    await vi.runAllTimersAsync();
+  });
   it('direct cooldown/429 does not delay aggregator completion or create retries', async () => {
     vi.useFakeTimers(); const j = provider('jupiter', 10); const r = provider('raptor', 10); const d = provider('meteora');
     d.isRateLimited = () => true;

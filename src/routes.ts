@@ -146,6 +146,7 @@ export async function buildRoundTripMatrix(
   estimatedNetworkFeeUsdc: number | EstimatedCostInput,
   include: (buy: Quote, sellProvider: QuoteProvider) => boolean = () => true,
   scannerBudgetMs?: number,
+  onRoute?: (route: RoundTripResult) => void,
 ): Promise<RoundTripMatrix> {
   const deadlineAt = scannerBudgetMs === undefined ? undefined : Date.now() + scannerBudgetMs;
   const buys = firstLegResults.flatMap((result) =>
@@ -196,7 +197,7 @@ export async function buildRoundTripMatrix(
     const classification = classifyRoute(buy, sellQuote);
     const liquidityOverlap = detectLiquidityOverlap(buy, sellQuote);
     const category = categorizeProfit(profit);
-    return {
+    const result = {
       buyQuote: buy,
       sellQuote,
       classification,
@@ -213,6 +214,8 @@ export async function buildRoundTripMatrix(
       opportunityScope: 'RAW_MARKET_OPPORTUNITY',
       profit,
     } satisfies RoundTripResult;
+    onRoute?.(result);
+    return result;
   }));
 
   const routes: RoundTripResult[] = [];

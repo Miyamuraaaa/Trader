@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import { executionFunnel } from './execution/execution-funnel.js';
+import { PrefilterCoalescer, type PrefilterTrace } from './execution/prefilter-trace.js';
+import { isExecutableProviderPair } from './execution/executable-route-policy.js';
 import { prioritizeDirectMarketPair } from './direct-market-stream.js';
 import { ScannerFirstLegBulkheads, ScannerBackgroundLane } from './scanner-bulkheads.js';
 import { CONFIG, DECIMALS, MINTS } from './config.js';
@@ -29,6 +31,7 @@ import {
   buildExecutableCandidateFromRaw,
   prewarmScannerExecutionMints,
   type ScannerExecutableCostSnapshot,
+  type ExecutablePrefilterResult,
 } from './execution/scanner-executable-prefilter.js';
 import {
   expireOpportunitiesByIdentity,
@@ -360,6 +363,25 @@ async function getScannerCostSnapshot(): Promise<ScannerCostSnapshot> {
   return scannerCostSnapshotPending;
 }
 
+const prefilterCoalescer = new PrefilterCoalescer<ExecutablePrefilterResult>();
+const prefilterJobs = new WeakMap<RoundTripResult, Promise<RoundTripResult[]>>();
+const preparedOpportunityIds = new WeakMap<RoundTripResult, string>();
+function registerRawPositive(raw: RoundTripResult): PrefilterTrace {
+  const now = Date.now();
+  const trace: PrefilterTrace = { rawPositiveDetectedAt: now, rawQuoteEvidenceAt: Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp),
+    rawQuoteAgeAtDetectionMs: Math.max(0, now - Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp)), executablePrefilterQueuedAt: now };
+  if (!raw.diagnosticSignalId) {
+    raw.diagnosticSignalId = `${raw.buyQuote.id}:${raw.sellQuote.id}`;
+    scannerStats.executionPrefilter.rawPositiveOpportunities++;
+    executionFunnel.record({ identity: raw.diagnosticSignalId, stage: 'RAW_POSITIVE', at: now, detectedAt: now });
+    executionFunnel.raw.register(raw.diagnosticSignalId, trace);
+    executionFunnel.signal({ id: raw.diagnosticSignalId, detectedAt: now, providers: `${raw.buyQuote.provider}->${raw.sellQuote.provider}`,
+      intermediateMint: raw.buyQuote.outputMint, inputAmount: raw.buyQuote.inAmount, rawNet: raw.profit.estimatedNetProfitUsdc.toFixed(6), rawWorstCase: raw.profit.worstCaseNetProfitUsdc.toFixed(6),
+      pools: [raw.buyQuote.poolIds, raw.sellQuote.poolIds], prefilterTrace: trace, p0Handoff: false });
+  }
+  return trace;
+}
+
 async function findExecutableCandidates(
   rawRoutes: RoundTripResult[],
   costs: ScannerExecutableCostSnapshot,
@@ -368,14 +390,36 @@ async function findExecutableCandidates(
     route.profit.estimatedNetProfitUsdc.gt(0) && route.profit.worstCaseNetProfitUsdc.gt(0));
   const capAtomic = BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC));
   const results = await Promise.all(positive.map(async (raw) => {
-    const signalId = raw.diagnosticSignalId ?? `${raw.buyQuote.id}:${raw.sellQuote.id}`;
+    const trace = registerRawPositive(raw);
+    const signalId = raw.diagnosticSignalId!;
     const event = (stage: string) => executionFunnel.record({ identity: signalId, stage, at: Date.now(), detectedAt: raw.buyQuote.responseTimestamp });
-    if (raw.opportunityScope === 'DISCOVERY_ONLY_TOKEN_2022') { event('DISCOVERY_ONLY_TOKEN_2022'); executionFunnel.update(signalId, { prefilterResult: 'DISCOVERY_ONLY_TOKEN_2022' }); return undefined; }
-    if (BigInt(raw.buyQuote.inAmount) > capAtomic) { event('ABOVE_LIVE_CAP'); executionFunnel.update(signalId, { prefilterResult: 'ABOVE_LIVE_CAP' }); return undefined; }
-    const result = await buildExecutableCandidateFromRaw(raw, costs);
+    const eligibility = BigInt(raw.buyQuote.inAmount) > capAtomic ? 'ABOVE_LIVE_CAP'
+      : !isExecutableProviderPair(raw.buyQuote.provider, raw.sellQuote.provider) ? 'UNSUPPORTED_PROVIDER_PAIR'
+      : raw.opportunityScope === 'DISCOVERY_ONLY_TOKEN_2022' ? 'DISCOVERY_ONLY_TOKEN_2022' : undefined;
+    executionFunnel.update(signalId, { liveEligibility: eligibility ?? 'ELIGIBLE_FOR_PREFILTER', prefilterTrace: trace });
+    const key = JSON.stringify([raw.buyQuote.provider, raw.sellQuote.provider, raw.buyQuote.inputMint, raw.buyQuote.outputMint, raw.sellQuote.outputMint,
+      raw.buyQuote.inAmount, [...new Set(raw.buyQuote.poolIds)].sort(), [...new Set(raw.sellQuote.poolIds)].sort(),
+      [raw.buyQuote, raw.sellQuote].map((quote) => quote.routePlan.map((step) => [step.swapInfo?.programId, step.swapInfo?.label]))]);
+    const result: ExecutablePrefilterResult = eligibility ? { status: eligibility, trace }
+      : await prefilterCoalescer.schedule(key, trace.rawQuoteEvidenceAt, () => {
+        event('PREFILTER_STARTED');
+        return buildExecutableCandidateFromRaw(raw, costs, { trace });
+      }, (status) => ({ status, trace }));
+    executionFunnel.raw.finish(signalId, result.status, result.trace);
+    if (trace.executablePrefilterStartedAt !== undefined) event('PREFILTER_COMPLETED');
     event(result.status);
+    // Publish only a freshly constrained executable route, before any history/UI persistence.
+    if (result.status === 'EXECUTABLE_CANDIDATE' && result.route) {
+      result.route.diagnosticSignalId = signalId;
+      if (isFreshPositiveAuditedExecutionSignal(result.route) && shouldPublishFreshLiveHandoff(result.route)) {
+        const opportunityId = crypto.randomUUID();
+        preparedOpportunityIds.set(result.route, opportunityId);
+        await publishSupportedAggregatorHandoff(result.route, opportunityId, trace.rawPositiveDetectedAt, calculateConfidence(result.route, Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC))));
+      }
+    }
+    log.info('RAW_POSITIVE_PREFILTER', { correlationId: signalId, ...trace, result: result.status });
     executionFunnel.update(signalId, { prefilterResult: result.status,
-      constrainedNet: result.route?.profit.estimatedNetProfitUsdc.toFixed(6), constrainedWorstCase: result.route?.profit.worstCaseNetProfitUsdc.toFixed(6),
+      prefilterTrace: result.trace, constrainedNet: result.route?.profit.estimatedNetProfitUsdc.toFixed(6), constrainedWorstCase: result.route?.profit.worstCaseNetProfitUsdc.toFixed(6),
       networkFee: String(costs.estimatedNetworkCostsUsdc.baseNetworkFeeUsdc), priorityFee: String(costs.estimatedNetworkCostsUsdc.priorityFeeUsdc),
       ataRent: result.estimatedAtaRentUsdc === undefined ? undefined : String(result.estimatedAtaRentUsdc),
       pools: result.route ? [result.route.buyQuote.poolIds, result.route.sellQuote.poolIds] : [raw.buyQuote.poolIds, raw.sellQuote.poolIds] });
@@ -542,7 +586,7 @@ async function persistAndEvaluateRoute(
     printEstimatedRoundTrip(buyLeg, sellLeg, profit, route.opportunityScope);
   }
   const confidence = calculateConfidence(route, tradeSizeUsdc);
-  const oppId = crypto.randomUUID();
+  const oppId = preparedOpportunityIds.get(route) ?? crypto.randomUUID();
   const now = Date.now();
   const detectedTimestamp = new Date(lifecycle.observedAt).toISOString();
   const initialDetectedAt = lifecycle.initialDetectedAt === null
@@ -828,9 +872,9 @@ export async function scanOnce(
       };
 
       const directProviders = scanProviders.filter((provider) => provider.kind === 'direct');
-      const directFirstLegsPromise = firstLegs.direct.then(persistFirstLegs);
+      const directFirstLegsPromise = firstLegs.direct;
       const aggregatorProviders = scanProviders.filter((provider) => provider.kind === 'aggregator');
-      const aggregatorFirstLegsPromise = firstLegs.aggregator.then(persistFirstLegs);
+      const aggregatorFirstLegsPromise = firstLegs.aggregator;
       const observableRoutes: RoundTripResult[] = [];
       let persisted = false;
       let executionCandidateChosen = false;
@@ -841,6 +885,16 @@ export async function scanOnce(
         if (persistedQuotePairs.has(key)) return false;
         persistedQuotePairs.add(key);
         return persistAndEvaluateRoute(route, scanRowId, timestamp, tradeSizeUsdc, confirm);
+      };
+      const promoteRawImmediately = (route: RoundTripResult) => {
+        if (CONFIG.executionMode !== 'live' || !route.profit.estimatedNetProfitUsdc.gt(0) || !route.profit.worstCaseNetProfitUsdc.gt(0) || prefilterJobs.has(route)) return;
+        const work = findExecutableCandidates([route], { referenceSolPriceUsdc, estimatedNetworkCostsUsdc }).catch(() => {
+          const id = route.diagnosticSignalId!;
+          executionFunnel.raw.finish(id, 'QUOTE_FAILED');
+          executionFunnel.update(id, { prefilterResult: 'QUOTE_FAILED' });
+          return [];
+        });
+        prefilterJobs.set(route, work);
       };
 
       // Submit all independent second-leg work now. Each provider's own runtime
@@ -859,6 +913,8 @@ export async function scanOnce(
           },
           estimatedNetworkCostsUsdc,
           spreadPrefilter(aggregatorFirstLegs),
+          undefined,
+          promoteRawImmediately,
         ))
         : undefined;
       const directMatrixPromise = directFirstLegsPromise.then((directFirstLegs) => buildRoundTripMatrix(
@@ -874,6 +930,7 @@ export async function scanOnce(
         estimatedNetworkCostsUsdc,
         spreadPrefilter(directFirstLegs),
         CONFIG.scannerDirectLaneDeadlineMs,
+        promoteRawImmediately,
       ));
       const mixedMatrixPromise = !CONFIG.directDexOnly
         ? firstLegs.mixed.then((buyResults) => buildRoundTripMatrix(
@@ -893,6 +950,7 @@ export async function scanOnce(
             return buyIsAggregator !== sellIsAggregator;
           }),
           CONFIG.scannerDirectLaneDeadlineMs,
+          promoteRawImmediately,
         ))
         : undefined;
 
@@ -902,6 +960,8 @@ export async function scanOnce(
       if (!CONFIG.directDexOnly && aggregatorProviders.length >= 2) {
         scannerStats.currentPhase = 'JUPITER_RAPTOR_FAST_LANE';
         const fastMatrix = await fastMatrixPromise!;
+        // Every positive route has already started prefiltering from the per-route callback.
+        persistFirstLegs(await aggregatorFirstLegsPromise);
         recordMatrixEvaluations(fastMatrix.routes, 'aggregator');
         completedRoutes += fastMatrix.routes.length;
         observableRoutes.push(...fastMatrix.routes);
@@ -917,9 +977,7 @@ export async function scanOnce(
         // separately requoted route constrained to the executor's exact DEX,
         // hop and amount-propagation policy may enter the P0 lane.
         const executableFast = CONFIG.executionMode === 'live'
-          ? await findExecutableCandidates(fastMatrix.routes, {
-            referenceSolPriceUsdc, estimatedNetworkCostsUsdc,
-          })
+          ? (await Promise.all(fastMatrix.routes.map((route) => prefilterJobs.get(route) ?? Promise.resolve([])))).flat()
           : [];
         for (const executable of executableFast) {
           const passed = await persistRoute(executable);
@@ -943,6 +1001,8 @@ export async function scanOnce(
       }
       completedSize = completedSize || completedRoutes > 0;
       const completeDirectWork = async () => {
+      persistFirstLegs(await directFirstLegsPromise);
+      if (!fastMatrixPromise) persistFirstLegs(await aggregatorFirstLegsPromise);
       scannerStats.currentPhase = 'DIRECT_MATRIX';
       const directMatrix = await directMatrixPromise;
       recordMatrixEvaluations(directMatrix.routes, 'direct');
@@ -987,9 +1047,7 @@ export async function scanOnce(
           ));
         }
         const executableMixed = CONFIG.executionMode === 'live'
-          ? await findExecutableCandidates(mixedMatrix.routes, {
-            referenceSolPriceUsdc, estimatedNetworkCostsUsdc,
-          })
+          ? (await Promise.all(mixedMatrix.routes.map((route) => prefilterJobs.get(route) ?? Promise.resolve([])))).flat()
           : [];
         for (const executable of executableMixed) {
           const passed = await persistRoute(executable);
@@ -1210,17 +1268,15 @@ function recordMatrixEvaluations(routes: RoundTripResult[], lane: 'aggregator' |
     if (route.opportunityScope !== 'EXECUTABLE_CANDIDATE'
       && route.profit.estimatedNetProfitUsdc.gt(0)
       && route.profit.worstCaseNetProfitUsdc.gt(0)) {
-      scannerStats.executionPrefilter.rawPositiveOpportunities++;
-      const signalId = `${route.buyQuote.id}:${route.sellQuote.id}`;
-      route.diagnosticSignalId = signalId;
-      executionFunnel.record({ identity: signalId, stage: 'RAW_POSITIVE', at: Date.now(), detectedAt: route.buyQuote.responseTimestamp });
-      executionFunnel.signal({ id: signalId, detectedAt: Date.now(), providers: `${route.buyQuote.provider}->${route.sellQuote.provider}`,
-        intermediateMint: route.buyQuote.outputMint, inputAmount: route.buyQuote.inAmount,
-        rawNet: route.profit.estimatedNetProfitUsdc.toFixed(6), rawWorstCase: route.profit.worstCaseNetProfitUsdc.toFixed(6),
-        pools: [route.buyQuote.poolIds, route.sellQuote.poolIds], p0Handoff: false });
+      if (!route.diagnosticSignalId) {
+        registerRawPositive(route);
+        executionFunnel.raw.finish(route.diagnosticSignalId!, 'OBSERVATION_ONLY');
+        executionFunnel.update(route.diagnosticSignalId!, { prefilterResult: 'OBSERVATION_ONLY' });
+      }
       if (dynamicByMint.get(route.buyQuote.outputMint)?.tokenProgram === token2022Program) {
+        const alreadyClassified = route.opportunityScope === 'DISCOVERY_ONLY_TOKEN_2022';
         route.opportunityScope = 'DISCOVERY_ONLY_TOKEN_2022';
-        scannerStats.executionPrefilter.token2022DiscoveryOnly++;
+        if (!alreadyClassified) scannerStats.executionPrefilter.token2022DiscoveryOnly++;
       }
     }
     recordPairEvaluation(

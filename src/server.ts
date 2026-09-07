@@ -1,6 +1,6 @@
 import express from 'express';
 import { executionFunnel } from './execution/execution-funnel.js';
-import { scannerDisplayEligibility } from './execution/scanner-display-eligibility.js';
+import { scannerDisplayEligibility, scannerLifecycleDisplay } from './execution/scanner-display-eligibility.js';
 import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
 import { directMarketStreamHealth } from './direct-market-stream.js';
 import cors from 'cors';
@@ -99,7 +99,10 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
 
   app.get('/api/opportunities', (req, res) => {
     try {
-      res.json(getRecentOpportunities(100));
+      res.json(getRecentOpportunities(100).map((value) => {
+        const row = value as Record<string, unknown>;
+        return CONFIG.executionMode === 'live' ? { ...row, opportunity_state: scannerLifecycleDisplay(row.opportunity_state), executionEligibility: scannerDisplayEligibility(row, CONFIG.firstLiveMaxInputUsdc) } : row;
+      }));
     } catch (err: unknown) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -356,7 +359,7 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
           manualApprovalMockEnabled: CONFIG.manualApprovalUiMock,
           opportunities: getRecentOpportunities(20).map((value) => {
             const row = value as Record<string, unknown>;
-            return { ...row, executionEligibility: scannerDisplayEligibility(row, CONFIG.firstLiveMaxInputUsdc) };
+            return { ...row, opportunity_state: CONFIG.executionMode === 'live' ? scannerLifecycleDisplay(row.opportunity_state) : row.opportunity_state, executionEligibility: scannerDisplayEligibility(row, CONFIG.firstLiveMaxInputUsdc) };
           }),
           trades: paperActive ? getRecentTrades(20) : live!.trades,
         };

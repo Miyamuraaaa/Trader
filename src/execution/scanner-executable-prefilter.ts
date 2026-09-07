@@ -23,6 +23,7 @@ import {
   quoteMatchesExecutableProviderPolicy,
 } from './executable-route-policy.js';
 import { assertIntermediateTokenExecutionPolicy } from './token-analysis.js';
+import type { PrefilterTrace } from './prefilter-trace.js';
 
 export type ExecutablePrefilterStatus =
   | 'EXECUTABLE_CANDIDATE'
@@ -32,7 +33,8 @@ export type ExecutablePrefilterStatus =
   | 'TOKEN_POLICY_REJECTED'
   | 'ROUTE_POLICY_REJECTED'
   | 'ECONOMICS_DIVERGED'
-  | 'QUOTE_FAILED';
+  | 'QUOTE_FAILED' | 'ABOVE_LIVE_CAP' | 'RAW_SIGNAL_ENDED' | 'RAW_STALE_BEFORE_PREFILTER'
+  | 'PREFILTER_STALE' | 'PREFILTER_RATE_LIMITED' | 'COALESCED' | 'OBSERVATION_ONLY';
 
 export interface ScannerExecutableCostSnapshot {
   referenceSolPriceUsdc: number;
@@ -43,6 +45,7 @@ export interface ScannerExecutableCostSnapshot {
 }
 
 export interface ExecutablePrefilterResult {
+  trace?: PrefilterTrace;
   estimatedAtaRentUsdc?: number;
   status: ExecutablePrefilterStatus;
   route?: RoundTripResult;
@@ -97,7 +100,7 @@ export async function prewarmScannerExecutionMints(mints: readonly string[]): Pr
   );
 }
 
-async function classifyIntermediate(mint: string): Promise<{
+export async function classifyIntermediate(mint: string): Promise<{
   status: 'SUPPORTED' | 'TOKEN_2022' | 'REJECTED';
   rentLamports: number;
   reason?: string;
@@ -163,7 +166,23 @@ function exactPoolEvidence(quote: Quote): string[] {
 export async function buildExecutableCandidateFromRaw(
   raw: RoundTripResult,
   costs: ScannerExecutableCostSnapshot,
+  options: { trace?: PrefilterTrace; now?: () => number; policy?: typeof classifyIntermediate; quote?: typeof constrainedQuote } = {},
 ): Promise<ExecutablePrefilterResult> {
+  const now = options.now ?? Date.now;
+  const trace = options.trace ?? { rawPositiveDetectedAt: now(), rawQuoteEvidenceAt: Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp), rawQuoteAgeAtDetectionMs: Math.max(0, now() - Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp)), executablePrefilterQueuedAt: now() };
+  trace.executablePrefilterStartedAt = now(); trace.rawAgeAtPrefilterStartMs = Math.max(0, now() - trace.rawQuoteEvidenceAt);
+  trace.prefilterQueueMs = now() - trace.executablePrefilterQueuedAt;
+  const timed = async <T>(stage: 'tokenPolicy' | 'constrainedLeg1' | 'constrainedLeg2', work: () => Promise<T>): Promise<T> => {
+    trace[`${stage}StartedAt`] = now();
+    try { return await work(); } finally { trace[`${stage}FinishedAt`] = now(); trace[`${stage}Ms`] = now() - trace[`${stage}StartedAt`]!; }
+  };
+  const finish = (result: ExecutablePrefilterResult): ExecutablePrefilterResult => {
+    trace.prefilterFinishedAt = now(); trace.totalPrefilterMs = now() - trace.executablePrefilterStartedAt!;
+    return { ...result, trace };
+  };
+  const result = await (async (): Promise<ExecutablePrefilterResult> => {
+  if (now() - trace.rawPositiveDetectedAt > CONFIG.opportunityExpiryMs) return { status: 'RAW_SIGNAL_ENDED' };
+  if (trace.rawAgeAtPrefilterStartMs! > CONFIG.maxQuoteAgeMs) return { status: 'RAW_STALE_BEFORE_PREFILTER' };
   if (!raw.profit.estimatedNetProfitUsdc.gt(0) || !raw.profit.worstCaseNetProfitUsdc.gt(0)) {
     return { status: 'RAW_NOT_POSITIVE' };
   }
@@ -172,23 +191,32 @@ export async function buildExecutableCandidateFromRaw(
   if (!isExecutableProviderPair(buyProvider, sellProvider)) {
     return { status: 'UNSUPPORTED_PROVIDER_PAIR' };
   }
+  const quote = options.quote ?? constrainedQuote;
+  const [policyResult, buyResult] = await Promise.allSettled([
+    timed('tokenPolicy', () => (options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint)),
+    timed('constrainedLeg1', () => quote(buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount)),
+  ]);
   let tokenPolicy: Awaited<ReturnType<typeof classifyIntermediate>>;
-  try { tokenPolicy = await classifyIntermediate(raw.buyQuote.outputMint); }
+  try { if (policyResult.status === 'rejected') throw policyResult.reason; tokenPolicy = policyResult.value; }
   catch (error) {
-    return { status: 'QUOTE_FAILED', reason: error instanceof Error ? error.message : String(error) };
+    const reason = error instanceof Error ? error.message : String(error);
+    return { status: /429|backpressure|cooldown|capacity|rate.?limit/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : 'QUOTE_FAILED', reason };
   }
   if (tokenPolicy.status === 'TOKEN_2022') return { status: 'DISCOVERY_ONLY_TOKEN_2022' };
   if (tokenPolicy.status !== 'SUPPORTED') return { status: 'TOKEN_POLICY_REJECTED', reason: tokenPolicy.reason };
 
   try {
-    const buy = await constrainedQuote(
-      buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount,
-    );
+    if (buyResult.status === 'rejected') throw buyResult.reason;
+    const buy = buyResult.value;
+    if (now() - buy.responseTimestamp > CONFIG.maxQuoteAgeMs) return { status: 'PREFILTER_STALE' };
     // The executor's second instruction consumes the first instruction's
     // enforceable minimum. This is deliberately not the optimistic outAmount.
-    const sell = await constrainedQuote(
+    const sell = await timed('constrainedLeg2', () => quote(
       sellProvider, raw.buyQuote.outputMint, MINTS.USDC, buy.otherAmountThreshold,
-    );
+    ));
+    if (!isFullFillQuote(buy) || !isFullFillQuote(sell) || !quoteMatchesExecutableProviderPolicy(buy) || !quoteMatchesExecutableProviderPolicy(sell)) return { status: 'ROUTE_POLICY_REJECTED', reason: 'Constrained quotes escaped audited route policy' };
+    if (buy.inputMint !== MINTS.USDC || buy.outputMint !== raw.buyQuote.outputMint || buy.inAmount !== raw.buyQuote.inAmount
+      || sell.inputMint !== buy.outputMint || sell.outputMint !== MINTS.USDC) return { status: 'ROUTE_POLICY_REJECTED', reason: 'Constrained mint/input path mismatch' };
     if (sell.inAmount !== buy.otherAmountThreshold) {
       return { status: 'ROUTE_POLICY_REJECTED', reason: 'Executable prefilter lost exact minimum-output propagation' };
     }
@@ -201,7 +229,8 @@ export async function buildExecutableCandidateFromRaw(
       };
     }
     const quoteSkewMs = Math.abs(sell.responseTimestamp - buy.responseTimestamp);
-    const stale = quoteSkewMs > CONFIG.maxQuoteAgeMs;
+    const stale = quoteSkewMs > CONFIG.maxQuoteAgeMs || now() - Math.min(buy.responseTimestamp, sell.responseTimestamp) > CONFIG.maxQuoteAgeMs;
+    if (stale) return { status: 'PREFILTER_STALE', reason: 'Constrained quote evidence exceeded scanner freshness' };
     const liquidityOverlap = poolOverlap(buy, sell);
     if (liquidityOverlap === true) {
       return { status: 'ROUTE_POLICY_REJECTED', reason: 'Executable legs resolve to the same pool' };
@@ -235,6 +264,8 @@ export async function buildExecutableCandidateFromRaw(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);
-    return { status: policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason };
+    return { status: /429|backpressure|cooldown|capacity|rate.?limit/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason };
   }
+  })();
+  return finish(result);
 }

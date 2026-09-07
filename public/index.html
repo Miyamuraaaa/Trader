@@ -639,12 +639,24 @@
                                 const line = document.createElement('div');
                                 line.textContent = `${stage}: ${f.session[stage] || 0} session / ${f.last5m[stage] || 0} 5m / ${f.last15m[stage] || 0} 15m`; counts.append(line);
                             }
+                            if (f.rawPrefilter) {
+                                for (const windowName of ['last60s','last5m','last15m']) {
+                                    const cohort = f.rawPrefilter[windowName]; const row = document.createElement('div');
+                                    row.textContent = `${windowName} RAW detection cohort: ${cohort.rawPositive} = ${Object.entries(cohort.buckets).map(([k,v]) => `${k}:${v}`).join(' + ') || '0'} | PREFILTER_STARTED:${cohort.started} COMPLETED:${cohort.completed} | prefilter p50/p90 ${cohort.totalMs.p50 ?? '-'}/${cohort.totalMs.p90 ?? '-'}ms; queue ${cohort.queueMs.p50 ?? '-'}/${cohort.queueMs.p90 ?? '-'}ms`;
+                                    counts.append(row);
+                                }
+                            }
                             const signals = document.getElementById('positive-signal-diagnostics'); signals.replaceChildren();
                             if (!f.lastPositiveSignals.length) signals.textContent = 'No positive signals this session.';
                             for (const s of f.lastPositiveSignals) {
                                 const card = document.createElement('div');
                                 card.textContent = `${new Date(s.detectedAt).toLocaleTimeString()} ${s.providers} | mint ${s.intermediateMint} | input ${s.inputAmount} raw USDC | raw ${s.rawNet} / worst ${s.rawWorstCase} | constrained ${s.constrainedNet ?? 'unavailable'} / worst ${s.constrainedWorstCase ?? 'unavailable'} | network ${s.networkFee ?? '?'} priority ${s.priorityFee ?? '?'} ATA ${s.ataRent ?? '?'} USDC | pools ${s.pools.flat().join(' -> ')} | prefilter ${s.prefilterResult ?? 'pending'} | P0 ${s.p0Handoff ? 'yes' : 'no'} | executor ${s.executorResult ?? 'not received'} | alignment ${s.routeAlignment ?? 'not evaluated'} | final conservative ${s.finalConservativeNet ?? 'unavailable'} | latency ms ${JSON.stringify(s.latencyByStage ?? {})}`;
                                 signals.append(card);
+                                if (s.prefilterTrace) {
+                                    const t = s.prefilterTrace; const trace = document.createElement('div');
+                                    trace.textContent = `Eligibility ${s.liveEligibility ?? 'observation'} | raw evidence age ${t.rawQuoteAgeAtDetectionMs}ms | prefilter queue ${t.prefilterQueueMs ?? '-'}ms | token ${t.tokenPolicyMs ?? '-'}ms | leg1 ${t.constrainedLeg1Ms ?? '-'}ms | leg2 ${t.constrainedLeg2Ms ?? '-'}ms | total ${t.totalPrefilterMs ?? '-'}ms`;
+                                    card.append(trace);
+                                }
                             }
                         }
                         document.getElementById('live-size-cap').textContent = `FIRST_LIVE_MAX_INPUT_USDC: ${p.firstLiveMaxInputUsdc ?? 'unavailable'} — larger sizes are scanner-only`;
