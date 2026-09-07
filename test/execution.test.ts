@@ -1055,4 +1055,27 @@ describe('confirmed-balance accounting', () => {
     expect(accounting.realizedBasePnlAtomic).toBe(25n);
     expect(journal.get('confirmation')).toMatchObject({ state: 'CONFIRMED', accounting: { actualFeeLamports: '5000', usdcDelta: '25', intermediateDust: '3' } });
   });
+
+  it('charges confirmed failed fees before finalizing; risk persistence failure remains reconcilable', async () => {
+    const dir = tempDir(); await mkdir(dir);
+    const journal = new PersistentExecutionJournal(path.join(dir, 'failed-confirm.json'));
+    const wallet = key(); const base = key(); const middle = key();
+    await journal.begin('failed');
+    for (const state of ['VALIDATING', 'SIMULATING', 'APPROVED', 'SIGNING', 'SIGNED', 'SUBMITTING'] as const) await journal.transition('failed', state);
+    const connection = {
+      getSignatureStatuses: async () => ({ value: [{ confirmationStatus: 'confirmed', err: { InstructionError: [0, 'test'] } }] }),
+      getTransaction: async () => ({ meta: { err: { InstructionError: [0, 'test'] }, fee: 5000,
+        preBalances: [10000], postBalances: [5000], preTokenBalances: [], postTokenBalances: [] },
+        transaction: { message: { staticAccountKeys: [new PublicKey(wallet)] } } }),
+    } as unknown as import('@solana/web3.js').Connection;
+    const request = { signature: 'TEST DATA', wallet, baseMint: base, intermediateMint: middle, journal, executionId: 'failed' };
+    await expect(confirmAndAccountForCycle(connection, { ...request, onConfirmed: async () => { throw new Error('TEST risk disk failure'); } })).rejects.toThrow('risk disk failure');
+    expect(journal.get('failed')?.state).toBe('CONFIRMING');
+    let charged = 0n;
+    await expect(confirmAndAccountForCycle(connection, { ...request, onConfirmed: async (accounting, failed) => {
+      expect(failed).toBe(true); expect(journal.get('failed')?.state).toBe('CONFIRMING'); charged = accounting.actualFeeLamports;
+    } })).rejects.toThrow('Confirmed transaction failed');
+    expect(charged).toBe(5000n);
+    expect(journal.get('failed')).toMatchObject({ state: 'TRANSACTION_FAILED', accounting: { actualFeeLamports: '5000' } });
+  });
 });

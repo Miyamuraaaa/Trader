@@ -167,11 +167,12 @@ export class PersistentExecutionJournal {
     return next;
   }
 
-  async recordAccounting(id: string, accounting: ConfirmedCycleAccounting): Promise<ExecutionRecord> {
+  async recordAccounting(id: string, accounting: ConfirmedCycleAccounting, failed = false): Promise<ExecutionRecord> {
     const current = this.records.get(id);
     if (!current) throw new Error('Execution journal record does not exist');
-    assertExecutionTransition(current.state, 'CONFIRMED');
-    const next = { ...current, state: 'CONFIRMED' as const, updatedAt: Date.now(), accounting: toPersistedAccounting(accounting) };
+    const state = failed ? 'TRANSACTION_FAILED' as const : 'CONFIRMED' as const;
+    assertExecutionTransition(current.state, state);
+    const next = { ...current, state, updatedAt: Date.now(), accounting: toPersistedAccounting(accounting) };
     this.records.set(id, next);
     await this.persist();
     return next;

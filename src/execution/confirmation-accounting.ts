@@ -12,7 +12,11 @@ export interface ConfirmationRequest {
   commitment?: 'confirmed' | 'finalized';
   journal?: PersistentExecutionJournal;
   executionId?: string;
+  /** Durable risk debit must precede terminal journal state (replay is idempotent). */
+  onConfirmed?: (accounting: ConfirmedCycleAccounting, failed: boolean) => Promise<void>;
 }
+
+export class ConfirmedTransactionFailure extends Error {}
 
 export interface TokenBalanceRecord {
   accountIndex: number;
@@ -110,10 +114,6 @@ export async function confirmAndAccountForCycle(
   let confirmed = false;
   while (Date.now() < deadline) {
     const status = (await connection.getSignatureStatuses([request.signature], { searchTransactionHistory: true })).value[0];
-    if (status?.err) {
-      if (request.journal && request.executionId) await request.journal.transition(request.executionId, 'TRANSACTION_FAILED', { reason: JSON.stringify(status.err) });
-      throw new Error(`Confirmed transaction failed: ${JSON.stringify(status.err)}`);
-    }
     if (status?.confirmationStatus === requiredCommitment || (requiredCommitment === 'confirmed' && status?.confirmationStatus === 'finalized')) {
       confirmed = true;
       break;
@@ -123,7 +123,7 @@ export async function confirmAndAccountForCycle(
   if (!confirmed) throw new Error(`Timed out waiting for ${requiredCommitment} confirmation of ${request.signature}`);
   try {
     const transaction = await connection.getTransaction(request.signature, {
-      commitment: 'confirmed',
+      commitment: requiredCommitment,
       maxSupportedTransactionVersion: 0,
     });
     if (!transaction?.meta) throw new Error('Confirmed transaction details are unavailable');
@@ -152,15 +152,14 @@ export async function confirmAndAccountForCycle(
         postTokenBalances: asRecords(transaction.meta.postTokenBalances),
       },
     );
-    if (request.journal && request.executionId) await request.journal.recordAccounting(request.executionId, accounting);
+    const failed = transaction.meta.err != null;
+    await request.onConfirmed?.(accounting, failed);
+    if (request.journal && request.executionId) await request.journal.recordAccounting(request.executionId, accounting, failed);
+    if (failed) throw new ConfirmedTransactionFailure(`Confirmed transaction failed: ${JSON.stringify(transaction.meta.err)}`);
     return accounting;
   } catch (error) {
-    if (request.journal && request.executionId
-      && request.journal.get(request.executionId)?.state === 'CONFIRMING') {
-      await request.journal.transition(request.executionId, 'ACCOUNTING_FAILED', {
-        reason: error instanceof Error ? error.message : String(error),
-      });
-    }
+    // Missing details / failed persistence remain CONFIRMING for reconciliation.
+    // A terminal ACCOUNTING_FAILED here would lose the risk debit on restart.
     throw error;
   }
 }

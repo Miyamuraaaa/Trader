@@ -4,7 +4,7 @@ import { OneShotBroadcaster, SolanaRpcSubmissionTransport } from './execution/br
 import { AggregatorHandoffInbox } from './execution/aggregator-handoff-inbox.js';
 import { aggregatorHandoffIdentity, parseAggregatorAtomicHandoff, type AggregatorAtomicHandoff } from './execution/aggregator-handoff-dto.js';
 import { validateAggregatorHandoffForApproval } from './execution/aggregator-handoff-validator.js';
-import { confirmAndAccountForCycle } from './execution/confirmation-accounting.js';
+import { confirmAndAccountForCycle, ConfirmedTransactionFailure, type ConfirmedCycleAccounting } from './execution/confirmation-accounting.js';
 import { PersistentExecutionJournal, type ExecutionRecord } from './execution/execution-journal.js';
 import { PersistentExecutionLock } from './execution/execution-lock.js';
 import { handoffIdentity, parseOrcaAtomicHandoff, type OrcaAtomicHandoff } from './execution/handoff-dto.js';
@@ -13,7 +13,7 @@ import { validateOrcaHandoffForApproval } from './execution/handoff-validator.js
 import { captureAndValidateLiveBalances, captureLiveExecutionBalances } from './execution/live-balance-preflight.js';
 import { assertLiveSubmissionAllowed } from './execution/live-guard.js';
 import { EXECUTION_IMPLEMENTATION_READY } from './execution/readiness-manifest.js';
-import { PersistentRiskManager } from './execution/risk-manager.js';
+import { PersistentRiskManager, confirmedRiskPnl } from './execution/risk-manager.js';
 import { log } from './logger.js';
 import { fromAtomic, toAtomic } from './math.js';
 import type { AtomicExecutionPlan, SignerContext, SimulationResult } from './execution/types.js';
@@ -76,10 +76,20 @@ function riskManager(): PersistentRiskManager {
     maxTrades: CONFIG.maxTradesPerSession,
     maxConsecutiveFailures: CONFIG.maxExecutionConsecutiveFailures,
     maxSessionLossAtomic: BigInt(toAtomic(CONFIG.maxSessionLossUsdc, DECIMALS.USDC)),
+    maxDailyLossAtomic: BigInt(toAtomic(CONFIG.maxDailyLossUsdc, DECIMALS.USDC)),
+    maxSingleTradeLossAtomic: BigInt(toAtomic(CONFIG.maxSingleTradeLossUsdc, DECIMALS.USDC)),
   });
 }
 
-async function reconcile(connection: Connection, journal: PersistentExecutionJournal, record: ExecutionRecord): Promise<void> {
+function chargeConfirmedRisk(risk: PersistentRiskManager, id: string, accounting: ConfirmedCycleAccounting, failed: boolean): Promise<void> {
+  const debit = accounting.before.solLamports - accounting.after.solLamports;
+  // Count fees even if a rent refund masks the SOL debit. Do not count SOL credits as USDC wins.
+  return risk.recordConfirmed(id, confirmedRiskPnl(accounting.realizedBasePnlAtomic,
+    debit > accounting.actualFeeLamports ? debit : accounting.actualFeeLamports,
+    BigInt(toAtomic(CONFIG.executionSolPriceCeilingUsdc, DECIMALS.USDC))), failed);
+}
+
+async function reconcile(connection: Connection, journal: PersistentExecutionJournal, record: ExecutionRecord, risk: PersistentRiskManager): Promise<void> {
   if (!['SUBMITTING', 'SUBMITTED', 'CONFIRMING'].includes(record.state)) {
     throw new Error(`Pre-submission ${record.state} record reached submission reconciliation unexpectedly`);
   }
@@ -90,6 +100,7 @@ async function reconcile(connection: Connection, journal: PersistentExecutionJou
     signature: record.signature, wallet: record.wallet, baseMint: record.baseMint,
     intermediateMint: record.intermediateMint, commitment: CONFIG.executionConfirmationCommitment,
     journal, executionId: record.id,
+    onConfirmed: (accounting, failed) => chargeConfirmedRisk(risk, record.id, accounting, failed),
   });
   log.info('Reconciled existing live submission', {
     signature: record.signature, realizedUsdcAtomic: accounting.realizedBasePnlAtomic.toString(),
@@ -489,8 +500,8 @@ export async function startLiveExecutionWorker(
         signature, wallet: current.plan.wallet, baseMint: MINTS.USDC,
         intermediateMint: current.plan.intermediateMint,
         commitment: CONFIG.executionConfirmationCommitment, journal, executionId: current.identity,
+        onConfirmed: (accounting, failed) => chargeConfirmedRisk(risk, current.identity, accounting, failed),
       });
-      await risk.recordSuccess(current.identity, accounting.realizedBasePnlAtomic);
       const refreshed = await captureLiveExecutionBalances(connection, current.plan);
       updatePending('CONFIRMED', {
         signature,
@@ -509,8 +520,8 @@ export async function startLiveExecutionWorker(
         refreshedUsdcAtomic: refreshed.baseAmount.toString(), refreshedSolLamports: refreshed.solLamports.toString(),
       });
     } catch (error) {
-      await risk.recordFailure();
-      updatePending('TRANSACTION_FAILED', { reason: error instanceof Error ? error.message : String(error) });
+      // RPC timeout/ambiguous confirmation is not a confirmed transaction failure or fee.
+      updatePending(error instanceof ConfirmedTransactionFailure ? 'TRANSACTION_FAILED' : 'CONFIRMING', { reason: error instanceof Error ? error.message : String(error) });
       log.error('Submitted transaction failed confirmation/accounting', { identity: current.identity, reason: error instanceof Error ? error.message : String(error) });
     } finally {
       // Keep terminal feedback visible briefly; the approval token cannot be reused.
@@ -605,6 +616,7 @@ export async function startLiveExecutionWorker(
         refreshed = true;
         await captureAndValidateLiveBalances(connection, current.plan);
       }
+      risk.assertCanExecute(current.identity, current.economics.conservativeNetAtomic);
       const submissionTransport = CONFIG.executionSubmissionTransport === 'jito'
         ? new JitoBlockEngineSubmissionTransport()
         : new SolanaRpcSubmissionTransport(connection);
@@ -662,7 +674,7 @@ export async function startLiveExecutionWorker(
           throw new Error('Multiple submission-possible executions require manual reconciliation');
         }
         if (recovery.requiresReconciliation[0]) {
-          await reconcile(connection, journal, recovery.requiresReconciliation[0]);
+          await reconcile(connection, journal, recovery.requiresReconciliation[0], risk);
         }
         return;
       }

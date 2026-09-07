@@ -111,7 +111,9 @@ describe('Jupiter API Global Rate Limiter', () => {
     const end = Date.now();
     // Must have waited at least 2 seconds (the retry-after header value)
     expect(end - start).toBeGreaterThanOrEqual(2000);
-  });
+  // Keyless CI enforces 2050ms pacing in addition to Retry-After. This is a
+  // wall-clock mock test, not an execution freshness threshold.
+  }, 10_000);
   
   it('does not leak API key to logs on error', async () => {
     (CONFIG as any).jupiterApiKey = 'secret-key-123';
