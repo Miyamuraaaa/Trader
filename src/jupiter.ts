@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { ScannerFairService } from './scanner-service-policy.js';
+const fairService = new ScannerFairService();
 import { RollingWorkMetrics } from './work-metrics.js';
 export const jupiterWorkMetrics = new RollingWorkMetrics();
 import { CONFIG } from './config.js';
@@ -237,9 +239,7 @@ async function processQueue() {
       }
 
       // Dequeue next highest priority request
-      let reqIndex = queue.findIndex(req => req.params.priority === 'HIGH');
-      if (reqIndex === -1) reqIndex = 0;
-      const req = queue.splice(reqIndex, 1)[0];
+      const req = fairService.take(queue, (request) => request.params.priority);
       if (!req) continue;
 
       jupiterStats.throttleState = 'ACTIVE';
@@ -314,6 +314,7 @@ export async function getQuote(params: QuoteParams): Promise<Quote> {
   if (queue.length >= 128) throw new Error('Jupiter scanner quote queue capacity exceeded');
   const p = new Promise<Quote>((resolve, reject) => {
     queue.push({ params, cacheKey, resolve, reject, queuedAt: Date.now() });
+    jupiterWorkMetrics.observeQueue(queue.length);
     processQueue().catch(e => log.error('Queue processor error', { error: String(e) }));
   }).then(quote => {
     shortCache.set(cacheKey, { quote, expires: Date.now() + CONFIG.quoteCacheTtlMs });

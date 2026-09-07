@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import { ScannerFairService } from './scanner-service-policy.js';
+const fairService = new ScannerFairService();
 import { z } from 'zod';
 import { CONFIG } from './config.js';
 import { getJson, HttpError } from './http.js';
@@ -102,6 +104,7 @@ function enqueue(task: () => Promise<Quote>, priority: QuoteParams['priority']):
   return new Promise<Quote>((resolve, reject) => {
     if (queue.length >= 128) { reject(new Error('Raptor scanner quote queue capacity exceeded')); return; }
     queue.push({ task, priority, resolve, reject, queuedAt: Date.now() });
+    raptorWorkMetrics.observeQueue(queue.length);
     void processQueue();
   });
 }
@@ -112,8 +115,7 @@ async function processQueue(): Promise<void> {
   try {
     while (queue.length > 0) {
       await paceRequest();
-      const highIndex = queue.findIndex((request) => request.priority === 'HIGH');
-      const request = queue.splice(highIndex >= 0 ? highIndex : 0, 1)[0]!;
+      const request = fairService.take(queue, (request) => request.priority)!;
       raptorStats.throttleState = 'ACTIVE';
       const finish = raptorWorkMetrics.start(request.queuedAt);
       try {

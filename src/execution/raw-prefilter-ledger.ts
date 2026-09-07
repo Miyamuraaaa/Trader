@@ -13,7 +13,8 @@ export class RawPrefilterLedger {
   finish(id: string, result: string, trace?: PrefilterTrace): void {
     const record = this.records.get(id); if (!record || record.result !== 'PENDING') return;
     if (trace) record.trace = trace;
-    record.result = result === 'EXECUTABLE_CANDIDATE' ? 'EXECUTOR_CONSTRAINED_POSITIVE' : result;
+    record.result = ({ EXECUTABLE_CANDIDATE: 'EXECUTOR_CONSTRAINED_POSITIVE', DISCOVERY_ONLY_TOKEN_2022: 'TOKEN_2022_DISCOVERY_ONLY',
+      RAW_SIGNAL_ENDED: 'MARKET_SIGNAL_ENDED_BEFORE_PREFILTER' } as Record<string, string>)[result] ?? result;
     this.session.PENDING!--; this.session[record.result] = (this.session[record.result] ?? 0) + 1;
   }
   private prune(): void {

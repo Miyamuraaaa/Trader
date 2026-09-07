@@ -34,7 +34,7 @@ export function providerKind(name: QuoteProviderName): QuoteProviderKind {
   return name === 'jupiter' || name === 'raptor' ? 'aggregator' : 'direct';
 }
 
-export type QuotePriority = 'HIGH' | 'LOW';
+export type QuotePriority = 'HIGH' | 'LOW' | 'EXEC_PREFILTER_HIGH' | 'DISCOVERY_HIGH' | 'DISCOVERY_LOW';
 
 export interface QuoteParams {
   inputMint: string;

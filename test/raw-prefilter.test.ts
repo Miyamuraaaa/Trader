@@ -31,6 +31,12 @@ const costs = { referenceSolPriceUsdc: 150, estimatedNetworkCostsUsdc: { baseNet
 const supported = async () => ({ status: 'SUPPORTED' as const, rentLamports: 0 });
 
 describe('TEST DATA ONLY: raw-positive constrained prefilter', () => {
+  it('never spends policy or provider capacity on above-cap raw positives', async () => {
+    const candidate = raw(); candidate.buyQuote.inAmount = '1000000000000';
+    const policy = vi.fn(supported); const quoted = vi.fn(async (...args: Parameters<typeof quote>) => quote(...args));
+    expect((await buildExecutableCandidateFromRaw(candidate, costs, { policy, quote: quoted })).status).toBe('ABOVE_LIVE_CAP');
+    expect(policy).not.toHaveBeenCalled(); expect(quoted).not.toHaveBeenCalled();
+  });
   it('overlaps token policy with leg1, then propagates its enforceable minimum to leg2', async () => {
     vi.useFakeTimers(); const start = Date.now(); const calls: Array<{ at: number; amount: string }> = [];
     const result = buildExecutableCandidateFromRaw(raw(), costs, {

@@ -1,4 +1,5 @@
 import type { QuoteParams, QuoteProvider } from './aggregators/types.js';
+import { startScannerStage } from './scanner-stage-profile.js';
 import type { ProviderQuoteResult } from './aggregators/index.js';
 
 /** Reserving before dispatch prevents background lanes from accumulating across scan cycles. */
@@ -28,7 +29,9 @@ export class ScannerFirstLegBulkheads {
   start(providers: QuoteProvider[], params: QuoteParams, directDeadlineMs: number,
     observed: (lane: 'aggregator' | 'direct', elapsed: number) => void = () => undefined) {
     const start = Date.now();
-    const lane = (kind: 'aggregator' | 'direct') => Promise.all(providers.filter((p) => p.kind === kind).map((provider) => {
+    const lane = (kind: 'aggregator' | 'direct') => {
+      const finish = startScannerStage(`${kind}FirstLeg`);
+      return Promise.all(providers.filter((p) => p.kind === kind).map((provider) => {
       const unavailable = (reason: string): ProviderQuoteResult => ({ provider: provider.name, error: new Error(reason) });
       if (provider.isRateLimited()) return Promise.resolve(unavailable('Provider cooling down; scanner skipped'));
       const key = JSON.stringify([provider.name, params.inputMint, params.outputMint, params.amountAtomic, params.slippageBps,
@@ -42,7 +45,8 @@ export class ScannerFirstLegBulkheads {
         this.pending.set(key, work);
       }
       return kind === 'direct' ? scannerDeadline(work, directDeadlineMs, unavailable('DIRECT_FIRST_LEG_SOFT_DEADLINE')) : work;
-    })).then((results) => { observed(kind, Date.now() - start); return results; });
+    })).then((results) => { observed(kind, Date.now() - start); return results; }).finally(finish);
+    };
     // Start both, but never join direct work into the aggregator first-leg promise.
     const aggregator = lane('aggregator'); const direct = lane('direct');
     return { aggregator, direct, mixed: Promise.all([aggregator, direct]).then(([a, d]) => [...a, ...d]) };

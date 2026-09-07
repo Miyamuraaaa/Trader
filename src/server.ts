@@ -1,6 +1,8 @@
 import express from 'express';
 import { executionFunnel } from './execution/execution-funnel.js';
 import { scannerDisplayEligibility, scannerLifecycleDisplay } from './execution/scanner-display-eligibility.js';
+import { scannerStageProfile } from './scanner-stage-profile.js';
+import { scannerOperationalMetrics } from './scanner.js';
 import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
 import { directMarketStreamHealth } from './direct-market-stream.js';
 import cors from 'cors';
@@ -211,6 +213,8 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
       const providerDirectionsPerPair = enabledProviderCount * Math.max(0, enabledProviderCount - 1);
       res.json({
         executionFunnel: executionFunnel.snapshot(),
+        scannerStageProfile: scannerStageProfile(),
+        scannerOperationalMetrics: scannerOperationalMetrics(),
         scannerRpcConfig: SCANNER_RPC_CONFIG,
         scannerRpc: scannerRpcLimiter.snapshot(),
         directMarketStream: directMarketStreamHealth(),
@@ -354,6 +358,8 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
           },
           balance: paperBalance,
           executionFunnel: executionFunnel.snapshot(),
+          scannerStageProfile: scannerStageProfile(),
+          scannerOperationalMetrics: scannerOperationalMetrics(),
           firstLiveMaxInputUsdc: CONFIG.firstLiveMaxInputUsdc,
           approval: liveApproval?.snapshot() ?? null,
           manualApprovalMockEnabled: CONFIG.manualApprovalUiMock,

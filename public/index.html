@@ -640,11 +640,28 @@
                                 line.textContent = `${stage}: ${f.session[stage] || 0} session / ${f.last5m[stage] || 0} 5m / ${f.last15m[stage] || 0} 15m`; counts.append(line);
                             }
                             if (f.rawPrefilter) {
+                                const session = f.rawPrefilter.last15m.session;
+                                const sessionRow = document.createElement('div');
+                                sessionRow.textContent = `Session raw outcomes: ${session.RAW_POSITIVE} = ${Object.entries(session).filter(([k]) => k !== 'RAW_POSITIVE').map(([k,v]) => `${k}:${v}`).join(' + ')} (PENDING is active work; COALESCED is duplicate/superseded work, not market expiry)`;
+                                counts.append(sessionRow);
                                 for (const windowName of ['last60s','last5m','last15m']) {
                                     const cohort = f.rawPrefilter[windowName]; const row = document.createElement('div');
                                     row.textContent = `${windowName} RAW detection cohort: ${cohort.rawPositive} = ${Object.entries(cohort.buckets).map(([k,v]) => `${k}:${v}`).join(' + ') || '0'} | PREFILTER_STARTED:${cohort.started} COMPLETED:${cohort.completed} | prefilter p50/p90 ${cohort.totalMs.p50 ?? '-'}/${cohort.totalMs.p90 ?? '-'}ms; queue ${cohort.queueMs.p50 ?? '-'}/${cohort.queueMs.p90 ?? '-'}ms`;
                                     counts.append(row);
                                 }
+                            }
+                            if (p.scannerOperationalMetrics) {
+                                const metric = document.createElement('div');
+                                metric.textContent = `Rolling completed work: ${JSON.stringify(p.scannerOperationalMetrics)}`; counts.append(metric);
+                            }
+                            for (const provider of p.stats?.apiStats?.providers ?? []) {
+                                if (!provider.work) continue;
+                                const row = document.createElement('div'); const w = provider.work;
+                                row.textContent = `${provider.provider}: requests/429 ${w.requests60s}/${w.rateLimits60s}; queue p50/p90 ${w.queueWaitP50 ?? '-'}/${w.queueWaitP90 ?? '-'}ms; request p50/p90 ${w.requestLatencyP50 ?? '-'}/${w.requestLatencyP90 ?? '-'}ms; active/queued ${provider.active}/${provider.queueLength}; queue high-water ${w.queueHighWater60s ?? '-'} — ${w.rateLimits60s ? 'RATE LIMITS' : w.queueWaitP90 > w.requestLatencyP90 ? 'QUEUE/PACING' : 'REQUEST LATENCY'}`;
+                                counts.append(row);
+                            }
+                            for (const [stage, metric] of Object.entries(p.scannerStageProfile ?? {})) {
+                                const row = document.createElement('div'); row.textContent = `${stage}: p50/p90 ${metric.requestLatencyP50 ?? '-'}/${metric.requestLatencyP90 ?? '-'}ms (${metric.requests60s} samples/60s)`; counts.append(row);
                             }
                             const signals = document.getElementById('positive-signal-diagnostics'); signals.replaceChildren();
                             if (!f.lastPositiveSignals.length) signals.textContent = 'No positive signals this session.';

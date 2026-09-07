@@ -15,6 +15,7 @@ export interface PositiveSignal {
   routeAlignment?: string; finalConservativeNet?: string; latencyByStage?: Record<string, number>;
 }
 const stages: Record<string, string> = { EXECUTABLE_CANDIDATE: 'EXECUTOR_CONSTRAINED_POSITIVE',
+  RAW_SIGNAL_ENDED: 'MARKET_SIGNAL_ENDED_BEFORE_PREFILTER',
   ROUTE_ALIGNED: 'ROUTE_ALIGNED', SIMULATION_PASS: 'SIMULATION_PASSED',
   FINAL_PROFITABILITY_PASS: 'FINAL_PROFITABILITY_PASSED', APPROVED_BY_USER: 'USER_APPROVED',
   DISCOVERY_ONLY_TOKEN_2022: 'TOKEN_2022_DISCOVERY_ONLY', QUOTE_FAILED: 'QUOTE_FAILED' };
@@ -73,6 +74,7 @@ export class ExecutionFunnel {
       const all = this.events.filter((e) => e.at >= this.now() - ms).reduce<Record<string, number>>((all, e) => { all[e.stage] = (all[e.stage] ?? 0) + 1; return all; }, {});
       const cohort = this.raw.snapshot(ms);
       if (cohort.session.RAW_POSITIVE) {
+        all.MARKET_SIGNAL_ENDED_BEFORE_PREFILTER = 0;
         for (const key of ['ABOVE_LIVE_CAP','UNSUPPORTED_PROVIDER_PAIR','TOKEN_2022_DISCOVERY_ONLY','TOKEN_POLICY_REJECTED','ROUTE_POLICY_REJECTED','ECONOMICS_DIVERGED','QUOTE_FAILED','RAW_SIGNAL_ENDED','RAW_STALE_BEFORE_PREFILTER','PREFILTER_STALE','PREFILTER_RATE_LIMITED','COALESCED','OBSERVATION_ONLY','PENDING','RAW_NOT_POSITIVE','EXECUTOR_CONSTRAINED_POSITIVE']) all[key] = 0;
         for (const [key, value] of Object.entries(cohort.buckets)) all[stages[key] ?? key] = value;
         all.RAW_POSITIVE = cohort.rawPositive; all.PREFILTER_STARTED = cohort.started; all.PREFILTER_COMPLETED = cohort.completed;
@@ -83,7 +85,7 @@ export class ExecutionFunnel {
     const rawPrefilter = { last60s: this.raw.snapshot(60_000), last5m: this.raw.snapshot(300_000), last15m: this.raw.snapshot(900_000) };
     const explanation = !(last15m.RAW_POSITIVE ?? 0)
       ? 'No raw positive spreads survived conservative market costs in the last 15m.'
-      : `Last 15m: ${last15m.RAW_POSITIVE ?? 0} raw positives -> ${last15m.EXECUTOR_CONSTRAINED_POSITIVE ?? 0} executable -> ${last15m.READY_TO_EXECUTE ?? 0} READY; economics diverged ${last15m.ECONOMICS_DIVERGED ?? 0}, Token-2022 ${last15m.TOKEN_2022_DISCOVERY_ONLY ?? 0}, route policy ${last15m.ROUTE_POLICY_REJECTED ?? 0}, above cap ${last15m.ABOVE_LIVE_CAP ?? 0}.`;
+      : `Last 15m: ${last15m.RAW_POSITIVE ?? 0} raw positives -> ${last15m.EXECUTOR_CONSTRAINED_POSITIVE ?? 0} executable -> ${last15m.READY_TO_EXECUTE ?? 0} READY; ${rawPrefilter.last15m.rawPositive ? Object.entries(rawPrefilter.last15m.buckets).map(([key, count]) => `${key}: ${count}`).join(', ') : `economics diverged ${last15m.ECONOMICS_DIVERGED ?? 0}, Token-2022 ${last15m.TOKEN_2022_DISCOVERY_ONLY ?? 0}, route policy ${last15m.ROUTE_POLICY_REJECTED ?? 0}, above cap ${last15m.ABOVE_LIVE_CAP ?? 0}`}.`;
     const session = { ...this.totals };
     if (rawPrefilter.last15m.session.RAW_POSITIVE) {
       for (const [key, value] of Object.entries(rawPrefilter.last15m.session)) session[stages[key] ?? key] = value;

@@ -1,6 +1,9 @@
 import crypto from 'crypto';
 import { executionFunnel } from './execution/execution-funnel.js';
 import { PrefilterCoalescer, type PrefilterTrace } from './execution/prefilter-trace.js';
+import { LiveSizeCadence } from './scanner-service-policy.js';
+import { profileScannerStage, startScannerStage } from './scanner-stage-profile.js';
+const liveSizeCadence = new LiveSizeCadence();
 import { isExecutableProviderPair } from './execution/executable-route-policy.js';
 import { prioritizeDirectMarketPair } from './direct-market-stream.js';
 import { ScannerFirstLegBulkheads, ScannerBackgroundLane } from './scanner-bulkheads.js';
@@ -120,6 +123,7 @@ function nextTradeSizes(): number[] {
   const sizes = CONFIG.tradeSizesUsdc;
   if (sizes.length === 0) return [];
   const count = Math.max(1, Math.min(CONFIG.tradeSizesPerScan, sizes.length));
+  if (CONFIG.executionMode === 'live') return [...new Set(Array.from({ length: count }, () => liveSizeCadence.next(sizes, CONFIG.firstLiveMaxInputUsdc)!))];
   const selected = Array.from(
     { length: count },
     (_, offset) => sizes[(tradeSizeCursor + offset) % sizes.length]!,
@@ -822,8 +826,9 @@ export async function scanOnce(
     });
   }
 
+  const finishedScan = startScannerStage('totalScanCycle');
   try {
-    const { referenceSolPriceUsdc, estimatedNetworkCostsUsdc } = await getScannerCostSnapshot();
+    const { referenceSolPriceUsdc, estimatedNetworkCostsUsdc } = await profileScannerStage('costSnapshot', getScannerCostSnapshot);
     triggerOrcaCrossPoolScan(estimatedNetworkCostsUsdc);
     let completedSize = false;
 
@@ -866,9 +871,12 @@ export async function scanOnce(
         scannerStats.lanes[`${lane}FirstLegMs`] = elapsed;
       });
       const persistFirstLegs = (results: ProviderQuoteResult[]) => {
+        const finished = startScannerStage('firstLegPersistenceAndBookkeeping');
+        try {
         recordProviderQuoteResults(results);
         for (const quote of successfulQuotes(results).filter(isFullFillQuote)) insertQuote(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`));
         return results;
+        } finally { finished(); }
       };
 
       const directProviders = scanProviders.filter((provider) => provider.kind === 'direct');
@@ -884,7 +892,7 @@ export async function scanOnce(
         const key = `${route.buyQuote.id}:${route.sellQuote.id}`;
         if (persistedQuotePairs.has(key)) return false;
         persistedQuotePairs.add(key);
-        return persistAndEvaluateRoute(route, scanRowId, timestamp, tradeSizeUsdc, confirm);
+        return profileScannerStage('routePersistenceAndBookkeeping', () => persistAndEvaluateRoute(route, scanRowId, timestamp, tradeSizeUsdc, confirm));
       };
       const promoteRawImmediately = (route: RoundTripResult) => {
         if (CONFIG.executionMode !== 'live' || !route.profit.estimatedNetProfitUsdc.gt(0) || !route.profit.worstCaseNetProfitUsdc.gt(0) || prefilterJobs.has(route)) return;
@@ -915,6 +923,7 @@ export async function scanOnce(
           spreadPrefilter(aggregatorFirstLegs),
           undefined,
           promoteRawImmediately,
+          'aggregatorMatrix',
         ))
         : undefined;
       const directMatrixPromise = directFirstLegsPromise.then((directFirstLegs) => buildRoundTripMatrix(
@@ -931,6 +940,7 @@ export async function scanOnce(
         spreadPrefilter(directFirstLegs),
         CONFIG.scannerDirectLaneDeadlineMs,
         promoteRawImmediately,
+        'directMatrix',
       ));
       const mixedMatrixPromise = !CONFIG.directDexOnly
         ? firstLegs.mixed.then((buyResults) => buildRoundTripMatrix(
@@ -951,6 +961,7 @@ export async function scanOnce(
           }),
           CONFIG.scannerDirectLaneDeadlineMs,
           promoteRawImmediately,
+          'mixedMatrix',
         ))
         : undefined;
 
@@ -976,13 +987,13 @@ export async function scanOnce(
         // Unrestricted quotes remain visible as RAW_MARKET_OPPORTUNITY. Only a
         // separately requoted route constrained to the executor's exact DEX,
         // hop and amount-propagation policy may enter the P0 lane.
-        const executableFast = CONFIG.executionMode === 'live'
-          ? (await Promise.all(fastMatrix.routes.map((route) => prefilterJobs.get(route) ?? Promise.resolve([])))).flat()
-          : [];
-        for (const executable of executableFast) {
-          const passed = await persistRoute(executable);
-          executionCandidateChosen = executionCandidateChosen || passed;
-          persisted = true;
+        // Promotion and P0 run in the bounded coalescer, not the cycle's completion barrier.
+        // Keep one continuation per admitted result; raw routes have a bounded matrix.
+        for (const route of fastMatrix.routes) {
+          const job = prefilterJobs.get(route);
+          if (job) void job.then(async (executable) => {
+            for (const candidate of executable) await persistRoute(candidate);
+          }).catch(() => log.warn('Executable candidate history persistence failed'));
         }
         const fastCandidate = bestEligibleRoute(fastMatrix.routes)
           ?? bestObservableRoute(fastMatrix.routes);
@@ -1127,7 +1138,7 @@ export async function scanOnce(
         consecutiveFailures,
       });
     }
-  }
+  } finally { finishedScan(); }
 }
 
 export const scannerStats: {
@@ -1354,6 +1365,17 @@ setInterval(() => {
   refreshDiscoveryMetrics();
 }, 1_000).unref();
 
+export function scannerOperationalMetrics() {
+  refreshEvaluationsPerMinute(); refreshDiscoveryMetrics();
+  const raw = executionFunnel.raw.snapshot(60_000);
+  return { totalRouteEvals60s: scannerStats.evaluationsThisMinute,
+    aggregatorFastLaneEvals60s: scannerStats.lanes.aggregatorFastLaneEvals60s,
+    directLaneEvals60s: scannerStats.lanes.directLaneEvals60s, mixedLaneEvals60s: scannerStats.lanes.mixedLaneEvals60s,
+    completedScanCycles60s: scannerStats.lanes.completedScans60s, rawPositive60s: raw.rawPositive,
+    executablePrefilterStarts60s: raw.started, executablePrefilterCompletes60s: raw.completed,
+    directMixedBacklog: directBackgroundLane.pending, prefilterActiveIdentities: prefilterCoalescer.activeRoutes };
+}
+
 let running = true;
 const pendingMarketCycles = new Map<string, ScanCycle>();
 const lastMarketEventByCycle = new Map<string, number>();
@@ -1382,14 +1404,15 @@ function takePendingCycle(): ScanCycle | undefined {
 }
 
 function waitForMarketEventOrInterval(): Promise<void> {
+  const finished = startScannerStage('schedulerWait');
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       if (marketWake === wake) marketWake = null;
-      resolve();
+      finished(); resolve();
     }, CONFIG.scanIntervalMs);
     const wake = () => {
       clearTimeout(timer);
-      resolve();
+      finished(); resolve();
     };
     marketWake = wake;
   });
@@ -1411,7 +1434,7 @@ export async function scanLoop(): Promise<void> {
     const eventCycle = takePendingCycle();
     if (eventCycle) {
       const waitMs = Math.max(0, CONFIG.eventScanMinIntervalMs - (Date.now() - lastEventBatchAt));
-      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      if (waitMs > 0) await profileScannerStage('schedulerEventPacing', () => new Promise((resolve) => setTimeout(resolve, waitMs)));
       lastEventBatchAt = Date.now();
     }
     const cycles: ScanCycle[] = [];

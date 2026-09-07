@@ -1,4 +1,5 @@
 import type { ProviderQuoteResult } from './aggregators/index.js';
+import { startScannerStage } from './scanner-stage-profile.js';
 import { scannerDeadline } from './scanner-bulkheads.js';
 import {
   getRouteLabels,
@@ -147,7 +148,10 @@ export async function buildRoundTripMatrix(
   include: (buy: Quote, sellProvider: QuoteProvider) => boolean = () => true,
   scannerBudgetMs?: number,
   onRoute?: (route: RoundTripResult) => void,
+  profileLane?: 'aggregatorMatrix' | 'directMatrix' | 'mixedMatrix',
 ): Promise<RoundTripMatrix> {
+  const finishProfile = profileLane ? startScannerStage(profileLane) : () => undefined;
+  try {
   const deadlineAt = scannerBudgetMs === undefined ? undefined : Date.now() + scannerBudgetMs;
   const buys = firstLegResults.flatMap((result) =>
     result.quote && isFullFillQuote(result.quote) ? [result.quote] : [],
@@ -231,6 +235,7 @@ export async function buildRoundTripMatrix(
   });
   routes.sort((a, b) => b.profit.estimatedNetProfitUsdc.cmp(a.profit.estimatedNetProfitUsdc));
   return { routes, failures };
+  } finally { finishProfile(); }
 }
 
 export function printRoundTripMatrix(title: string, matrix: RoundTripMatrix): void {

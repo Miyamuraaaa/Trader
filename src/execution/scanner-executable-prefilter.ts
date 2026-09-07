@@ -2,7 +2,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { getProviderQuote } from '../aggregators/index.js';
 import { isFullFillQuote, type Quote, type QuoteProviderName } from '../aggregators/types.js';
 import { CONFIG, DECIMALS, LAMPORTS_PER_SOL, MINTS } from '../config.js';
-import { fromAtomic } from '../math.js';
+import { fromAtomic, toAtomic } from '../math.js';
 import { calculateEstimatedRoundTripProfit, type EstimatedCostInput } from '../profit.js';
 import { runScannerRpc } from '../scanner-rpc-limiter.js';
 import {
@@ -145,7 +145,7 @@ async function constrainedQuote(
     outputMint,
     amountAtomic,
     slippageBps: CONFIG.slippageBps,
-    priority: 'HIGH',
+    priority: 'EXEC_PREFILTER_HIGH',
     ...executableQuoteConstraints(provider),
   });
   if (!isFullFillQuote(quote)) throw new Error(`${provider} returned a partial executable-prefilter fill`);
@@ -181,6 +181,8 @@ export async function buildExecutableCandidateFromRaw(
     return { ...result, trace };
   };
   const result = await (async (): Promise<ExecutablePrefilterResult> => {
+  // Defense in depth for quote-only callers outside scanner admission; no network work above cap.
+  if (BigInt(raw.buyQuote.inAmount) > BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC))) return { status: 'ABOVE_LIVE_CAP' };
   if (now() - trace.rawPositiveDetectedAt > CONFIG.opportunityExpiryMs) return { status: 'RAW_SIGNAL_ENDED' };
   if (trace.rawAgeAtPrefilterStartMs! > CONFIG.maxQuoteAgeMs) return { status: 'RAW_STALE_BEFORE_PREFILTER' };
   if (!raw.profit.estimatedNetProfitUsdc.gt(0) || !raw.profit.worstCaseNetProfitUsdc.gt(0)) {

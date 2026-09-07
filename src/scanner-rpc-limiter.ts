@@ -122,6 +122,7 @@ export class ScannerRpcLimiter {
         resolve,
         reject,
       } as QueueEntry<unknown>);
+      this.workMetrics.observeQueue(this.queue.length);
       this.queue.sort((a, b) => {
         const priorityDelta = (b.priority === 'HIGH' ? 1 : 0) - (a.priority === 'HIGH' ? 1 : 0);
         return priorityDelta !== 0 ? priorityDelta : a.sequence - b.sequence;

@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { ScannerFairService } from './scanner-service-policy.js';
 import { RollingWorkMetrics } from './work-metrics.js';
 import { CONFIG } from './config.js';
 import { HttpError } from './http.js';
@@ -39,6 +40,7 @@ export interface ProviderHealth {
  * scanner-side Solana RPC. Jupiter/Raptor remain independent HTTP paths.
  */
 export class QuoteProviderRuntime {
+  private readonly fairService = new ScannerFairService();
   private readonly queue: Array<{
     task: () => Promise<Quote>;
     resolve: (quote: Quote) => void;
@@ -105,7 +107,7 @@ export class QuoteProviderRuntime {
       try {
         const runTask = () => task();
         const quote = this.provider === 'orca' || this.provider === 'meteora'
-          ? await runScannerRpc(`${this.provider}.quote`, runTask, priority)
+          ? await runScannerRpc(`${this.provider}.quote`, runTask, priority === 'LOW' || priority === 'DISCOVERY_LOW' ? 'LOW' : 'HIGH')
           : await runTask();
         this.counters.successes++;
         finish(true);
@@ -177,7 +179,7 @@ export class QuoteProviderRuntime {
   private enqueue(task: () => Promise<Quote>, priority: QuotePriority): Promise<Quote> {
     return new Promise<Quote>((resolve, reject) => {
       this.queue.push({ task, resolve, reject, priority });
-      this.queue.sort((a, b) => priorityRank(b.priority) - priorityRank(a.priority));
+      this.workMetrics.observeQueue(this.queue.length);
       this.drain();
     });
   }
@@ -198,7 +200,7 @@ export class QuoteProviderRuntime {
       }, waitMs);
       return;
     }
-    const next = this.queue.shift()!;
+    const next = this.fairService.take(this.queue, (item) => item.priority)!;
     this.active++;
     next.task().then(next.resolve, next.reject).finally(() => {
       this.active--;
@@ -207,10 +209,6 @@ export class QuoteProviderRuntime {
     // The following request may be eligible while this one is in flight.
     this.drain();
   }
-}
-
-function priorityRank(priority: QuotePriority): number {
-  return priority === 'HIGH' ? 1 : 0;
 }
 
 export function quoteCacheKey(parts: Array<string | number | undefined>): string {
