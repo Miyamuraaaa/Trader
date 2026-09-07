@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { prioritizeDirectMarketPair } from './direct-market-stream.js';
 import { ScannerFirstLegBulkheads, ScannerBackgroundLane } from './scanner-bulkheads.js';
 import { CONFIG, DECIMALS, MINTS } from './config.js';
 import {
@@ -399,6 +400,7 @@ async function findExecutableCandidates(
     }
     if (result.status !== 'EXECUTABLE_CANDIDATE' || !result.route) return undefined;
     scannerStats.executionPrefilter.executablePositiveCandidates++;
+    prioritizeDirectMarketPair([raw.buyQuote.inputMint, raw.buyQuote.outputMint], 'EXECUTABLE');
     return result.route;
   }));
   return results.filter((route): route is RoundTripResult => Boolean(route));
@@ -740,6 +742,7 @@ export async function scanOnce(
   }
 
   const scanId = crypto.randomUUID();
+  prioritizeDirectMarketPair([cycle.inputMint, cycle.intermediateMint], cycle.tier === 'HOT' ? 'HOT' : cycle.tier === 'DISCOVERY' ? 'SCAN' : 'WARM');
   const timestamp = new Date().toISOString();
   scannerStats.currentPhase = 'ESTIMATING_NETWORK_COSTS';
   scannerStats.currentTradeSizeUsdc = null;

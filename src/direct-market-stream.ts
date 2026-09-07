@@ -1,6 +1,7 @@
 import { Connection, PublicKey, type AccountInfo } from '@solana/web3.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
+import { SubscriptionPriorityManager, type SubscriptionPriority } from './subscription-priority.js';
 
 type MarketChangeListener = (inputMint: string, outputMint: string) => void;
 type Invalidate = () => void;
@@ -22,12 +23,35 @@ const connection = new Connection(CONFIG.rpcUrl, {
   ...(CONFIG.scannerWsUrl ? { wsEndpoint: CONFIG.scannerWsUrl } : {}),
 });
 const watchers = new Map<string, Map<string, Watcher>>();
-const subscriptions = new Map<string, number>();
 const cached = new Map<string, CachedDirectAccount>();
 let listener: MarketChangeListener | undefined;
 let updates = 0;
-let subscriptionCapLogAt = 0;
-let subscriptionCapSkips = 0;
+const pairPriorities = new Map<string, SubscriptionPriority>();
+const pairKey = (pair: readonly string[]) => [...pair].sort().join(':');
+const manager = new SubscriptionPriorityManager(CONFIG.directMarketStreamMaxSubscriptions,
+  (value) => connection.onAccountChange(new PublicKey(value), (account, context) => {
+    if (!manager.active(value)) return;
+    const previous = cached.get(value);
+    if (previous && context.slot < previous.slot) return;
+    cached.set(value, { account, slot: context.slot, receivedAt: Date.now() }); updates++;
+    for (const owner of manager.owners(value)) {
+      const watcher = watchers.get(value)?.get(owner);
+      if (!watcher) continue;
+      try { watcher.invalidate(); listener?.(...watcher.pair); }
+      catch { log.debug('Direct market-state invalidation failed', { address: value }); }
+    }
+  }, 'confirmed'),
+  async (id, address) => { await connection.removeAccountChangeListener(id); cached.delete(address); },
+  (address) => { watchers.delete(address); cached.delete(address); });
+
+export function prioritizeDirectMarketPair(pair: [string, string], priority: SubscriptionPriority): void {
+  const key = pairKey(pair); pairPriorities.delete(key); pairPriorities.set(key, priority);
+  while (pairPriorities.size > 256) pairPriorities.delete(pairPriorities.keys().next().value!);
+  for (const [address, owners] of watchers) for (const [owner, watcher] of owners) {
+    if (pairKey(watcher.pair) === key) manager.watch(owner, address, priority);
+  }
+  void manager.rebalance().catch(() => log.debug('Subscription priority rebalance deferred after unsubscribe failure'));
+}
 
 export function setDirectMarketChangeListener(value: MarketChangeListener | undefined): void {
   listener = value;
@@ -45,69 +69,38 @@ export async function watchDirectMarketAccounts(
   if (!listener) return;
   for (const value of new Set(addresses)) {
     new PublicKey(value);
+    if (!manager.watch(owner, value, pairPriorities.get(pairKey(pair)) ?? 'DISCOVERY')) continue;
     let owners = watchers.get(value);
     if (!owners) {
       owners = new Map();
       watchers.set(value, owners);
     }
     owners.set(owner, { pair, invalidate });
-    if (subscriptions.has(value)) continue;
-    if (subscriptions.size >= CONFIG.directMarketStreamMaxSubscriptions) {
-      subscriptionCapSkips++;
-      if (Date.now() - subscriptionCapLogAt >= 10_000) {
-        log.debug('Direct market-state subscription cap reached', {
-          cap: CONFIG.directMarketStreamMaxSubscriptions,
-          deferredAddresses: subscriptionCapSkips,
-        });
-        subscriptionCapSkips = 0;
-        subscriptionCapLogAt = Date.now();
-      }
-      continue;
-    }
-    const id = connection.onAccountChange(new PublicKey(value), (account, context) => {
-      cached.set(value, { account, slot: context.slot, receivedAt: Date.now() });
-      updates++;
-      for (const watcher of watchers.get(value)?.values() ?? []) {
-        try {
-          watcher.invalidate();
-          listener?.(...watcher.pair);
-        } catch (error) {
-          log.debug('Direct market-state invalidation failed', {
-            address: value,
-            reason: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-    }, 'confirmed');
-    subscriptions.set(value, id);
+    const activeOwners = new Set(manager.owners(value));
+    for (const key of owners.keys()) if (!activeOwners.has(key)) owners.delete(key);
   }
+  await manager.rebalance();
 }
 
-export function directMarketStreamHealth(): {
-  subscriptions: number;
-  cachedAccounts: number;
-  updates: number;
-  newestStateAgeMs?: number;
-} {
+export function directMarketStreamHealth() {
   const newest = [...cached.values()].reduce<number | undefined>(
     (result, value) => result === undefined ? value.receivedAt : Math.max(result, value.receivedAt),
     undefined,
   );
   return {
-    subscriptions: subscriptions.size,
+    ...manager.snapshot(),
+    subscriptions: manager.snapshot().activeSubscriptions,
     cachedAccounts: cached.size,
     updates,
     newestStateAgeMs: newest === undefined ? undefined : Date.now() - newest,
+    oldestStateAgeMs: cached.size ? Date.now() - Math.min(...[...cached.values()].map((v) => v.receivedAt)) : undefined,
   };
 }
 
 export async function stopDirectMarketStream(): Promise<void> {
-  const ids = [...subscriptions.values()];
-  subscriptions.clear();
+  await manager.stop();
   watchers.clear();
   cached.clear();
   listener = undefined;
-  subscriptionCapLogAt = 0;
-  subscriptionCapSkips = 0;
-  await Promise.allSettled(ids.map((id) => connection.removeAccountChangeListener(id)));
+  pairPriorities.clear();
 }
