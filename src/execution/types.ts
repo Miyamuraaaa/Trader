@@ -34,6 +34,7 @@ export type ExecutionRouteType =
 export type AggregatorExecutionProvider = 'raptor' | 'jupiter' | 'orca' | 'raydium' | 'meteora';
 
 export interface ValidatedExecutionLegEvidence {
+  downstreamProgramId?: string;
   provider: AggregatorExecutionProvider;
   programId: string;
   inputMint: string;

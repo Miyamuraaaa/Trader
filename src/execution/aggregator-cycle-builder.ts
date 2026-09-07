@@ -434,7 +434,7 @@ export async function buildRaptorJupiterCycle(input: BuildRaptorJupiterCycleInpu
       sourceInstructionHashes,
       closesIntermediateAta: !intermediateAta.exists && intermediateMint === MINTS.SOL,
       legs: [{
-        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(),
+        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(), downstreamProgramId: raptorQuote.routePlan[0]?.programId,
         inputMint: MINTS.USDC, outputMint: intermediateMint, inputAmount: input.inputAmount,
         expectedOutputAmount: BigInt(raptorQuote.amountOut), minimumOutputAmount: BigInt(raptorQuote.minAmountOut),
         pool: pools[0],
@@ -655,7 +655,7 @@ export async function buildJupiterRaptorCycle(input: BuildRaptorJupiterCycleInpu
         expectedOutputAmount: BigInt(jupiterBuild.outAmount), minimumOutputAmount: BigInt(jupiterBuild.otherAmountThreshold),
         pool: pools[0],
       }, {
-        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(),
+        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(), downstreamProgramId: raptorQuote.routePlan[0]?.programId,
         inputMint: intermediateMint, outputMint: MINTS.USDC, inputAmount: BigInt(jupiterBuild.otherAmountThreshold),
         expectedOutputAmount: BigInt(raptorQuote.amountOut), minimumOutputAmount: BigInt(raptorQuote.minAmountOut),
         pool: pools[1],

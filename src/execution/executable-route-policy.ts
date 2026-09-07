@@ -1,4 +1,5 @@
 import { getRouteLabels, type Quote, type QuoteParams, type QuoteProviderName } from '../aggregators/types.js';
+import { createHash } from 'node:crypto';
 
 /**
  * One source of truth for the route surface audited by the live builders.
@@ -23,6 +24,18 @@ export const EXECUTABLE_PROVIDER_PAIRS = new Set<string>([
   'raptor:orca',
   'orca:raptor',
 ]);
+
+export const EXECUTABLE_POLICY_VERSION = 2;
+export const EXECUTABLE_POLICY_HASH = createHash('sha256').update(JSON.stringify({
+  version: EXECUTABLE_POLICY_VERSION, pairs: [...EXECUTABLE_PROVIDER_PAIRS].sort(),
+  jupiterDexes: EXECUTION_JUPITER_DEXES, raptorDexes: EXECUTION_RAPTOR_DEXES,
+  maxHops: EXECUTION_AGGREGATOR_MAX_HOPS, maxAccounts: EXECUTION_JUPITER_MAX_ACCOUNTS,
+  orcaProgram: EXECUTION_ORCA_PROGRAM_ID, raptorPrograms: [...EXECUTION_RAPTOR_DOWNSTREAM_PROGRAMS].sort(),
+  tokenPolicy: 'classic-spl-only', amountPolicy: 'exact-in-enforceable-min-chain',
+})).digest('hex');
+export function executionAdapterIdentity(provider: string, program: string): string {
+  return `${provider}:single-pool-exact-in:${program}`;
+}
 
 export function isExecutableProviderPair(
   buy: QuoteProviderName,

@@ -811,7 +811,7 @@ export async function buildRaptorOrcaCycle(input: MixedCycleInput): Promise<Atom
       sourceInstructionHashes,
       closesIntermediateAta,
       legs: [{
-        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(), inputMint: MINTS.USDC,
+        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(), downstreamProgramId: raptorQuote.routePlan[0]?.programId, inputMint: MINTS.USDC,
         outputMint: intermediateMint, inputAmount: input.inputAmount,
         expectedOutputAmount: BigInt(raptorQuote.amountOut), minimumOutputAmount: BigInt(raptorQuote.minAmountOut),
         pool: raptorPool,
@@ -1012,7 +1012,7 @@ export async function buildOrcaRaptorCycle(input: MixedCycleInput): Promise<Atom
         expectedOutputAmount: orcaLeg.expectedOutput, minimumOutputAmount: orcaLeg.minimumOutput,
         pool: orcaLeg.pool.address,
       }, {
-        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(), inputMint: intermediateMint,
+        provider: 'raptor', programId: RAPTOR_PROGRAM_ID.toBase58(), downstreamProgramId: raptorQuote.routePlan[0]?.programId, inputMint: intermediateMint,
         outputMint: MINTS.USDC, inputAmount: orcaLeg.minimumOutput,
         expectedOutputAmount: BigInt(raptorQuote.amountOut), minimumOutputAmount: BigInt(raptorQuote.minAmountOut),
         pool: raptorPool,

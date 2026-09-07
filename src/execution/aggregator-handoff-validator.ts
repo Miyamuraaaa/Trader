@@ -42,6 +42,7 @@ import { createExecutionConnection } from './execution-connection.js';
 import { ExecutionNetworkProfiler } from './network-profiler.js';
 import { executionQuoteAgeLimit } from './quote-freshness.js';
 import { compareExecutionRouteAlignment } from './execution-route-alignment.js';
+import { EXECUTABLE_POLICY_HASH, EXECUTABLE_POLICY_VERSION } from './executable-route-policy.js';
 
 export interface AggregatorHandoffValidationResult {
   candidate: AggregatorAtomicHandoff;
@@ -77,6 +78,8 @@ export async function validateAggregatorHandoffForApproval(
   const candidate = parseAggregatorAtomicHandoff(value);
   const identity = aggregatorHandoffIdentity(candidate);
   const base = { candidate, identity };
+  if (candidate.version !== 2 || !candidate.routeEvidence) return reject(base, 'POLICY_VERSION_MISMATCH: legacy handoff is discovery-only; obtain a fresh v2 candidate');
+  if (candidate.routeEvidence.policyVersion !== EXECUTABLE_POLICY_VERSION || candidate.routeEvidence.policyHash !== EXECUTABLE_POLICY_HASH) return reject(base, 'POLICY_VERSION_MISMATCH');
   const journal = options.journal ?? new PersistentExecutionJournal();
   // Keep the request-level trace even when a route fails. A positive
   // candidate that expires is actionable only when we can distinguish a slow

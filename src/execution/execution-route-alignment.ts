@@ -1,5 +1,6 @@
 import type { AggregatorAtomicHandoff } from './aggregator-handoff-dto.js';
 import type { AtomicExecutionPlan, ValidatedExecutionLegEvidence } from './types.js';
+import { EXECUTABLE_POLICY_HASH, EXECUTABLE_POLICY_VERSION, EXECUTION_ORCA_PROGRAM_ID, executionAdapterIdentity } from './executable-route-policy.js';
 
 export type ExecutionRouteAlignmentCode =
   | 'ALIGNED'
@@ -9,7 +10,8 @@ export type ExecutionRouteAlignmentCode =
   | 'SCANNER_POOL_EVIDENCE_AMBIGUOUS'
   | 'EXECUTION_ROUTE_CHANGED'
   | 'MINT_PATH_MISMATCH'
-  | 'AMOUNT_CHAIN_MISMATCH';
+  | 'AMOUNT_CHAIN_MISMATCH'
+  | 'POLICY_VERSION_MISMATCH';
 
 export interface ExecutionRouteAlignmentResult {
   passed: boolean;
@@ -46,6 +48,14 @@ function validateLeg(
   executorPools: [string, string],
 ): ExecutionRouteAlignmentResult | undefined {
   const expectedProvider = candidate.providers[index];
+  if (candidate.version === 2) {
+    const expected = index === 0 ? candidate.routeEvidence?.leg1 : candidate.routeEvidence?.leg2;
+    const downstream = leg.downstreamProgramId ?? (leg.provider === 'jupiter' ? EXECUTION_ORCA_PROGRAM_ID : leg.programId);
+    if (!expected || expected.executableProgramId !== downstream
+      || expected.normalizedRouteLabel !== executionAdapterIdentity(leg.provider, downstream)) {
+      return fail('EXECUTION_ROUTE_CHANGED', `Executor leg ${index + 1} downstream program/adapter changed`, scannerPools, executorPools);
+    }
+  }
   if (leg.provider !== expectedProvider) {
     return fail(
       'PROVIDER_ORDER_MISMATCH',
@@ -112,6 +122,11 @@ export function compareExecutionRouteAlignment(
     unique(candidate.scannerPools[1]),
   ];
   const evidence = plan.aggregatorEvidence;
+  if (candidate.version === 2 && (!candidate.routeEvidence
+    || candidate.routeEvidence.policyVersion !== EXECUTABLE_POLICY_VERSION
+    || candidate.routeEvidence.policyHash !== EXECUTABLE_POLICY_HASH)) {
+    return fail('POLICY_VERSION_MISMATCH', 'Scanner policy differs from current executor policy', scannerPools, null);
+  }
   if (!evidence) {
     return fail(
       'MISSING_EXECUTOR_ROUTE_EVIDENCE',

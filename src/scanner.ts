@@ -22,7 +22,7 @@ import {
   isAuditedMixedHandoffRoute,
   isFreshPositiveAuditedExecutionSignal,
 } from './execution/scanner-handoff-eligibility.js';
-import { aggregatorHandoffIdentity } from './execution/aggregator-handoff-dto.js';
+import { aggregatorHandoffIdentity, quoteRouteEvidence, routeEvidenceFingerprint } from './execution/aggregator-handoff-dto.js';
 import { logExecutionStage } from './execution/execution-diagnostics.js';
 import {
   buildExecutableCandidateFromRaw,
@@ -199,10 +199,13 @@ async function publishSupportedAggregatorHandoff(
   }
 
   const providers: AggregatorAtomicHandoff['providers'] = [buyQuote.provider, sellQuote.provider];
+  const routeEvidence = quoteRouteEvidence(buyQuote, sellQuote);
 
   const dto: AggregatorAtomicHandoff = {
     schema: 'sol-arb.aggregator-execution-handoff',
-    version: 1,
+    version: 2,
+    routeEvidence,
+    routeFingerprint: routeEvidenceFingerprint(routeEvidence),
     opportunityId,
     detectedAt,
     opportunityType: `${buyQuote.provider.toUpperCase()}_${sellQuote.provider.toUpperCase()}_ATOMIC`,

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AggregatorAtomicHandoff } from '../src/execution/aggregator-handoff-dto.js';
+import { aggregatorHandoffIdentity, parseAggregatorAtomicHandoff, routeEvidenceFingerprint, type RouteEvidence } from '../src/execution/aggregator-handoff-dto.js';
+import { EXECUTABLE_POLICY_HASH, EXECUTABLE_POLICY_VERSION, EXECUTION_ORCA_PROGRAM_ID, executionAdapterIdentity } from '../src/execution/executable-route-policy.js';
 import {
   compareExecutionRouteAlignment,
 } from '../src/execution/execution-route-alignment.js';
@@ -71,6 +73,39 @@ function plan(overrides: Partial<AtomicExecutionPlan> = {}): AtomicExecutionPlan
 }
 
 describe('execution route alignment', () => {
+  function v2() {
+    const raptorProgram = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
+    const evidence: RouteEvidence = { policyVersion: EXECUTABLE_POLICY_VERSION, policyHash: EXECUTABLE_POLICY_HASH,
+      leg1: { provider: 'raptor', poolId: POOL_A, executableProgramId: raptorProgram, normalizedRouteLabel: executionAdapterIdentity('raptor', raptorProgram), inputMint: USDC, outputMint: WSOL, inputAmount: '50000', minimumOutputAmount: '990', quoteEvidenceAt: 1 },
+      leg2: { provider: 'jupiter', poolId: POOL_B, executableProgramId: EXECUTION_ORCA_PROGRAM_ID, normalizedRouteLabel: executionAdapterIdentity('jupiter', EXECUTION_ORCA_PROGRAM_ID), inputMint: WSOL, outputMint: USDC, inputAmount: '990', minimumOutputAmount: '50050', quoteEvidenceAt: 1 } };
+    const dto = candidate({ version: 2, routeEvidence: evidence, routeFingerprint: routeEvidenceFingerprint(evidence) });
+    const built = plan(); built.aggregatorEvidence!.legs[0].downstreamProgramId = raptorProgram;
+    return { dto, built };
+  }
+  it('v2 binds normalized pool/program/policy/amount evidence to identity', () => {
+    const { dto, built } = v2(); expect(parseAggregatorAtomicHandoff(dto)).toEqual(dto);
+    expect(compareExecutionRouteAlignment(dto, built).code).toBe('ALIGNED');
+    const original = aggregatorHandoffIdentity(dto);
+    dto.routeEvidence!.leg1.poolId = POOL_C; dto.scannerPools[0] = [POOL_C];
+    expect(() => parseAggregatorAtomicHandoff(dto)).toThrow('FINGERPRINT');
+    dto.routeFingerprint = routeEvidenceFingerprint(dto.routeEvidence!);
+    expect(aggregatorHandoffIdentity(dto)).not.toBe(original);
+    expect(compareExecutionRouteAlignment(dto, built).code).toBe('EXECUTION_ROUTE_CHANGED');
+  });
+  it('v2 rejects program or policy changes and broken scanner amount chaining', () => {
+    const { dto, built } = v2();
+    built.aggregatorEvidence!.legs[0].downstreamProgramId = EXECUTION_ORCA_PROGRAM_ID;
+    expect(compareExecutionRouteAlignment(dto, built).code).toBe('EXECUTION_ROUTE_CHANGED');
+    dto.routeEvidence!.policyVersion++;
+    expect(compareExecutionRouteAlignment(dto, built).code).toBe('POLICY_VERSION_MISMATCH');
+    dto.routeEvidence!.leg2.inputAmount = '991'; dto.routeFingerprint = routeEvidenceFingerprint(dto.routeEvidence!);
+    expect(() => parseAggregatorAtomicHandoff(dto)).toThrow('CHAIN_MISMATCH');
+  });
+  it('v1 remains readable for history but cannot silently carry v2 fields', () => {
+    expect(parseAggregatorAtomicHandoff(candidate()).version).toBe(1);
+    const { dto } = v2(); expect(() => parseAggregatorAtomicHandoff({ ...dto, version: 1 })).toThrow('v1 cannot');
+    expect(() => parseAggregatorAtomicHandoff({ ...candidate(), version: 2 })).toThrow('FINGERPRINT');
+  });
   it('accepts a fresh executor rebuild on the same underlying pools', () => {
     const result = compareExecutionRouteAlignment(candidate(), plan());
     expect(result.passed).toBe(true);
