@@ -59,3 +59,23 @@ provider retries; they are not individual HTTP-attempt counters. Queue time and
 task time are separate, with rolling 60s percentiles. Existing HTTP/rate-limit
 counters remain available separately. Read-only observation is never a trade or
 realized PnL.
+
+## CI and deployment notes
+
+Supported runtime: Node22 (local validation22.23.2); CI runs the full suite on
+Ubuntu and Windows. The GitHub jobs have not run until this branch is pushed.
+`npm run audit:review` saves an ignored JSON artifact and enforces the dated,
+reviewed advisory/version baseline; it does not describe remaining exposures as
+fixed. See dependency-security-audit.md and hardening-benchmarks.md.
+
+Scanner RPC options are validated centrally and exposed without endpoint secrets
+in `/api/health`. The example environment has empty wallet identity and a generic
+external WSL path; the real `.env` was not touched. Scanner queues and pending
+pair-support discovery are bounded, including after soft deadlines. An executable
+subscription gets a short priority lease so a normal HOT/WARM scheduling pass
+cannot immediately demote it; this is not a quote-freshness relaxation.
+
+Before deploying, review migration from legacy risk state. This branch deliberately
+does not invent historical daily fee accounting or automatically clear its review
+halt. Terminal-history archival and long-duration soak validation remain future
+work; unresolved submission records are never removed to improve throughput.

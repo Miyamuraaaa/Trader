@@ -123,6 +123,19 @@ export function classifyValidationTier(
   return 'QUOTE_CANDIDATE';
 }
 
+const pendingPairSupport = new WeakMap<QuoteProvider, Map<string, Promise<boolean>>>();
+/** A soft deadline must not turn one hung discovery read into unbounded orphan work. */
+function sharedPairSupport(provider: QuoteProvider, inputMint: string, outputMint: string): Promise<boolean> {
+  if (!provider.supportsPair) return Promise.resolve(true);
+  let pending = pendingPairSupport.get(provider);
+  if (!pending) { pending = new Map(); pendingPairSupport.set(provider, pending); }
+  const key = `${inputMint}:${outputMint}`;
+  const existing = pending.get(key); if (existing) return existing;
+  if (pending.size >= 32) return Promise.resolve(false);
+  const work = Promise.resolve().then(() => provider.supportsPair!(inputMint, outputMint)).finally(() => pending!.delete(key));
+  pending.set(key, work); return work;
+}
+
 export async function buildRoundTripMatrix(
   firstLegResults: ProviderQuoteResult[],
   sellProviders: QuoteProvider[],
@@ -142,8 +155,8 @@ export async function buildRoundTripMatrix(
     provider,
     supported: provider.isRateLimited?.() ? false : typeof provider.supportsPair !== 'function'
       || await (scannerBudgetMs === undefined
-        ? provider.supportsPair(baseParams.intermediateMint, baseParams.startingMint)
-        : scannerDeadline(provider.supportsPair(baseParams.intermediateMint, baseParams.startingMint), scannerBudgetMs, false)),
+        ? sharedPairSupport(provider, baseParams.intermediateMint, baseParams.startingMint)
+        : scannerDeadline(sharedPairSupport(provider, baseParams.intermediateMint, baseParams.startingMint), scannerBudgetMs, false)),
   })));
   const supportedSellProviders = supported.flatMap((result) =>
     result.status === 'fulfilled' && result.value.supported ? [result.value.provider] : [],

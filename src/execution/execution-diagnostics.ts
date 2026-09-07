@@ -7,7 +7,7 @@ export type ExecutionRejectionCategory =
   | 'SLIPPAGE_MOVED' | 'SIMULATION_FAILED' | 'INSUFFICIENT_BALANCE'
   | 'UNSUPPORTED_ROUTE' | 'TOKEN_POLICY' | 'TRANSACTION_TOO_LARGE'
   | 'COMPUTE_LIMIT' | 'RPC_TIMEOUT' | 'JOURNAL_BLOCKED' | 'STARTUP_FAILURE'
-  | 'ROUTE_DIVERGED' | 'VALIDATION_FAILED';
+  | 'ROUTE_DIVERGED' | 'ECONOMICS_DIVERGED' | 'POLICY_VERSION_MISMATCH' | 'VALIDATION_FAILED';
 
 export interface LatestExecutionStage {
   stage: string;
@@ -62,6 +62,8 @@ export function getLatestExecutionStage(identity: string): LatestExecutionStage 
 }
 
 export function classifyExecutionRejection(reason: string): ExecutionRejectionCategory {
+  if (/ROUTE_ECONOMICS_DIVERGED|ECONOMICS_DIVERGED/.test(reason)) return 'ECONOMICS_DIVERGED';
+  if (/POLICY_VERSION_MISMATCH/.test(reason)) return 'POLICY_VERSION_MISMATCH';
   if (/minimum-output net|final economics|not profitable|profit.*below/i.test(reason)) return 'NOT_PROFITABLE';
   if (/ROI.*below|MIN_PROFIT_BPS/i.test(reason)) return 'BELOW_MIN_ROI';
   if (/confidence/i.test(reason)) return 'LOW_CONFIDENCE';
@@ -128,6 +130,10 @@ export function logExecutionStage(
   emitFunnelExecutionStage(identity, stage, detectedAt,
     stage === 'REJECTED' && typeof details.reason === 'string' ? classifyExecutionRejection(details.reason) : undefined,
     typeof details.conservativeNetAtomic === 'string' && /^-?\d+$/.test(details.conservativeNetAtomic) ? details.conservativeNetAtomic : undefined);
+  if (stage === 'REJECTED' && typeof details.expiryStage === 'string'
+    && /^EXPIRED_(BEFORE_HANDOFF|WAITING_FOR_EXECUTOR|RAPTOR_QUOTE|RAPTOR_INSTRUCTIONS|BUILD|RPC|SIMULATION|FINAL_CHECK)$/.test(details.expiryStage)) {
+    emitFunnelExecutionStage(identity, details.expiryStage, detectedAt);
+  }
   const previous = latestNonTerminalStage.get(identity);
   if (previous && previous.stage !== stage) {
     rollingStageTimings.push({

@@ -12,13 +12,20 @@ permissions:
 env:
   # CI is always non-live and must not inherit generic runner MODE values.
   EXECUTION_MODE: paper
+  LIVE_TRADING_ENABLED: 'false'
+  REAL_MONEY_READINESS: NOT_READY
+  DOTENV_CONFIG_PATH: .ci-no-env-does-not-exist
   # Keep the fixture below the absolute cap so the allocation test exercises
   # MAX_TRADE_PERCENT rather than being pre-empted by MAX_TRADE_USDC.
   MAX_TRADE_USDC: 1
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -51,7 +58,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-output
+          name: test-output-${{ matrix.os }}
           path: test-output.log
 
       - name: Fail if tests failed
@@ -60,3 +67,14 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Review current dependency audit
+        if: always()
+        run: npm run audit:review
+
+      - name: Upload dependency audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-${{ matrix.os }}
+          path: artifacts/dependency-audit.json

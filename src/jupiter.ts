@@ -311,6 +311,7 @@ export async function getQuote(params: QuoteParams): Promise<Quote> {
   }
 
   // 3. Queue new request
+  if (queue.length >= 128) throw new Error('Jupiter scanner quote queue capacity exceeded');
   const p = new Promise<Quote>((resolve, reject) => {
     queue.push({ params, cacheKey, resolve, reject, queuedAt: Date.now() });
     processQueue().catch(e => log.error('Queue processor error', { error: String(e) }));

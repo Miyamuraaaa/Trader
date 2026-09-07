@@ -19,7 +19,7 @@ import {
   getRecentObservedSolUsdPrice,
 } from './db.js';
 import { log } from './logger.js';
-import { CONFIG } from './config.js';
+import { CONFIG, SCANNER_RPC_CONFIG } from './config.js';
 import { getExecutionEngine, scannerStats, stopScanner, scanLoop } from './scanner.js';
 import { getProviderHealth } from './provider-health.js';
 import { rpcMetrics } from './solana.js';
@@ -208,6 +208,7 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
       const providerDirectionsPerPair = enabledProviderCount * Math.max(0, enabledProviderCount - 1);
       res.json({
         executionFunnel: executionFunnel.snapshot(),
+        scannerRpcConfig: SCANNER_RPC_CONFIG,
         scannerRpc: scannerRpcLimiter.snapshot(),
         directMarketStream: directMarketStreamHealth(),
         scanner: getHealthHistory('scanner', 10),

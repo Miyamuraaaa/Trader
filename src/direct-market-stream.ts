@@ -26,7 +26,7 @@ const watchers = new Map<string, Map<string, Watcher>>();
 const cached = new Map<string, CachedDirectAccount>();
 let listener: MarketChangeListener | undefined;
 let updates = 0;
-const pairPriorities = new Map<string, SubscriptionPriority>();
+const pairPriorities = new Map<string, { priority: SubscriptionPriority; executableUntil: number }>();
 const pairKey = (pair: readonly string[]) => [...pair].sort().join(':');
 const manager = new SubscriptionPriorityManager(CONFIG.directMarketStreamMaxSubscriptions,
   (value) => connection.onAccountChange(new PublicKey(value), (account, context) => {
@@ -45,7 +45,12 @@ const manager = new SubscriptionPriorityManager(CONFIG.directMarketStreamMaxSubs
   (address) => { watchers.delete(address); cached.delete(address); });
 
 export function prioritizeDirectMarketPair(pair: [string, string], priority: SubscriptionPriority): void {
-  const key = pairKey(pair); pairPriorities.delete(key); pairPriorities.set(key, priority);
+  const key = pairKey(pair);
+  const previous = pairPriorities.get(key);
+  // A routine HOT/WARM scheduler pass must not immediately demote an active execution watch.
+  const executableUntil = priority === 'EXECUTABLE' ? Date.now() + 10_000 : previous?.executableUntil ?? 0;
+  if (executableUntil > Date.now()) priority = 'EXECUTABLE';
+  pairPriorities.delete(key); pairPriorities.set(key, { priority, executableUntil });
   while (pairPriorities.size > 256) pairPriorities.delete(pairPriorities.keys().next().value!);
   for (const [address, owners] of watchers) for (const [owner, watcher] of owners) {
     if (pairKey(watcher.pair) === key) manager.watch(owner, address, priority);
@@ -69,7 +74,7 @@ export async function watchDirectMarketAccounts(
   if (!listener) return;
   for (const value of new Set(addresses)) {
     new PublicKey(value);
-    if (!manager.watch(owner, value, pairPriorities.get(pairKey(pair)) ?? 'DISCOVERY')) continue;
+    if (!manager.watch(owner, value, pairPriorities.get(pairKey(pair))?.priority ?? 'DISCOVERY')) continue;
     let owners = watchers.get(value);
     if (!owners) {
       owners = new Map();

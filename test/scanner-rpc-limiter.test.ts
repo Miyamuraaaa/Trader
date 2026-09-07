@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ScannerRpcBackpressureError,
   ScannerRpcLimiter,
 } from '../src/scanner-rpc-limiter.js';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+afterEach(() => vi.useRealTimers());
 
 describe('shared scanner RPC limiter', () => {
   it('prioritizes executable-prefilter work ahead of queued discovery work', async () => {
@@ -66,6 +67,8 @@ describe('shared scanner RPC limiter', () => {
   });
 
   it('rejects queued and new scanner work immediately while a 429 cooldown is active', async () => {
+    // Deterministic clock: a busy Windows runner must not consume this test's 20ms cooldown.
+    vi.useFakeTimers();
     const limiter = new ScannerRpcLimiter({
       maxConcurrency: 1,
       minIntervalMs: 0,
@@ -99,7 +102,8 @@ describe('shared scanner RPC limiter', () => {
     })).rejects.toBeInstanceOf(ScannerRpcBackpressureError);
     expect(newTaskRan).toBe(false);
 
-    await sleep(25);
+    expect(limiter.snapshot()).toMatchObject({ rejectedQueuedByBackpressure: 1, skippedDuringCooldown: 1, totalCooldowns: 1 });
+    await vi.advanceTimersByTimeAsync(25);
     await expect(limiter.run('healthy-after-cooldown', async () => 3)).resolves.toBe(3);
   });
 });

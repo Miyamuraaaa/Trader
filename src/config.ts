@@ -1,6 +1,22 @@
 import 'dotenv/config';
 import { parseTokenAllowlist } from './tokens.js';
 
+function scannerRpcInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  const value = raw === undefined || raw === '' ? fallback : Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer from ${min} through ${max}`);
+  return value;
+}
+/** Validated scanner-only configuration; never contains endpoint credentials. */
+export const SCANNER_RPC_CONFIG = Object.freeze({
+  maxConcurrency: scannerRpcInt('SCANNER_RPC_MAX_CONCURRENCY', 2, 1, 4),
+  minIntervalMs: scannerRpcInt('SCANNER_RPC_MIN_INTERVAL_MS', 100, 0, 5_000),
+  baseCooldownMs: scannerRpcInt('SCANNER_RPC_429_COOLDOWN_MS', 2_000, 100, 60_000),
+  maxCooldownMs: scannerRpcInt('SCANNER_RPC_MAX_COOLDOWN_MS', 15_000, 500, 120_000),
+  recoverySuccesses: scannerRpcInt('SCANNER_RPC_RECOVERY_SUCCESSES', 6, 1, 100),
+});
+if (SCANNER_RPC_CONFIG.maxCooldownMs < SCANNER_RPC_CONFIG.baseCooldownMs) throw new Error('Scanner RPC maximum cooldown must cover base cooldown');
+
 function str(name: string, fallback?: string): string {
   const v = process.env[name];
   if (v === undefined || v === '') {

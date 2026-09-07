@@ -22,6 +22,15 @@ function provider(name: QuoteProviderName, delay = 0): QuoteProvider {
 function bulkheads() { return new ScannerFirstLegBulkheads(async (providers, p) => Promise.all(providers.map(async (provider) => ({ provider: provider.name, quote: await provider.getQuote(p) })))); }
 
 describe('TEST DATA: scanner independent first-leg lanes', () => {
+  it('deduplicates pair-support reads after second-leg soft deadlines', async () => {
+    vi.useFakeTimers(); const p = provider('orca');
+    p.supportsPair = vi.fn(() => new Promise<boolean>(() => undefined));
+    for (let i = 0; i < 5; i++) {
+      const work = buildRoundTripMatrix([], [p], { intermediateMint: 'TEST_TOKEN', startingMint: 'TEST_USDC', slippageBps: 5 }, 0, () => true, 10);
+      await vi.advanceTimersByTimeAsync(11); await work;
+    }
+    expect(p.supportsPair).toHaveBeenCalledTimes(1);
+  });
   it('bounds background direct work before dispatch and releases slots idempotently', () => {
     const lane = new ScannerBackgroundLane(1); const release = lane.reserve();
     expect(lane.reserve()).toBeUndefined(); expect(lane.pending).toBe(1);

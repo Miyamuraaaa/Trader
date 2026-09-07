@@ -100,6 +100,7 @@ async function paceRequest(): Promise<void> {
 
 function enqueue(task: () => Promise<Quote>, priority: QuoteParams['priority']): Promise<Quote> {
   return new Promise<Quote>((resolve, reject) => {
+    if (queue.length >= 128) { reject(new Error('Raptor scanner quote queue capacity exceeded')); return; }
     queue.push({ task, priority, resolve, reject, queuedAt: Date.now() });
     void processQueue();
   });

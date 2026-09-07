@@ -21,6 +21,14 @@ describe('TEST DATA: execution funnel semantics', () => {
     expect(funnel.snapshot().explanation).toContain('1 raw positives -> 0 executable');
     expect(funnel.snapshot().last15m.EXECUTION_ROUTE_CHANGED).toBe(1);
   });
+  it('derives executor stage percentiles only from matching evidence', () => {
+    const funnel = new ExecutionFunnel(() => 1000);
+    expect(funnel.snapshot().timings.simulation?.p90Ms).toBeNull();
+    for (const [stage, at] of [['P0_HANDOFF', 100], ['EXECUTOR_RECEIVED', 110], ['SIMULATION_START', 200], ['SIMULATION_END', 300], ['READY_TO_EXECUTE', 350]] as const) funnel.record({ identity: 'TEST', stage, at, detectedAt: 90 });
+    expect(funnel.snapshot().timings.p0ToExecutor?.p90Ms).toBe(10);
+    expect(funnel.snapshot().timings.simulation?.p90Ms).toBe(100);
+    expect(funnel.snapshot().timings.candidateToReady?.p50Ms).toBe(260);
+  });
   it('READY and user-approved remain distinct from confirmed trades', () => {
     const value = calculateLiveExecutionDashboard([
       { id: 'ready', state: 'APPROVED_FOR_SUBMISSION', createdAt: 1, updatedAt: 1 },

@@ -1,5 +1,6 @@
 import { log } from './logger.js';
 import { RollingWorkMetrics } from './work-metrics.js';
+import { SCANNER_RPC_CONFIG } from './config.js';
 
 export type ScannerRpcPriority = 'HIGH' | 'LOW';
 
@@ -26,6 +27,7 @@ export interface ScannerRpcLimiterOptions {
 }
 
 export interface ScannerRpcLimiterSnapshot {
+  sources: Record<string, ReturnType<RollingWorkMetrics['snapshot']>>;
   work: ReturnType<RollingWorkMetrics['snapshot']>;
   rejectedQueuedByBackpressure: number;
   skippedDuringCooldown: number;
@@ -51,16 +53,6 @@ interface QueueEntry<T> {
   reject: (error: unknown) => void;
 }
 
-function boundedEnvInt(name: string, fallback: number, min: number, max: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return fallback;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < min || value > max) {
-    throw new Error(`${name} must be an integer from ${min} through ${max}`);
-  }
-  return value;
-}
-
 function isRateLimit(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /\b429\b|too many requests|rate.?limit/i.test(message);
@@ -81,6 +73,7 @@ function isRateLimit(error: unknown): boolean {
  * restores shared concurrency gradually.
  */
 export class ScannerRpcLimiter {
+  private sourceMetrics = new Map<string, RollingWorkMetrics>();
   private workMetrics = new RollingWorkMetrics();
   private rejectedQueuedByBackpressure = 0;
   private skippedDuringCooldown = 0;
@@ -143,6 +136,7 @@ export class ScannerRpcLimiter {
 
   snapshot(): ScannerRpcLimiterSnapshot {
     return {
+      sources: Object.fromEntries([...this.sourceMetrics].map(([source, metric]) => [source, metric.snapshot()])),
       work: this.workMetrics.snapshot(), rejectedQueuedByBackpressure: this.rejectedQueuedByBackpressure,
       skippedDuringCooldown: this.skippedDuringCooldown, totalCooldowns: this.rateLimits429,
       queued: this.queue.length,
@@ -183,16 +177,25 @@ export class ScannerRpcLimiter {
 
     const next = this.queue.shift()!;
     const finish = this.workMetrics.start(next.queuedAt);
+    // Fixed source vocabulary prevents dynamic mint/URL labels leaking into the API or growing the map.
+    const source = /orca/i.test(next.label) ? 'orca' : /meteora/i.test(next.label) ? 'meteora'
+      : /wallet|balance/i.test(next.label) ? 'wallet' : /fee/i.test(next.label) ? 'fees'
+      : /policy|mint|preflight/i.test(next.label) ? 'policy' : 'other';
+    let sourceMetric = this.sourceMetrics.get(source);
+    if (!sourceMetric) { sourceMetric = new RollingWorkMetrics(); this.sourceMetrics.set(source, sourceMetric); }
+    const finishSource = sourceMetric.start(next.queuedAt);
     this.active++;
     this.lastStartAt = now;
     Promise.resolve()
       .then(next.task)
       .then((value) => {
         finish(true);
+        finishSource(true);
         this.onSuccess(next.label);
         next.resolve(value);
       }, (error) => {
         finish(false, isRateLimit(error));
+        finishSource(false, isRateLimit(error));
         this.onFailure(next.label, error);
         next.reject(error);
       })
@@ -257,13 +260,7 @@ export class ScannerRpcLimiter {
   }
 }
 
-export const scannerRpcLimiter = new ScannerRpcLimiter({
-  maxConcurrency: boundedEnvInt('SCANNER_RPC_MAX_CONCURRENCY', 2, 1, 4),
-  minIntervalMs: boundedEnvInt('SCANNER_RPC_MIN_INTERVAL_MS', 100, 0, 5_000),
-  baseCooldownMs: boundedEnvInt('SCANNER_RPC_429_COOLDOWN_MS', 2_000, 100, 60_000),
-  maxCooldownMs: boundedEnvInt('SCANNER_RPC_MAX_COOLDOWN_MS', 15_000, 500, 120_000),
-  recoverySuccesses: boundedEnvInt('SCANNER_RPC_RECOVERY_SUCCESSES', 6, 1, 100),
-});
+export const scannerRpcLimiter = new ScannerRpcLimiter(SCANNER_RPC_CONFIG);
 
 export function runScannerRpc<T>(
   label: string,
