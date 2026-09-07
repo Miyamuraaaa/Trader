@@ -181,8 +181,10 @@ export async function validateAggregatorHandoffForApproval(
       executorPools: routeAlignment.executorPools,
     });
     if (!routeAlignment.passed) {
+      logExecutionStage(identity, routeAlignment.code, candidate.detectedAt);
       throw new Error(`${routeAlignment.code}: ${routeAlignment.reason}`);
     }
+    logExecutionStage(identity, 'ROUTE_ALIGNED', candidate.detectedAt);
     await transition('INSPECTING');
     const inspection = inspectAtomicTransaction(plan);
     if (!inspection.passed) throw new Error(`Aggregator inspection failed: ${inspection.reasons.join('; ')}`);

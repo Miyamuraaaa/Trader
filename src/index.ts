@@ -198,6 +198,11 @@ async function startMain(runtimeLock: ScannerRuntimeLock): Promise<void> {
     // A slow external key file must never terminate dashboard/market discovery.
     void startIsolatedLiveExecutor().then((child) => {
       liveExecutor = child;
+      child.on('message', (message: unknown) => {
+        if (!message || typeof message !== 'object' || !('type' in message) || message.type !== 'EXECUTION_FUNNEL_EVENT' || !('event' in message)) return;
+        const parsed = FunnelTelemetry.safeParse(message.event);
+        if (parsed.success) executionFunnel.record(parsed.data);
+      });
       liveApproval.attach(child);
       const publishExecutionPrewarm = (): void => {
         if (!child.connected) return;
@@ -291,3 +296,4 @@ main().catch((err) => {
   log.fatal('fatal', { reason: err instanceof Error ? err.stack : String(err) });
   process.exit(1);
 });
+import { executionFunnel, FunnelTelemetry } from './execution/execution-funnel.js';

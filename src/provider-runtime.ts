@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { RollingWorkMetrics } from './work-metrics.js';
 import { CONFIG } from './config.js';
 import { HttpError } from './http.js';
 import { log } from './logger.js';
@@ -10,6 +11,9 @@ import {
 import type { ProviderAvailabilityState, Quote, QuotePriority, QuoteProviderName } from './aggregators/types.js';
 
 export interface ProviderHealth {
+  work: ReturnType<RollingWorkMetrics['snapshot']>;
+  queueLength: number;
+  active: number;
   provider: QuoteProviderName;
   requests: number;
   successes: number;
@@ -49,6 +53,7 @@ export class QuoteProviderRuntime {
   private consecutiveFailures = 0;
   private cooldownUntil = 0;
   private latencyTotalMs = 0;
+  private workMetrics = new RollingWorkMetrics();
 
   private readonly counters = {
     requests: 0,
@@ -85,6 +90,7 @@ export class QuoteProviderRuntime {
       throw new Error(`${this.provider} quote queue is at bounded discovery capacity`);
     }
 
+    const queuedAt = Date.now();
     const promise = this.enqueue(async () => {
       const cooldownWait = Math.max(0, this.cooldownUntil - Date.now());
       if (cooldownWait > 0) {
@@ -94,6 +100,7 @@ export class QuoteProviderRuntime {
       this.lastRequestAt = Date.now();
       this.counters.requests++;
       const started = Date.now();
+      const finish = this.workMetrics.start(queuedAt);
 
       try {
         const runTask = () => task();
@@ -101,6 +108,7 @@ export class QuoteProviderRuntime {
           ? await runScannerRpc(`${this.provider}.quote`, runTask, priority)
           : await runTask();
         this.counters.successes++;
+        finish(true);
         this.consecutiveFailures = 0;
         this.latencyTotalMs += Date.now() - started;
         this.cache.set(key, {
@@ -109,6 +117,7 @@ export class QuoteProviderRuntime {
         });
         return quote;
       } catch (error) {
+        finish(false, /429|rate.?limit/i.test(error instanceof Error ? error.message : String(error)));
         // Shared scanner-RPC cooldown is deliberate admission control, not a
         // provider failure. Counting it as another provider error would open a
         // second circuit and lengthen the outage after the RPC is healthy.
@@ -154,6 +163,7 @@ export class QuoteProviderRuntime {
         : this.counters.failures > 0 ? 'DEGRADED' : 'HEALTHY';
     return {
       provider: this.provider,
+      work: this.workMetrics.snapshot(), queueLength: this.queue.length, active: this.active,
       ...this.counters,
       averageLatencyMs: this.counters.successes === 0
         ? 0

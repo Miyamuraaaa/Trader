@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { DisabledPaperExecutionEngine } from '../src/engine.js';
-import { calculateLiveExecutionDashboard, mergeLiveDecisionJournal } from '../src/execution/live-dashboard.js';
+import { calculateLiveExecutionDashboard, mergeLiveDecisionJournal, scannerDecisionTrade } from '../src/execution/live-dashboard.js';
 import type { ExecutionRecord } from '../src/execution/execution-journal.js';
 
 describe('live and dry-run paper-ledger isolation', () => {
@@ -63,8 +63,9 @@ describe('live and dry-run paper-ledger isolation', () => {
         buy_provider: 'raydium', sell_provider: 'orca',
       },
     ];
-    const merged = mergeLiveDecisionJournal([], decisions);
-    expect(merged.map((trade) => trade.status)).toEqual(['REJECTED', 'REJECTED']);
+    expect(mergeLiveDecisionJournal([], decisions)).toEqual([]);
+    const merged = decisions.map(scannerDecisionTrade).reverse();
+    expect(merged.map((trade) => trade.status)).toEqual(['SCANNER_ONLY', 'SCANNER_ONLY']);
     expect(merged.every((trade) => trade.realizedPnlUsdc === null)).toBe(true);
     expect(merged[1]!.reason).toContain('expected +0.001000');
     expect(merged[1]!.reason).toContain('NO AUDITED ATOMIC EXECUTOR');
@@ -82,13 +83,13 @@ describe('live and dry-run paper-ledger isolation', () => {
       ]),
       stale: 0, liquidity_overlap: 0, buy_provider: 'raptor', sell_provider: 'jupiter',
     }];
-    const [trade] = mergeLiveDecisionJournal([], decisions);
-    expect(trade?.status).toBe('REJECTED');
+    const [trade] = decisions.map(scannerDecisionTrade);
+    expect(trade?.status).toBe('SCANNER_ONLY');
     expect(trade?.reason).toContain('QUOTE EXPIRED');
     expect(trade?.reason).toContain('9cRCn9…');
   });
 
-  it('counts visible scanner lifecycle expirations in the live expiration KPI', () => {
+  it('keeps scanner lifecycle expirations separate from real execution KPIs', () => {
     const execution = calculateLiveExecutionDashboard([]);
     const scanner = [{
       id: 'expired', timestamp: new Date(20).toISOString(), trade_size_usdc: '0.5',
@@ -98,9 +99,8 @@ describe('live and dry-run paper-ledger isolation', () => {
       stale: 0, liquidity_overlap: 0, buy_provider: 'raptor', sell_provider: 'jupiter',
     }];
     execution.trades = mergeLiveDecisionJournal(execution.trades, scanner);
-    execution.stats.expiredTrades += scanner.filter((row) =>
-      row.opportunity_state === 'EXPIRED' || row.stale === 1).length;
-    expect(execution.stats.expiredTrades).toBe(1);
+    expect(execution.stats.expiredTrades).toBe(0);
+    expect(execution.trades).toEqual([]);
   });
 
   it('preserves real executor records when scanner observations fill the journal limit', () => {
@@ -116,8 +116,8 @@ describe('live and dry-run paper-ledger isolation', () => {
       buy_provider: 'jupiter', sell_provider: 'raptor',
     }));
     const merged = mergeLiveDecisionJournal([execution], scanner, 100);
-    expect(merged).toHaveLength(100);
+    expect(merged).toHaveLength(1);
     expect(merged.some((row) => row.id === execution.id)).toBe(true);
-    expect(merged.filter((row) => row.id.startsWith('scanner:'))).toHaveLength(99);
+    expect(merged.filter((row) => row.id.startsWith('scanner:'))).toHaveLength(0);
   });
 });

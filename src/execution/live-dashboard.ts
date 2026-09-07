@@ -1,5 +1,5 @@
 import { DECIMALS } from '../config.js';
-import { getRecentLiveScannerDecisions, type LiveScannerDecisionRow } from '../db.js';
+import type { LiveScannerDecisionRow } from '../db.js';
 import { fromAtomic } from '../math.js';
 import { PersistentExecutionJournal, type ExecutionRecord, type ExecutionState } from './execution-journal.js';
 
@@ -11,14 +11,14 @@ export interface LiveExecutionDashboardTrade {
   id: string;
   timestamp: string;
   /** Final execution decision for the dashboard; detailed state stays in reason. */
-  status: 'ACCEPTED' | 'REJECTED';
+  status: ExecutionState | 'READY_TO_EXECUTE' | 'SCANNER_ONLY';
   inputUsdc: number;
   realizedPnlUsdc: number | null;
   reason: string | null;
   signature: string | null;
 }
 
-function scannerDecisionTrade(row: LiveScannerDecisionRow): LiveExecutionDashboardTrade {
+export function scannerDecisionTrade(row: LiveScannerDecisionRow): LiveExecutionDashboardTrade {
   const state = row.opportunity_state;
   const expected = Number(row.expected_profit_usdc);
   const worst = Number(row.worst_case_profit_usdc);
@@ -29,11 +29,8 @@ function scannerDecisionTrade(row: LiveScannerDecisionRow): LiveExecutionDashboa
   } catch { /* malformed historical rows remain displayable and fail closed */ }
   const isPositiveCandidate = row.validation_tier !== 'OBSERVATION' && expected > 0 && worst > 0;
   const isExpired = state === 'EXPIRED' || row.stale === 1;
-  // Scanner output has no execution authority. It is rejected from the real
-  // execution journal unless/until an independent executor creates its own
-  // APPROVED_FOR_SUBMISSION record. There is deliberately no third
-  // "discovery-only" execution decision.
-  const status = 'REJECTED' as const;
+  // Scanner observations are not execution attempts or real rejections.
+  const status = 'SCANNER_ONLY' as const;
   const route = `${row.buy_provider ?? 'unknown'} → ${row.sell_provider ?? 'unknown'}`;
   const format = (value: number) => Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value.toFixed(6)}` : 'unavailable';
   let eligibility: string;
@@ -112,13 +109,10 @@ export function calculateLiveExecutionDashboard(records: readonly ExecutionRecor
     maxDrawdown,
     totalVolume: confirmed.reduce((sum, record) => sum + usdc(record.inputAmount), 0),
   };
-  const acceptedStates = new Set<ExecutionState>([
-    'APPROVED_FOR_SUBMISSION', 'SUBMITTING', 'SUBMITTED', 'CONFIRMING', 'CONFIRMED',
-  ]);
   const trades = [...ordered].reverse().slice(0, 100).map((record) => ({
     id: record.id,
     timestamp: new Date(record.updatedAt).toISOString(),
-    status: acceptedStates.has(record.state) ? 'ACCEPTED' as const : 'REJECTED' as const,
+    status: record.state === 'APPROVED_FOR_SUBMISSION' ? 'READY_TO_EXECUTE' as const : record.state,
     inputUsdc: usdc(record.inputAmount),
     realizedPnlUsdc: record.accounting ? usdc(record.accounting.usdcDelta) : null,
     reason: record.reason ? `${record.state}: ${record.reason}` : record.state,
@@ -132,13 +126,8 @@ export function mergeLiveDecisionJournal(
   scannerDecisions: readonly LiveScannerDecisionRow[],
   limit = 100,
 ): LiveExecutionDashboardTrade[] {
-  // Scanner decisions arrive far more frequently than executor state changes.
-  // Reserve journal capacity for actual executor records so rejected/submitted/
-  // confirmed attempts cannot disappear merely because 100 new quotes arrived.
-  const executionReserve = Math.min(executionTrades.length, Math.min(25, limit));
-  const preservedExecution = executionTrades.slice(0, executionReserve);
-  const scannerLimit = Math.max(0, limit - preservedExecution.length);
-  return [...preservedExecution, ...scannerDecisions.slice(0, scannerLimit).map(scannerDecisionTrade)]
+  // Legacy API retained for callers; scanner observations NEVER enter this stream.
+  return [...executionTrades].filter((row) => !row.id.startsWith('scanner:'))
     .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
     .slice(0, limit);
 }
@@ -153,14 +142,6 @@ export async function getLiveExecutionDashboard(): Promise<ReturnType<typeof cal
       const journal = new PersistentExecutionJournal();
       await journal.load();
       const value = calculateLiveExecutionDashboard(journal.all());
-      const scannerDecisions = getRecentLiveScannerDecisions(100);
-      value.trades = mergeLiveDecisionJournal(value.trades, scannerDecisions);
-      value.stats.totalOpps = journal.all().length + scannerDecisions.length;
-      // The route table includes scanner lifecycle expirations as well as
-      // executor records. Reflect those same visible expirations in the KPI;
-      // otherwise the table can say EXPIRED while its summary remains zero.
-      value.stats.expiredTrades += scannerDecisions.filter((row) =>
-        row.opportunity_state === 'EXPIRED' || row.stale === 1).length;
       cache = { expiresAt: Date.now() + 1_000, value };
       return value;
     })().finally(() => { pending = undefined; });

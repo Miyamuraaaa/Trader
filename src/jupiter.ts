@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { RollingWorkMetrics } from './work-metrics.js';
+export const jupiterWorkMetrics = new RollingWorkMetrics();
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
 import crypto from 'crypto';
@@ -91,6 +93,7 @@ hourResetInterval.unref();
 dayResetInterval.unref();
 
 interface QueuedRequest {
+  queuedAt: number;
   params: QuoteParams;
   cacheKey: string;
   resolve: (q: Quote) => void;
@@ -240,11 +243,14 @@ async function processQueue() {
       if (!req) continue;
 
       jupiterStats.throttleState = 'ACTIVE';
+      const finish = jupiterWorkMetrics.start(req.queuedAt);
       
       try {
         const quote = await executeQuoteWithRetry(req.params);
+        finish(true);
         req.resolve(quote);
       } catch (err) {
+        finish(false, /429/.test(String(err)));
         req.reject(err instanceof Error ? err : new Error(String(err)));
       }
     }
@@ -306,7 +312,7 @@ export async function getQuote(params: QuoteParams): Promise<Quote> {
 
   // 3. Queue new request
   const p = new Promise<Quote>((resolve, reject) => {
-    queue.push({ params, cacheKey, resolve, reject });
+    queue.push({ params, cacheKey, resolve, reject, queuedAt: Date.now() });
     processQueue().catch(e => log.error('Queue processor error', { error: String(e) }));
   }).then(quote => {
     shortCache.set(cacheKey, { quote, expires: Date.now() + CONFIG.quoteCacheTtlMs });

@@ -33,3 +33,29 @@ Legacy risk files retain all counters and duplicate identities but migrate to
 fee history to reconstruct daily protection safely. Do not delete/reset them.
 Reconcile historical outcomes and review the retained state before any operator
 migration; no automatic unlock or fabricated history is provided.
+
+## Scanner and telemetry
+
+Aggregator first-leg work is independent of direct first legs. Continuous scans
+publish the fast lane before bounded direct/mixed background work finishes.
+Direct deadlines affect scanner work only, not execution freshness. Outstanding
+first-leg work is deduplicated and capped; background direct cycles are capped at
+four. Subscription capacity is unchanged, with leased priority/LRU ownership.
+
+Aggregator handoff v2 binds policy and normalized pool/program/amount evidence.
+Historical v1 records remain readable, but cannot create new live approvals.
+Fresh executor pool/program/amount-chain alignment remains mandatory.
+
+The dashboard now separates scanner observations from actual executor attempts.
+READY, user approval, submission and confirmation are distinct states. The funnel
+reports process-session totals and rolling 60s/5m/15m windows (bounded to 100,000
+events), the last ten positives, constrained costs and explicit live-size caps.
+Timing percentiles are absent, not fabricated zero-latency successes, when no
+matching start/end evidence exists. The funnel begins at process startup; it does
+not invent telemetry for historical journal entries.
+
+Provider work metrics describe logical quote tasks, including any existing
+provider retries; they are not individual HTTP-attempt counters. Queue time and
+task time are separate, with rolling 60s percentiles. Existing HTTP/rate-limit
+counters remain available separately. Read-only observation is never a trade or
+realized PnL.

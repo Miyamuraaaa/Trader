@@ -125,7 +125,7 @@
 
             <!-- Pipeline Stats -->
             <div class="glass-panel rounded-xl p-3 flex justify-between text-[10px] font-mono text-slate-400">
-                <div>Eval: <span id="kpi-detected" class="text-blue-400">0</span></div>
+                <div>Exec attempts: <span id="kpi-detected" class="text-blue-400">0</span></div>
                 <div>Rej: <span id="kpi-rejected" class="text-rose-400">0</span></div>
                 <div>Exp: <span id="kpi-expired" class="text-amber-400">0</span></div>
                 <div>Fail: <span id="kpi-failed" class="text-red-500">0</span></div>
@@ -142,6 +142,13 @@
             </section>
 
             <!-- Chart: PnL Area -->
+            <section class="glass-panel rounded-xl p-3 text-xs text-slate-400" id="execution-funnel-panel">
+                <h2 class="uppercase font-semibold text-slate-300 mb-2">Execution Funnel</h2>
+                <div id="execution-funnel-summary">Waiting for session telemetry...</div>
+                <div id="execution-funnel-counts" class="mt-2 font-mono space-y-1"></div>
+                <div id="scanner-lane-summary" class="mt-2"></div>
+                <div id="live-size-cap" class="mt-2">Live size cap: unavailable</div>
+            </section>
             <div id="execution-pnl-panel" class="glass-panel rounded-xl p-3 flex-1 min-h-[160px] flex flex-col">
                 <div class="flex items-center gap-2 mb-2">
                     <svg class="w-3.5 h-3.5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
@@ -166,6 +173,10 @@
 
         <!-- Right Column: Tables -->
         <div class="flex-1 flex flex-col gap-4 min-w-0">
+            <details class="glass-panel rounded-xl p-3 text-xs text-slate-400">
+                <summary class="cursor-pointer uppercase font-semibold text-slate-300">Last 10 positive signals — raw vs executable</summary>
+                <div id="positive-signal-diagnostics" class="mt-2 space-y-3 break-all">No positive signals this session.</div>
+            </details>
             
             <!-- Opportunities Table -->
             <div class="glass-panel rounded-xl overflow-hidden flex flex-col flex-1">
@@ -533,7 +544,7 @@
                 const wc = (worstCase > 0 ? '+' : '') + worstCase.toFixed(4);
                 const profitColor = expected > 0 ? 'text-emerald-400' : 'text-rose-400';
                 const tier = opp.validation_tier || 'OBSERVATION';
-                const decision = [opp.opportunity_state, tier, opp.category, opp.decision_status].filter(Boolean).join(' · ');
+                const decision = [opp.executionEligibility, opp.opportunity_state, tier, opp.category, opp.decision_status].filter(Boolean).join(' · ');
                 const decisionColor = tier === 'CONSERVATIVE_CANDIDATE'
                     ? 'text-emerald-400' : tier === 'QUOTE_CANDIDATE'
                     ? 'text-sky-400' : opp.decision_status === 'RISK_REJECTED' || opp.category === 'NEGATIVE'
@@ -573,7 +584,7 @@
             }
             body.innerHTML = trades.map(t => {
                 let badgeClass = 'bg-blue-500/10 text-blue-400 border border-blue-500/20';
-                if (t.status === 'ACCEPTED') badgeClass = 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
+                if (t.status === 'CONFIRMED') badgeClass = 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
                 if (t.status === 'REJECTED') badgeClass = 'bg-rose-500/10 text-rose-300 border border-rose-500/20';
                 
                 const quotedPnl = runtimeMode === 'paper' ? t.confirmed_quote_profit_usdc : t.realizedPnlUsdc;
@@ -620,6 +631,25 @@
                     if (data.type === 'INIT' || data.type === 'LIVE_UPDATE') {
                         const p = data.payload;
                         applyRuntimeMode(p.executionMode);
+                        if (p.executionFunnel) {
+                            const f = p.executionFunnel;
+                            document.getElementById('execution-funnel-summary').textContent = f.explanation;
+                            const counts = document.getElementById('execution-funnel-counts'); counts.replaceChildren();
+                            for (const stage of ['RAW_POSITIVE','EXECUTOR_CONSTRAINED_POSITIVE','P0_HANDOFF','EXECUTOR_RECEIVED','ROUTE_ALIGNED','SIMULATION_PASSED','FINAL_PROFITABILITY_PASSED','READY_TO_EXECUTE','USER_APPROVED','SUBMITTED','CONFIRMED']) {
+                                const line = document.createElement('div');
+                                line.textContent = `${stage}: ${f.session[stage] || 0} session / ${f.last5m[stage] || 0} 5m / ${f.last15m[stage] || 0} 15m`; counts.append(line);
+                            }
+                            const signals = document.getElementById('positive-signal-diagnostics'); signals.replaceChildren();
+                            if (!f.lastPositiveSignals.length) signals.textContent = 'No positive signals this session.';
+                            for (const s of f.lastPositiveSignals) {
+                                const card = document.createElement('div');
+                                card.textContent = `${new Date(s.detectedAt).toLocaleTimeString()} ${s.providers} | mint ${s.intermediateMint} | input ${s.inputAmount} raw USDC | raw ${s.rawNet} / worst ${s.rawWorstCase} | constrained ${s.constrainedNet ?? 'unavailable'} / worst ${s.constrainedWorstCase ?? 'unavailable'} | network ${s.networkFee ?? '?'} priority ${s.priorityFee ?? '?'} ATA ${s.ataRent ?? '?'} USDC | pools ${s.pools.flat().join(' -> ')} | prefilter ${s.prefilterResult ?? 'pending'} | P0 ${s.p0Handoff ? 'yes' : 'no'} | executor ${s.executorResult ?? 'not received'} | alignment ${s.routeAlignment ?? 'not evaluated'} | final conservative ${s.finalConservativeNet ?? 'unavailable'} | latency ms ${JSON.stringify(s.latencyByStage ?? {})}`;
+                                signals.append(card);
+                            }
+                        }
+                        document.getElementById('live-size-cap').textContent = `FIRST_LIVE_MAX_INPUT_USDC: ${p.firstLiveMaxInputUsdc ?? 'unavailable'} — larger sizes are scanner-only`;
+                        const lanes = p.stats?.apiStats?.scanner?.lanes;
+                        if (lanes) document.getElementById('scanner-lane-summary').textContent = `Rolling 60s: aggregator ${lanes.aggregatorFastLaneEvals60s}, direct ${lanes.directLaneEvals60s}, mixed ${lanes.mixedLaneEvals60s}; cycles ${lanes.completedScans60s}; cycle p50/p90 ${lanes.scannerCycleP50}/${lanes.scannerCycleP90}ms; scanner RPC queued ${p.stats?.apiStats?.scannerRpc?.queued ?? 0}`;
                         manualApprovalMockEnabled = p.manualApprovalMockEnabled === true;
                         renderLiveApproval(p.approval);
                         

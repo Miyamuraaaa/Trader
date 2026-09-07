@@ -57,6 +57,7 @@ export const raptorStats = {
 };
 
 interface QueuedRaptorRequest<T> {
+  queuedAt: number;
   task: () => Promise<T>;
   priority: QuoteParams['priority'];
   resolve: (value: T) => void;
@@ -68,6 +69,7 @@ let backoffUntil = 0;
 let consecutiveFailures = 0;
 const cache = new Map<string, { quote: Quote; expires: number }>();
 const pending = new Map<string, Promise<Quote>>();
+export function raptorQueueHealth() { return { queueLength: queue.length, active: raptorStats.throttleState === 'ACTIVE' ? 1 : 0, cooldownRemainingMs: Math.max(0, backoffUntil - Date.now()) }; }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -98,7 +100,7 @@ async function paceRequest(): Promise<void> {
 
 function enqueue(task: () => Promise<Quote>, priority: QuoteParams['priority']): Promise<Quote> {
   return new Promise<Quote>((resolve, reject) => {
-    queue.push({ task, priority, resolve, reject });
+    queue.push({ task, priority, resolve, reject, queuedAt: Date.now() });
     void processQueue();
   });
 }
@@ -112,9 +114,12 @@ async function processQueue(): Promise<void> {
       const highIndex = queue.findIndex((request) => request.priority === 'HIGH');
       const request = queue.splice(highIndex >= 0 ? highIndex : 0, 1)[0]!;
       raptorStats.throttleState = 'ACTIVE';
+      const finish = raptorWorkMetrics.start(request.queuedAt);
       try {
         request.resolve(await request.task());
+        finish(true);
       } catch (error) {
+        finish(false, /429/.test(String(error)));
         request.reject(error);
       }
     }
@@ -309,3 +314,5 @@ export const raptorProvider: QuoteProvider = {
   getQuote: getRaptorQuote,
   isRateLimited: isRaptorRateLimited,
 };
+import { RollingWorkMetrics } from './work-metrics.js';
+export const raptorWorkMetrics = new RollingWorkMetrics();

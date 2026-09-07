@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { executionFunnel } from './execution/execution-funnel.js';
 import { prioritizeDirectMarketPair } from './direct-market-stream.js';
 import { ScannerFirstLegBulkheads, ScannerBackgroundLane } from './scanner-bulkheads.js';
 import { CONFIG, DECIMALS, MINTS } from './config.js';
@@ -225,6 +226,7 @@ async function publishSupportedAggregatorHandoff(
     },
   };
   const identity = aggregatorHandoffIdentity(dto);
+  executionFunnel.update(route.diagnosticSignalId ?? '', { executionId: identity, p0Handoff: true });
   logExecutionStage(identity, 'FOUND', detectedAt, {
     providers: dto.providers, scannerExpectedNetAtomic: dto.scannerObservation.projectedNetAmount,
   });
@@ -366,9 +368,18 @@ async function findExecutableCandidates(
     route.profit.estimatedNetProfitUsdc.gt(0) && route.profit.worstCaseNetProfitUsdc.gt(0));
   const capAtomic = BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC));
   const results = await Promise.all(positive.map(async (raw) => {
-    if (raw.opportunityScope === 'DISCOVERY_ONLY_TOKEN_2022') return undefined;
-    if (BigInt(raw.buyQuote.inAmount) > capAtomic) return undefined;
+    const signalId = raw.diagnosticSignalId ?? `${raw.buyQuote.id}:${raw.sellQuote.id}`;
+    const event = (stage: string) => executionFunnel.record({ identity: signalId, stage, at: Date.now(), detectedAt: raw.buyQuote.responseTimestamp });
+    if (raw.opportunityScope === 'DISCOVERY_ONLY_TOKEN_2022') { event('DISCOVERY_ONLY_TOKEN_2022'); executionFunnel.update(signalId, { prefilterResult: 'DISCOVERY_ONLY_TOKEN_2022' }); return undefined; }
+    if (BigInt(raw.buyQuote.inAmount) > capAtomic) { event('ABOVE_LIVE_CAP'); executionFunnel.update(signalId, { prefilterResult: 'ABOVE_LIVE_CAP' }); return undefined; }
     const result = await buildExecutableCandidateFromRaw(raw, costs);
+    event(result.status);
+    executionFunnel.update(signalId, { prefilterResult: result.status,
+      constrainedNet: result.route?.profit.estimatedNetProfitUsdc.toFixed(6), constrainedWorstCase: result.route?.profit.worstCaseNetProfitUsdc.toFixed(6),
+      networkFee: String(costs.estimatedNetworkCostsUsdc.baseNetworkFeeUsdc), priorityFee: String(costs.estimatedNetworkCostsUsdc.priorityFeeUsdc),
+      ataRent: result.estimatedAtaRentUsdc === undefined ? undefined : String(result.estimatedAtaRentUsdc),
+      pools: result.route ? [result.route.buyQuote.poolIds, result.route.sellQuote.poolIds] : [raw.buyQuote.poolIds, raw.sellQuote.poolIds] });
+    if (result.route) result.route.diagnosticSignalId = signalId;
     if (result.status === 'DISCOVERY_ONLY_TOKEN_2022') {
       raw.opportunityScope = 'DISCOVERY_ONLY_TOKEN_2022';
       scannerStats.executionPrefilter.token2022DiscoveryOnly++;
@@ -1200,6 +1211,13 @@ function recordMatrixEvaluations(routes: RoundTripResult[], lane: 'aggregator' |
       && route.profit.estimatedNetProfitUsdc.gt(0)
       && route.profit.worstCaseNetProfitUsdc.gt(0)) {
       scannerStats.executionPrefilter.rawPositiveOpportunities++;
+      const signalId = `${route.buyQuote.id}:${route.sellQuote.id}`;
+      route.diagnosticSignalId = signalId;
+      executionFunnel.record({ identity: signalId, stage: 'RAW_POSITIVE', at: Date.now(), detectedAt: route.buyQuote.responseTimestamp });
+      executionFunnel.signal({ id: signalId, detectedAt: Date.now(), providers: `${route.buyQuote.provider}->${route.sellQuote.provider}`,
+        intermediateMint: route.buyQuote.outputMint, inputAmount: route.buyQuote.inAmount,
+        rawNet: route.profit.estimatedNetProfitUsdc.toFixed(6), rawWorstCase: route.profit.worstCaseNetProfitUsdc.toFixed(6),
+        pools: [route.buyQuote.poolIds, route.sellQuote.poolIds], p0Handoff: false });
       if (dynamicByMint.get(route.buyQuote.outputMint)?.tokenProgram === token2022Program) {
         route.opportunityScope = 'DISCOVERY_ONLY_TOKEN_2022';
         scannerStats.executionPrefilter.token2022DiscoveryOnly++;

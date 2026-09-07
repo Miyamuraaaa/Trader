@@ -43,6 +43,7 @@ export interface ScannerExecutableCostSnapshot {
 }
 
 export interface ExecutablePrefilterResult {
+  estimatedAtaRentUsdc?: number;
   status: ExecutablePrefilterStatus;
   route?: RoundTripResult;
   reason?: string;
@@ -228,9 +229,9 @@ export async function buildExecutableCandidateFromRaw(
     if (validationTier !== 'CONSERVATIVE_CANDIDATE'
       || !profit.estimatedNetProfitUsdc.gt(0)
       || !profit.worstCaseNetProfitUsdc.gt(0)) {
-      return { status: 'ECONOMICS_DIVERGED', route, reason: 'Executor-constrained route is not conservatively profitable' };
+      return { status: 'ECONOMICS_DIVERGED', route, estimatedAtaRentUsdc: Number(tokenPolicy.rentLamports) / LAMPORTS_PER_SOL * costs.referenceSolPriceUsdc, reason: 'Executor-constrained route is not conservatively profitable' };
     }
-    return { status: 'EXECUTABLE_CANDIDATE', route };
+    return { status: 'EXECUTABLE_CANDIDATE', route, estimatedAtaRentUsdc: Number(tokenPolicy.rentLamports) / LAMPORTS_PER_SOL * costs.referenceSolPriceUsdc };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);

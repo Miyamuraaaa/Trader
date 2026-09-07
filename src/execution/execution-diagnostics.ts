@@ -1,4 +1,5 @@
 import { log } from '../logger.js';
+import { emitFunnelExecutionStage } from './execution-funnel.js';
 import type { ExecutionNetworkTiming } from './network-profiler.js';
 
 export type ExecutionRejectionCategory =
@@ -124,6 +125,9 @@ export function logExecutionStage(
   details: Record<string, unknown> = {},
 ): void {
   const now = Date.now();
+  emitFunnelExecutionStage(identity, stage, detectedAt,
+    stage === 'REJECTED' && typeof details.reason === 'string' ? classifyExecutionRejection(details.reason) : undefined,
+    typeof details.conservativeNetAtomic === 'string' && /^-?\d+$/.test(details.conservativeNetAtomic) ? details.conservativeNetAtomic : undefined);
   const previous = latestNonTerminalStage.get(identity);
   if (previous && previous.stage !== stage) {
     rollingStageTimings.push({

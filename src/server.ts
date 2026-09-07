@@ -1,4 +1,8 @@
 import express from 'express';
+import { executionFunnel } from './execution/execution-funnel.js';
+import { scannerDisplayEligibility } from './execution/scanner-display-eligibility.js';
+import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
+import { directMarketStreamHealth } from './direct-market-stream.js';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import {
@@ -203,6 +207,9 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
       const pairsTracked = getScanCycles().length;
       const providerDirectionsPerPair = enabledProviderCount * Math.max(0, enabledProviderCount - 1);
       res.json({
+        executionFunnel: executionFunnel.snapshot(),
+        scannerRpc: scannerRpcLimiter.snapshot(),
+        directMarketStream: directMarketStreamHealth(),
         scanner: getHealthHistory('scanner', 10),
         progress: scannerStats,
         configuration: {
@@ -213,6 +220,7 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
           profitMode: CONFIG.profitMode === 'quote' ? 'expected' : CONFIG.profitMode,
           minNetProfitUsdc: CONFIG.minNetProfitUsdc,
           minProfitBps: CONFIG.minProfitBps,
+          firstLiveMaxInputUsdc: CONFIG.firstLiveMaxInputUsdc,
           prefilterSpreadBps: CONFIG.prefilterSpreadBps,
           scanMode: CONFIG.scanMode,
           discoveryMode: CONFIG.discoveryMode,
@@ -332,7 +340,8 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
               plan: CONFIG.jupiterPlan,
               maxRps: CONFIG.jupiterMaxRps,
               evaluationsPerMin: scannerStats.evaluationsThisMinute,
-              theoreticalMaxEvals: Math.floor((CONFIG.jupiterMaxRps * 60) / (CONFIG.tradeSizesUsdc.length * 2)),
+              scannerRpc: scannerRpcLimiter.snapshot(),
+              directMarketStream: directMarketStreamHealth(),
               raptor: raptorStats,
               providers: getProviderHealth(),
               rpc: rpcMetrics,
@@ -340,9 +349,14 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
             }
           },
           balance: paperBalance,
+          executionFunnel: executionFunnel.snapshot(),
+          firstLiveMaxInputUsdc: CONFIG.firstLiveMaxInputUsdc,
           approval: liveApproval?.snapshot() ?? null,
           manualApprovalMockEnabled: CONFIG.manualApprovalUiMock,
-          opportunities: getRecentOpportunities(20),
+          opportunities: getRecentOpportunities(20).map((value) => {
+            const row = value as Record<string, unknown>;
+            return { ...row, executionEligibility: scannerDisplayEligibility(row, CONFIG.firstLiveMaxInputUsdc) };
+          }),
           trades: paperActive ? getRecentTrades(20) : live!.trades,
         };
         ws.send(JSON.stringify({ type: 'LIVE_UPDATE', payload }));

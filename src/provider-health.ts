@@ -1,12 +1,16 @@
 import { CONFIG } from './config.js';
-import { jupiterStats } from './jupiter.js';
+import { jupiterStats, jupiterWorkMetrics, getQueueLength, getRateLimitState } from './jupiter.js';
 import { meteoraPoolRegistry, meteoraRuntime } from './meteora.js';
 import { orcaPoolRegistry, orcaRuntime } from './orca.js';
 import { raydiumRuntime } from './raydium.js';
-import { raptorStats } from './raptor.js';
+import { raptorStats, raptorWorkMetrics, raptorQueueHealth } from './raptor.js';
 import { rpcMetrics } from './solana.js';
 
 interface HealthLine {
+  work?: ReturnType<typeof jupiterWorkMetrics.snapshot>;
+  queueLength?: number;
+  active?: number;
+  cooldownRemainingMs?: number;
   provider: string;
   requests: number;
   successes: number;
@@ -24,6 +28,8 @@ export function getProviderHealth(): HealthLine[] {
   return [
     {
       provider: 'jupiter',
+      work: jupiterWorkMetrics.snapshot(), queueLength: getQueueLength(), active: jupiterStats.throttleState === 'ACTIVE' ? 1 : 0,
+      cooldownRemainingMs: Math.max(0, getRateLimitState().backoffUntil - Date.now()),
       requests: jupiterStats.requestsSinceStartup,
       successes: jupiterStats.successfulRequests,
       failures: jupiterStats.otherErrors,
@@ -40,6 +46,7 @@ export function getProviderHealth(): HealthLine[] {
     },
     {
       provider: 'raptor',
+      work: raptorWorkMetrics.snapshot(), ...raptorQueueHealth(),
       requests: raptorStats.requestsSinceStartup,
       successes: raptorStats.successfulRequests,
       failures: raptorStats.otherErrors,

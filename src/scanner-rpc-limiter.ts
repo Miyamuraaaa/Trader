@@ -1,4 +1,5 @@
 import { log } from './logger.js';
+import { RollingWorkMetrics } from './work-metrics.js';
 
 export type ScannerRpcPriority = 'HIGH' | 'LOW';
 
@@ -25,6 +26,10 @@ export interface ScannerRpcLimiterOptions {
 }
 
 export interface ScannerRpcLimiterSnapshot {
+  work: ReturnType<RollingWorkMetrics['snapshot']>;
+  rejectedQueuedByBackpressure: number;
+  skippedDuringCooldown: number;
+  totalCooldowns: number;
   queued: number;
   active: number;
   effectiveConcurrency: number;
@@ -37,6 +42,7 @@ export interface ScannerRpcLimiterSnapshot {
 }
 
 interface QueueEntry<T> {
+  queuedAt: number;
   label: string;
   priority: ScannerRpcPriority;
   sequence: number;
@@ -75,6 +81,9 @@ function isRateLimit(error: unknown): boolean {
  * restores shared concurrency gradually.
  */
 export class ScannerRpcLimiter {
+  private workMetrics = new RollingWorkMetrics();
+  private rejectedQueuedByBackpressure = 0;
+  private skippedDuringCooldown = 0;
   private readonly queue: Array<QueueEntry<unknown>> = [];
   private active = 0;
   private effectiveConcurrency: number;
@@ -105,11 +114,14 @@ export class ScannerRpcLimiter {
   run<T>(label: string, task: () => Promise<T>, priority: ScannerRpcPriority = 'LOW'): Promise<T> {
     const cooldownRemainingMs = this.cooldownRemainingMs();
     if (cooldownRemainingMs > 0) {
+      this.skippedDuringCooldown++;
       return Promise.reject(new ScannerRpcBackpressureError(cooldownRemainingMs));
     }
 
     return new Promise<T>((resolve, reject) => {
+      if (this.queue.length >= 128) { reject(new Error('Scanner RPC bounded queue capacity exceeded')); return; }
       this.queue.push({
+        queuedAt: Date.now(),
         label,
         priority,
         sequence: this.sequence++,
@@ -131,6 +143,8 @@ export class ScannerRpcLimiter {
 
   snapshot(): ScannerRpcLimiterSnapshot {
     return {
+      work: this.workMetrics.snapshot(), rejectedQueuedByBackpressure: this.rejectedQueuedByBackpressure,
+      skippedDuringCooldown: this.skippedDuringCooldown, totalCooldowns: this.rateLimits429,
       queued: this.queue.length,
       active: this.active,
       effectiveConcurrency: this.effectiveConcurrency,
@@ -168,14 +182,17 @@ export class ScannerRpcLimiter {
     }
 
     const next = this.queue.shift()!;
+    const finish = this.workMetrics.start(next.queuedAt);
     this.active++;
     this.lastStartAt = now;
     Promise.resolve()
       .then(next.task)
       .then((value) => {
+        finish(true);
         this.onSuccess(next.label);
         next.resolve(value);
       }, (error) => {
+        finish(false, isRateLimit(error));
         this.onFailure(next.label, error);
         next.reject(error);
       })
@@ -220,6 +237,7 @@ export class ScannerRpcLimiter {
     }
     if (this.queue.length === 0) return;
     const error = new ScannerRpcBackpressureError(cooldownRemainingMs);
+    this.rejectedQueuedByBackpressure += this.queue.length;
     for (const queued of this.queue.splice(0)) queued.reject(error);
   }
 
