@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
+import { writeAtomicJson } from '../persistence/atomic-json-file.js';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -44,7 +45,6 @@ export function confirmedRiskPnl(baseDelta: bigint, solDebitLamports: bigint, so
 export class PersistentRiskManager {
   private state: RiskStateJson;
   private persistenceFailed = false;
-  private writes: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly limits: ExecutionRiskLimits,
@@ -157,14 +157,8 @@ export class PersistentRiskManager {
   }
 
   private async persist(): Promise<void> {
-    const document = JSON.stringify(this.state);
-    const write = this.writes.then(async () => {
-      await mkdir(path.dirname(this.statePath), { recursive: true });
-      const temporary = `${this.statePath}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, document, { encoding: 'utf8', mode: 0o600 });
-      await rename(temporary, this.statePath);
-    });
-    this.writes = write.catch(() => { this.persistenceFailed = true; });
-    await write;
+    if (this.persistenceFailed) throw new Error('Risk persistence failed; restart/reconciliation required');
+    try { await writeAtomicJson(this.statePath, this.state); }
+    catch (error) { this.persistenceFailed = true; throw error; }
   }
 }

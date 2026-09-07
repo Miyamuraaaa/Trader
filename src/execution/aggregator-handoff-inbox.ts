@@ -1,5 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { updateAtomicJson } from '../persistence/atomic-json-file.js';
 import path from 'node:path';
 import {
   parseAggregatorAtomicHandoff,
@@ -9,7 +9,6 @@ import {
 interface InboxFile { version: 1; updatedAt: number; candidates: AggregatorAtomicHandoff[]; }
 
 const MAX_QUEUED_CANDIDATES = 8;
-let publishChain: Promise<void> = Promise.resolve();
 
 export class AggregatorHandoffInbox {
   constructor(private readonly filePath = path.resolve('data/aggregator-handoff-candidates.json')) {}
@@ -19,20 +18,15 @@ export class AggregatorHandoffInbox {
     // Scanner cycles can finish together. Serialize local mailbox updates so
     // one positive candidate cannot overwrite another before the executor's
     // next 100ms poll.
-    const write = async (): Promise<void> => {
-      await mkdir(path.dirname(this.filePath), { recursive: true });
-      const existing = await this.recent(MAX_QUEUED_CANDIDATES).catch(() => []);
+    await updateAtomicJson(this.filePath, async () => {
+      const existing = await this.recent(MAX_QUEUED_CANDIDATES);
       const candidates = [verified, ...existing.filter((item) => item.opportunityId !== verified.opportunityId)]
         .sort((a, b) => b.detectedAt - a.detectedAt)
         .slice(0, MAX_QUEUED_CANDIDATES);
-      const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, JSON.stringify({
+      return {
         version: 1, updatedAt: Date.now(), candidates,
-      } satisfies InboxFile), { encoding: 'utf8', mode: 0o600 });
-      await rename(temporary, this.filePath);
-    };
-    publishChain = publishChain.catch(() => undefined).then(write);
-    await publishChain;
+      } satisfies InboxFile;
+    });
   }
 
   async latest(): Promise<AggregatorAtomicHandoff | undefined> {

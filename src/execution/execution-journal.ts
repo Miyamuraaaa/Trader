@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
+import { writeAtomicJson } from '../persistence/atomic-json-file.js';
 import path from 'node:path';
 import type { ConfirmedCycleAccounting } from './confirmation-accounting.js';
 
@@ -93,6 +94,11 @@ function toPersistedAccounting(value: ConfirmedCycleAccounting): PersistedAccoun
 /** Atomic disk journal. Any unresolved submission blocks new execution on restart. */
 export class PersistentExecutionJournal {
   private records = new Map<string, ExecutionRecord>();
+  private persistenceFailed = false;
+
+  private assertHealthy(): void {
+    if (this.persistenceFailed) throw new Error('Execution journal persistence failed; restart/reconciliation required');
+  }
 
   constructor(private readonly journalPath = path.resolve('data/execution-journal.json')) {}
 
@@ -111,13 +117,14 @@ export class PersistentExecutionJournal {
     }
   }
 
-  get(id: string): ExecutionRecord | undefined { return this.records.get(id); }
+  get(id: string): ExecutionRecord | undefined { this.assertHealthy(); return this.records.get(id); }
 
   all(): ExecutionRecord[] {
     return [...this.records.values()].map((record) => ({ ...record }));
   }
 
   unresolved(): ExecutionRecord[] {
+    this.assertHealthy();
     return [...this.records.values()].filter((record) => !terminal.has(record.state));
   }
 
@@ -144,6 +151,7 @@ export class PersistentExecutionJournal {
   }
 
   async begin(id: string): Promise<ExecutionRecord> {
+    this.assertHealthy();
     if (this.records.has(id)) throw new Error('Execution journal already contains this opportunity');
     const now = Date.now();
     const record: ExecutionRecord = { id, state: 'DETECTED', createdAt: now, updatedAt: now };
@@ -158,6 +166,7 @@ export class PersistentExecutionJournal {
     update: Pick<ExecutionRecord, 'messageHash' | 'serializedTransactionHash' | 'signature' | 'wallet' | 'baseMint' | 'intermediateMint' | 'inputAmount' | 'reason'> = {},
     options: { persist?: boolean } = {},
   ): Promise<ExecutionRecord> {
+    this.assertHealthy();
     const current = this.records.get(id);
     if (!current) throw new Error('Execution journal record does not exist');
     assertExecutionTransition(current.state, state);
@@ -168,6 +177,7 @@ export class PersistentExecutionJournal {
   }
 
   async recordAccounting(id: string, accounting: ConfirmedCycleAccounting, failed = false): Promise<ExecutionRecord> {
+    this.assertHealthy();
     const current = this.records.get(id);
     if (!current) throw new Error('Execution journal record does not exist');
     const state = failed ? 'TRANSACTION_FAILED' as const : 'CONFIRMED' as const;
@@ -179,9 +189,8 @@ export class PersistentExecutionJournal {
   }
 
   private async persist(): Promise<void> {
-    await mkdir(path.dirname(this.journalPath), { recursive: true });
-    const temporary = `${this.journalPath}.${process.pid}.tmp`;
-    await writeFile(temporary, JSON.stringify({ records: [...this.records.values()] }), { encoding: 'utf8', mode: 0o600 });
-    await rename(temporary, this.journalPath);
+    this.assertHealthy();
+    try { await writeAtomicJson(this.journalPath, { records: [...this.records.values()] }); }
+    catch (error) { this.persistenceFailed = true; throw error; }
   }
 }
