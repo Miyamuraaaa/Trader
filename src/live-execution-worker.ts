@@ -56,6 +56,8 @@ export interface LiveExecutionWorker {
 }
 
 export interface LiveExecutionWorkerOptions {
+  /** Isolated diagnostic process only: manual acceptance is unavailable for its entire lifetime. */
+  noBroadcast?: boolean;
   onManualApprovalUpdate?: (view: ManualApprovalView | null) => void;
 }
 
@@ -244,7 +246,10 @@ export async function startLiveExecutionWorker(
   signer: SignerContext,
   options: LiveExecutionWorkerOptions = {},
 ): Promise<LiveExecutionWorker> {
-  assertLiveSubmissionAllowed(EXECUTION_IMPLEMENTATION_READY);
+  const noBroadcast = options.noBroadcast === true;
+  if (noBroadcast) {
+    if (CONFIG.liveTradingEnabled) throw new Error('No-broadcast validation requires LIVE_TRADING_ENABLED=false');
+  } else assertLiveSubmissionAllowed(EXECUTION_IMPLEMENTATION_READY);
   if (CONFIG.executionRpcUrl === CONFIG.rpcUrl) {
     log.warn('Execution RPC is shared with scanner RPC; public rate limits can prevent sub-second approval', {
       executionRpc: executionRpcEndpointLabel(),
@@ -571,6 +576,7 @@ export async function startLiveExecutionWorker(
   };
 
   const approveManual = async (executionId: string, messageHash: string, approvalToken: string): Promise<ManualApprovalResponse> => {
+    if (noBroadcast) return response(false, null, 'NO_BROADCAST_VALIDATION: manual acceptance unavailable');
     const mismatch = matchesPending(executionId, messageHash, approvalToken);
     if (mismatch) return response(false, pending?.view ?? null, mismatch);
     if (Date.now() >= pending!.view.expiresAt) return expirePending('Manual approval arrived after prepared transaction expiry');

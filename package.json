@@ -12,6 +12,7 @@
     "start": "tsx src/index.ts",
     "scan:once": "tsx src/scan-once.ts",
     "scan:live": "tsx src/scan-live.ts",
+    "scan:production-soak": "tsx src/production-workload-soak.ts",
     "execution:validate": "tsx src/execution-validate.ts",
     "execution:handoff-validate": "tsx src/execution-handoff-validate.ts",
     "execution:aggregator-validate": "tsx src/execution-aggregator-validate.ts",

@@ -22,6 +22,7 @@ async function main(): Promise<void> {
   const workerStartedAt = Date.now();
   log.info('Isolated live executor worker initialization started');
   worker = await startLiveExecutionWorker(signer, {
+    noBroadcast: process.env.TRADER_PRODUCTION_SOAK === '1',
     onManualApprovalUpdate: (view) => process.send?.({ type: 'LIVE_APPROVAL_UPDATE', view }),
   });
   log.info('Isolated live executor worker created', { elapsedMs: Date.now() - workerStartedAt });
