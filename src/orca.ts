@@ -493,7 +493,7 @@ export function getOrcaQuote(params: QuoteParams): Promise<Quote> {
     params.amountAtomic,
     params.slippageBps,
   ]);
-  return orcaRuntime.run(key, () => executeOrcaQuote(params), params.priority);
+  return orcaRuntime.run(key, () => executeOrcaQuote(params), params.priority, params);
 }
 
 export const orcaProvider: QuoteProvider = {

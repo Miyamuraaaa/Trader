@@ -1,4 +1,7 @@
 import { z } from 'zod';
+import { performance } from 'node:perf_hooks';
+import { dispatchDrift } from './dispatch-diagnostics.js';
+import { QuoteAdmission, semanticQuoteKey, type QuoteDeadline } from './quote-admission.js';
 import { ScannerFairService } from './scanner-service-policy.js';
 const fairService = new ScannerFairService();
 import { RollingWorkMetrics } from './work-metrics.js';
@@ -95,6 +98,7 @@ hourResetInterval.unref();
 dayResetInterval.unref();
 
 interface QueuedRequest {
+  deadline: QuoteDeadline;
   queuedAt: number;
   params: QuoteParams;
   cacheKey: string;
@@ -103,6 +107,7 @@ interface QueuedRequest {
 }
 
 const queue: QueuedRequest[] = [];
+export const jupiterAdmission = new QuoteAdmission('jupiter', () => CONFIG.jupiterApiKey ? CONFIG.jupiterSafetyIntervalMs : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050));
 let isProcessingQueue = false;
 let rateLimitBackoffUntil = 0;
 
@@ -221,7 +226,8 @@ async function processQueue() {
       if (isRateLimited()) {
         jupiterStats.throttleState = 'BACKOFF';
         const waitMs = rateLimitBackoffUntil - Date.now();
-        await new Promise(r => setTimeout(r, waitMs));
+        const expected = performance.now() + waitMs;
+        await new Promise(r => setTimeout(r, waitMs)); dispatchDrift('jupiter', expected);
         continue;
       }
 
@@ -234,23 +240,27 @@ async function processQueue() {
       if (timeSinceLast < effectiveIntervalMs) {
         jupiterStats.throttleState = 'THROTTLED';
         const waitMs = effectiveIntervalMs - timeSinceLast;
-        await new Promise(r => setTimeout(r, waitMs));
+        const expected = performance.now() + waitMs;
+        await new Promise(r => setTimeout(r, waitMs)); dispatchDrift('jupiter', expected);
         continue;
       }
 
       // Dequeue next highest priority request
-      const req = fairService.take(queue, (request) => request.params.priority);
+      const req = fairService.take(queue, (request) => request.params.priority, (request) => request.deadline.deadlineMono);
       if (!req) continue;
 
       jupiterStats.throttleState = 'ACTIVE';
-      const finish = jupiterWorkMetrics.start(req.queuedAt);
+      let finish: ReturnType<typeof jupiterWorkMetrics.start> | undefined;
       
       try {
-        const quote = await executeQuoteWithRetry(req.params);
-        finish(true);
+        const quote = await jupiterAdmission.dispatch(req.deadline, () => {
+          finish = jupiterWorkMetrics.start(req.queuedAt);
+          return executeQuoteWithRetry({ ...req.params, scheduling: { deadlineMono: req.deadline.deadlineMono, traceId: req.deadline.traceId } });
+        });
+        finish?.(true);
         req.resolve(quote);
       } catch (err) {
-        finish(false, /429/.test(String(err)));
+        finish?.(false, /429/.test(String(err)));
         req.reject(err instanceof Error ? err : new Error(String(err)));
       }
     }
@@ -261,7 +271,7 @@ async function processQueue() {
 }
 
 async function executeQuoteWithRetry(params: QuoteParams): Promise<Quote> {
-  const maxRetries = Math.min(CONFIG.httpMaxRetries, 2);
+  const maxRetries = params.scheduling ? 0 : Math.min(CONFIG.httpMaxRetries, 2);
   for (let attempt = 0; ; attempt++) {
     try {
       return await executeQuote(params);
@@ -287,46 +297,25 @@ async function executeQuoteWithRetry(params: QuoteParams): Promise<Quote> {
 // ---------------------------------------------------------------------------
 
 const shortCache = new Map<string, { quote: Quote, expires: number }>();
-const pendingPromises = new Map<string, Promise<Quote>>();
 
 export async function getQuote(params: QuoteParams): Promise<Quote> {
-  const cacheKey = [
-    params.inputMint, params.outputMint, params.amountAtomic,
-    params.slippageBps, (params.dexes||[]).join(','),
-    params.maxHops ?? '', params.onlyDirectRoutes ?? '', params.maxAccounts ?? '',
-  ].join('|');
-
-  // 1. Check short-lived cache (valid for 1500ms to allow concurrent scans of same pair to dedupe)
+  params = structuredClone(params);
+  const cacheKey = semanticQuoteKey('jupiter', params);
   const cached = shortCache.get(cacheKey);
-  if (cached && Date.now() < cached.expires) {
-    jupiterStats.cacheHits++;
-    return { ...cached.quote, id: crypto.randomUUID() };
-  }
   jupiterStats.cacheMisses++;
-
-  // 2. Request coalescing (if exactly this is already queued/fetching, just await it)
-  if (pendingPromises.has(cacheKey)) {
-    jupiterStats.deduplicatedRequests++;
-    return pendingPromises.get(cacheKey)!.then(quote => ({ ...quote, id: crypto.randomUUID() }));
-  }
-
-  // 3. Queue new request
-  if (queue.length >= 128) throw new Error('Jupiter scanner quote queue capacity exceeded');
-  const p = new Promise<Quote>((resolve, reject) => {
-    queue.push({ params, cacheKey, resolve, reject, queuedAt: Date.now() });
+  return jupiterAdmission.request(params, (deadline) => new Promise<Quote>((resolve, reject) => {
+    if (queue.length >= 128) { reject(new Error('Jupiter scanner quote queue capacity exceeded')); return; }
+    queue.push({ params, deadline, cacheKey, resolve, reject, queuedAt: Date.now() });
+    const cancel = () => { const index = queue.findIndex((q) => q.deadline === deadline); if (index >= 0) queue.splice(index, 1); reject(new Error('DISCOVERY_QUEUE_CANCELLED')); };
+    deadline.signal?.addEventListener('abort', cancel, { once: true });
+    if (deadline.signal?.aborted) { cancel(); return; }
     jupiterWorkMetrics.observeQueue(queue.length);
     processQueue().catch(e => log.error('Queue processor error', { error: String(e) }));
-  }).then(quote => {
-    shortCache.set(cacheKey, { quote, expires: Date.now() + CONFIG.quoteCacheTtlMs });
-    pendingPromises.delete(cacheKey);
-    return quote;
-  }).catch(err => {
-    pendingPromises.delete(cacheKey);
-    throw err;
+  }), cached && performance.now() < cached.expires ? cached.quote : undefined).then(quote => {
+    shortCache.set(cacheKey, { quote, expires: cached?.quote.responseTimestamp === quote.responseTimestamp ? cached.expires : performance.now() + CONFIG.quoteCacheTtlMs });
+    while (shortCache.size > 256) shortCache.delete(shortCache.keys().next().value!);
+    return { ...quote, id: crypto.randomUUID() };
   });
-
-  pendingPromises.set(cacheKey, p);
-  return p;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +353,7 @@ async function executeQuote(params: QuoteParams): Promise<Quote> {
   jupiterStats.requestsSinceStartup++;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CONFIG.httpTimeoutMs);
+  const timeout = setTimeout(() => controller.abort(), Math.max(1, Math.min(CONFIG.httpTimeoutMs, (params.scheduling?.deadlineMono ?? Infinity) - performance.now())));
 
   let rawText: string;
   let resTs: number;

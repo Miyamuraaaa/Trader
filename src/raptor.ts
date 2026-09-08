@@ -1,4 +1,7 @@
 import crypto from 'crypto';
+import { performance } from 'node:perf_hooks';
+import { dispatchDrift } from './dispatch-diagnostics.js';
+import { QuoteAdmission, semanticQuoteKey, type QuoteDeadline } from './quote-admission.js';
 import { ScannerFairService } from './scanner-service-policy.js';
 const fairService = new ScannerFairService();
 import { z } from 'zod';
@@ -59,6 +62,7 @@ export const raptorStats = {
 };
 
 interface QueuedRaptorRequest<T> {
+  deadline: QuoteDeadline;
   queuedAt: number;
   task: () => Promise<T>;
   priority: QuoteParams['priority'];
@@ -66,25 +70,17 @@ interface QueuedRaptorRequest<T> {
   reject: (error: unknown) => void;
 }
 const queue: QueuedRaptorRequest<Quote>[] = [];
+export const raptorAdmission = new QuoteAdmission('raptor', () => CONFIG.raptorSafetyIntervalMs);
 let isProcessingQueue = false;
 let backoffUntil = 0;
 let consecutiveFailures = 0;
 const cache = new Map<string, { quote: Quote; expires: number }>();
-const pending = new Map<string, Promise<Quote>>();
 export function raptorQueueHealth() { return { queueLength: queue.length, active: raptorStats.throttleState === 'ACTIVE' ? 1 : 0, cooldownRemainingMs: Math.max(0, backoffUntil - Date.now()) }; }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function cacheKey(params: QuoteParams): string {
-  return [
-    params.inputMint,
-    params.outputMint,
-    params.amountAtomic,
-    params.slippageBps,
-    (params.dexes ?? []).join(','),
-    params.maxHops ?? '',
-    params.onlyDirectRoutes ?? '',
-  ].join('|');
+  return semanticQuoteKey('raptor', params);
 }
 
 async function paceRequest(): Promise<void> {
@@ -96,14 +92,18 @@ async function paceRequest(): Promise<void> {
   const waitMs = Math.max(waitForBackoff, waitForInterval);
   if (waitMs > 0) {
     raptorStats.throttleState = waitForBackoff > 0 ? 'BACKOFF' : 'THROTTLED';
-    await sleep(waitMs);
+    const expected = performance.now() + waitMs;
+    await sleep(waitMs); dispatchDrift('raptor', expected);
   }
 }
 
-function enqueue(task: () => Promise<Quote>, priority: QuoteParams['priority']): Promise<Quote> {
+function enqueue(task: () => Promise<Quote>, priority: QuoteParams['priority'], deadline: QuoteDeadline): Promise<Quote> {
   return new Promise<Quote>((resolve, reject) => {
     if (queue.length >= 128) { reject(new Error('Raptor scanner quote queue capacity exceeded')); return; }
-    queue.push({ task, priority, resolve, reject, queuedAt: Date.now() });
+    queue.push({ task, priority, deadline, resolve, reject, queuedAt: Date.now() });
+    const cancel = () => { const index = queue.findIndex((q) => q.deadline === deadline); if (index >= 0) queue.splice(index, 1); reject(new Error('DISCOVERY_QUEUE_CANCELLED')); };
+    deadline.signal?.addEventListener('abort', cancel, { once: true });
+    if (deadline.signal?.aborted) { cancel(); return; }
     raptorWorkMetrics.observeQueue(queue.length);
     void processQueue();
   });
@@ -115,14 +115,15 @@ async function processQueue(): Promise<void> {
   try {
     while (queue.length > 0) {
       await paceRequest();
-      const request = fairService.take(queue, (request) => request.priority)!;
+      const request = fairService.take(queue, (request) => request.priority, (request) => request.deadline.deadlineMono);
+      if (!request) continue;
       raptorStats.throttleState = 'ACTIVE';
-      const finish = raptorWorkMetrics.start(request.queuedAt);
+      let finish: ReturnType<typeof raptorWorkMetrics.start> | undefined;
       try {
-        request.resolve(await request.task());
-        finish(true);
+        request.resolve(await raptorAdmission.dispatch(request.deadline, () => { finish = raptorWorkMetrics.start(request.queuedAt); return request.task(); }));
+        finish?.(true);
       } catch (error) {
-        finish(false, /429/.test(String(error)));
+        finish?.(false, /429/.test(String(error)));
         request.reject(error);
       }
     }
@@ -210,7 +211,8 @@ async function executeQuote(params: QuoteParams): Promise<Quote> {
   try {
     const raw = await getJson<unknown>(url.toString(), {}, {
       provider: 'Raptor',
-      maxRetries: Math.min(CONFIG.httpMaxRetries, 2),
+      maxRetries: params.scheduling ? 0 : Math.min(CONFIG.httpMaxRetries, 2),
+      timeoutMs: Math.max(1, Math.floor(Math.min(CONFIG.httpTimeoutMs, (params.scheduling?.deadlineMono ?? Infinity) - performance.now()))),
       baseBackoffMs: 750,
     });
     const responseTimestamp = Date.now();
@@ -244,32 +246,16 @@ async function executeQuote(params: QuoteParams): Promise<Quote> {
 }
 
 export async function getRaptorQuote(params: QuoteParams): Promise<Quote> {
+  params = structuredClone(params);
   const key = cacheKey(params);
   const cached = cache.get(key);
-  if (cached && Date.now() < cached.expires) {
-    raptorStats.cacheHits++;
-    return { ...cached.quote, id: crypto.randomUUID() };
-  }
   raptorStats.cacheMisses++;
-
-  const inFlight = pending.get(key);
-  if (inFlight) {
-    raptorStats.deduplicatedRequests++;
-    return inFlight.then((quote) => ({ ...quote, id: crypto.randomUUID() }));
-  }
-
-  const promise = enqueue(() => executeQuote(params), params.priority)
+  return raptorAdmission.request(params, (deadline) => enqueue(() => executeQuote({ ...params, scheduling: { deadlineMono: deadline.deadlineMono, traceId: deadline.traceId } }), params.priority, deadline), cached && performance.now() < cached.expires ? cached.quote : undefined)
     .then((quote) => {
-      cache.set(key, { quote, expires: Date.now() + CONFIG.quoteCacheTtlMs });
-      pending.delete(key);
-      return quote;
-    })
-    .catch((error: unknown) => {
-      pending.delete(key);
-      throw error;
+      cache.set(key, { quote, expires: cached?.quote.responseTimestamp === quote.responseTimestamp ? cached.expires : performance.now() + CONFIG.quoteCacheTtlMs });
+      while (cache.size > 256) cache.delete(cache.keys().next().value!);
+      return { ...quote, id: crypto.randomUUID() };
     });
-  pending.set(key, promise);
-  return promise;
 }
 
 /** Accept a quote-only `/stream` payload as a short-lived cache update. */
@@ -281,7 +267,8 @@ export function acceptRaptorStreamQuote(raw: unknown, receivedAt = Date.now()): 
     amountAtomic: quote.inAmount,
     slippageBps: quote.slippageBps,
   });
-  cache.set(key, { quote, expires: receivedAt + CONFIG.quoteCacheTtlMs });
+  cache.set(key, { quote, expires: performance.now() + CONFIG.quoteCacheTtlMs });
+  while (cache.size > 256) cache.delete(cache.keys().next().value!);
   raptorStats.streamUpdates++;
   return quote;
 }

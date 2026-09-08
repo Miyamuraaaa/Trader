@@ -37,6 +37,8 @@ export function providerKind(name: QuoteProviderName): QuoteProviderKind {
 export type QuotePriority = 'HIGH' | 'LOW' | 'EXEC_PREFILTER_HIGH' | 'DISCOVERY_HIGH' | 'DISCOVERY_LOW';
 
 export interface QuoteParams {
+  /** Scanner-only monotonic scheduling metadata; never included in HTTP parameters. */
+  scheduling?: { deadlineMono: number; traceId?: string };
   inputMint: string;
   outputMint: string;
   amountAtomic: string;

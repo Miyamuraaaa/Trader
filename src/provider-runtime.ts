@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import { QuoteAdmission, QuoteAdmissionError, semanticQuoteKey, type QuoteDeadline } from './quote-admission.js';
+import type { QuoteParams } from './aggregators/types.js';
 import { ScannerFairService } from './scanner-service-policy.js';
 import { RollingWorkMetrics } from './work-metrics.js';
 import { CONFIG } from './config.js';
@@ -12,6 +14,7 @@ import {
 import type { ProviderAvailabilityState, Quote, QuotePriority, QuoteProviderName } from './aggregators/types.js';
 
 export interface ProviderHealth {
+  admission: ReturnType<QuoteAdmission['snapshot']>;
   work: ReturnType<RollingWorkMetrics['snapshot']>;
   queueLength: number;
   active: number;
@@ -40,12 +43,14 @@ export interface ProviderHealth {
  * scanner-side Solana RPC. Jupiter/Raptor remain independent HTTP paths.
  */
 export class QuoteProviderRuntime {
+  private admission: QuoteAdmission;
   private readonly fairService = new ScannerFairService();
   private readonly queue: Array<{
     task: () => Promise<Quote>;
     resolve: (quote: Quote) => void;
     reject: (error: unknown) => void;
     priority: QuotePriority;
+    deadline?: QuoteDeadline;
   }> = [];
   private active = 0;
   private paceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -72,9 +77,15 @@ export class QuoteProviderRuntime {
     private readonly minIntervalMs: number,
     private readonly maxConcurrency = 1,
     private readonly maxQueue = CONFIG.directQuoteQueueMax,
-  ) {}
+  ) { this.admission = new QuoteAdmission(provider, minIntervalMs); }
 
-  run(key: string, task: () => Promise<Quote>, priority: QuotePriority = 'LOW'): Promise<Quote> {
+  run(key: string, task: () => Promise<Quote>, priority: QuotePriority = 'LOW', params?: QuoteParams, deadline?: QuoteDeadline): Promise<Quote> {
+    if (params) {
+      const semanticKey = semanticQuoteKey(this.provider, params);
+      const cached = this.cache.get(semanticKey);
+      return this.admission.request(params, (deadline) => this.run(semanticKey, () => this.admission.dispatch(deadline, task), priority, undefined, deadline),
+        cached && cached.expiresAt > Date.now() ? cached.quote : undefined);
+    }
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       this.counters.cacheHits++;
@@ -94,6 +105,10 @@ export class QuoteProviderRuntime {
 
     const queuedAt = Date.now();
     const promise = this.enqueue(async () => {
+      if (deadline) {
+        if (deadline.signal?.aborted) throw new QuoteAdmissionError('DISCOVERY_QUEUE_CANCELLED');
+        this.admission.check(deadline);
+      }
       const cooldownWait = Math.max(0, this.cooldownUntil - Date.now());
       if (cooldownWait > 0) {
         throw new Error(`${this.provider} provider circuit is cooling down for ${cooldownWait}ms`);
@@ -117,13 +132,14 @@ export class QuoteProviderRuntime {
           quote,
           expiresAt: Date.now() + CONFIG.quoteCacheTtlMs,
         });
+        while (this.cache.size > 256) this.cache.delete(this.cache.keys().next().value!);
         return quote;
       } catch (error) {
         finish(false, /429|rate.?limit/i.test(error instanceof Error ? error.message : String(error)));
         // Shared scanner-RPC cooldown is deliberate admission control, not a
         // provider failure. Counting it as another provider error would open a
         // second circuit and lengthen the outage after the RPC is healthy.
-        if (isScannerRpcBackpressureError(error)) throw error;
+        if (isScannerRpcBackpressureError(error) || error instanceof QuoteAdmissionError) throw error;
 
         this.counters.failures++;
         this.consecutiveFailures++;
@@ -141,7 +157,7 @@ export class QuoteProviderRuntime {
         }
         throw error;
       }
-    }, priority).finally(() => this.pending.delete(key));
+    }, priority, deadline).finally(() => this.pending.delete(key));
 
     this.pending.set(key, promise);
     return promise;
@@ -165,6 +181,7 @@ export class QuoteProviderRuntime {
         : this.counters.failures > 0 ? 'DEGRADED' : 'HEALTHY';
     return {
       provider: this.provider,
+      admission: this.admission.snapshot(),
       work: this.workMetrics.snapshot(), queueLength: this.queue.length, active: this.active,
       ...this.counters,
       averageLatencyMs: this.counters.successes === 0
@@ -176,9 +193,14 @@ export class QuoteProviderRuntime {
     };
   }
 
-  private enqueue(task: () => Promise<Quote>, priority: QuotePriority): Promise<Quote> {
+  private enqueue(task: () => Promise<Quote>, priority: QuotePriority, deadline?: QuoteDeadline): Promise<Quote> {
     return new Promise<Quote>((resolve, reject) => {
-      this.queue.push({ task, resolve, reject, priority });
+      const queued = { task, resolve, reject, priority, deadline };
+      this.queue.push(queued);
+      deadline?.signal?.addEventListener('abort', () => {
+        const index = this.queue.indexOf(queued);
+        if (index >= 0) { this.queue.splice(index, 1); reject(new QuoteAdmissionError('DISCOVERY_QUEUE_CANCELLED')); }
+      }, { once: true });
       this.workMetrics.observeQueue(this.queue.length);
       this.drain();
     });
@@ -200,7 +222,7 @@ export class QuoteProviderRuntime {
       }, waitMs);
       return;
     }
-    const next = this.fairService.take(this.queue, (item) => item.priority)!;
+    const next = this.fairService.take(this.queue, (item) => item.priority, (item) => item.deadline?.deadlineMono ?? Infinity)!;
     this.active++;
     next.task().then(next.resolve, next.reject).finally(() => {
       this.active--;

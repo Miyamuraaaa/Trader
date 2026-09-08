@@ -315,7 +315,7 @@ export function getMeteoraQuote(params: QuoteParams): Promise<Quote> {
     params.amountAtomic,
     params.slippageBps,
   ]);
-  return meteoraRuntime.run(key, () => executeMeteoraQuote(params), params.priority);
+  return meteoraRuntime.run(key, () => executeMeteoraQuote(params), params.priority, params);
 }
 
 export const meteoraProvider: QuoteProvider = {

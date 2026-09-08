@@ -154,7 +154,7 @@ export function getRaydiumQuote(params: QuoteParams): Promise<Quote> {
     params.amountAtomic,
     params.slippageBps,
   ]);
-  return raydiumRuntime.run(key, () => executeRaydiumQuote(params), params.priority);
+  return raydiumRuntime.run(key, () => executeRaydiumQuote(params), params.priority, params);
 }
 
 export const raydiumProvider: QuoteProvider = {

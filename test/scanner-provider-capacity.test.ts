@@ -11,7 +11,7 @@ it.each(['jupiter', 'raptor'] as const)('bounds %s scanner queue when a network 
   let rejected = 0;
   for (let i = 0; i < 140; i++) {
     void quote({ inputMint: 'TEST_BASE', outputMint: 'TEST_TOKEN', amountAtomic: String(i + 1), slippageBps: 5 })
-      .catch((error: unknown) => { expect(String(error)).toContain('queue capacity'); rejected++; });
+      .catch((error: unknown) => { expect(String(error)).toMatch(/queue capacity|DISCOVERY_QUEUE_(OVERFLOW|DEADLINE_EXCEEDED)/); rejected++; });
   }
   await vi.advanceTimersByTimeAsync(1);
   const queueLength = provider === 'jupiter' ? jupiter.getQueueLength() : raptor.raptorQueueHealth().queueLength;
