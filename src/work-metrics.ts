@@ -16,6 +16,7 @@ export class RollingWorkMetrics {
     return { queueHighWater60s: this.queueSamples.reduce((max, s) => Math.max(max, s.size), 0), requests60s: this.samples.length, successes60s: this.samples.filter((s) => s.ok === true).length,
       failures60s: this.samples.filter((s) => s.ok === false).length, rateLimits60s: this.samples.filter((s) => s.limited).length,
       queueWaitP50: percentile(queue, .5), queueWaitP90: percentile(queue, .9),
+      queueWaitP99: percentile(queue, .99), requestLatencyP99: percentile(latency, .99),
       requestLatencyP50: percentile(latency, .5), requestLatencyP90: percentile(latency, .9) };
   }
 }

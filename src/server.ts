@@ -2,6 +2,10 @@ import express from 'express';
 import { executionFunnel } from './execution/execution-funnel.js';
 import { scannerDisplayEligibility, scannerLifecycleDisplay } from './execution/scanner-display-eligibility.js';
 import { scannerStageProfile } from './scanner-stage-profile.js';
+import { jupiterAdmission } from './jupiter.js';
+import { raptorAdmission } from './raptor.js';
+import { dispatchDiagnostics } from './dispatch-diagnostics.js';
+import { scannerSizeDiagnostics } from './scanner-size-diagnostics.js';
 import { scannerOperationalMetrics } from './scanner.js';
 import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
 import { directMarketStreamHealth } from './direct-market-stream.js';
@@ -214,6 +218,9 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
       res.json({
         executionFunnel: executionFunnel.snapshot(),
         scannerStageProfile: scannerStageProfile(),
+        quoteAdmission: { jupiter: jupiterAdmission.snapshot(), raptor: raptorAdmission.snapshot() },
+        dispatchDiagnostics: dispatchDiagnostics(),
+        sizeDiagnostics: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps),
         scannerOperationalMetrics: scannerOperationalMetrics(),
         scannerRpcConfig: SCANNER_RPC_CONFIG,
         scannerRpc: scannerRpcLimiter.snapshot(),
@@ -359,6 +366,9 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
           balance: paperBalance,
           executionFunnel: executionFunnel.snapshot(),
           scannerStageProfile: scannerStageProfile(),
+          quoteAdmission: { jupiter: jupiterAdmission.snapshot(), raptor: raptorAdmission.snapshot() },
+          dispatchDiagnostics: dispatchDiagnostics(),
+          sizeDiagnostics: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps),
           scannerOperationalMetrics: scannerOperationalMetrics(),
           firstLiveMaxInputUsdc: CONFIG.firstLiveMaxInputUsdc,
           approval: liveApproval?.snapshot() ?? null,

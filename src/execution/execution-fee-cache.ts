@@ -1,5 +1,6 @@
 import { PublicKey, TransactionMessage, type Connection, type VersionedMessage } from '@solana/web3.js';
 import { CONFIG } from '../config.js';
+import { BoundedAdvisoryCache } from '../bounded-advisory-cache.js';
 import type { AtomicExecutionPlan } from './types.js';
 import type { ExecutionNetworkProfiler } from './network-profiler.js';
 
@@ -8,7 +9,7 @@ interface CachedFee {
   expiresAt: number;
 }
 
-const fees = new Map<string, CachedFee>();
+const fees = new BoundedAdvisoryCache<string, CachedFee>('RPC fee samples', 300_000, 256);
 const FEE_TTL_MS = 300_000;
 
 function priorityFeeLamports(plan: AtomicExecutionPlan): number {

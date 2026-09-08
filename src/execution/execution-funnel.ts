@@ -3,6 +3,7 @@ import { RawPrefilterLedger } from './raw-prefilter-ledger.js';
 import type { PrefilterTrace } from './prefilter-trace.js';
 
 export const FunnelTelemetry = z.object({ identity: z.string().max(200), stage: z.string().max(80),
+  monotonicAt: z.number().finite().optional(),
   at: z.number().finite(), detectedAt: z.number().finite(), reason: z.string().max(100).optional(), conservativeNetAtomic: z.string().regex(/^-?\d+$/).optional() }).strict();
 export type FunnelEvent = z.infer<typeof FunnelTelemetry>;
 export interface PositiveSignal {
@@ -29,6 +30,7 @@ export class ExecutionFunnel {
   private readonly startedAt: number;
   constructor(private readonly now: () => number = Date.now) { this.startedAt = now(); this.raw = new RawPrefilterLedger(now); }
   record(event: FunnelEvent): void {
+    event = { ...event, monotonicAt: event.monotonicAt ?? Number(process.hrtime.bigint() / 1000000n) };
     if (event.stage === 'REJECTED' && event.reason) {
       const reason = ({ NOT_PROFITABLE: 'BELOW_FINAL_PROFIT_THRESHOLD', STALE: 'EXPIRED', TOKEN_POLICY: 'TOKEN_POLICY_REJECTED', ROUTE_DIVERGED: 'EXECUTION_ROUTE_CHANGED' } as Record<string, string>)[event.reason] ?? event.reason;
       this.record({ ...event, stage: reason, reason: undefined });
@@ -61,6 +63,16 @@ export class ExecutionFunnel {
   snapshot() {
     this.prune();
     const percentile = (values: number[], q: number) => values.length ? [...values].sort((a, b) => a - b)[Math.ceil(values.length * q) - 1]! : null;
+    const adjacent = new Map<string, number[]>(); const previous = new Map<string, FunnelEvent>();
+    for (const event of this.events) {
+      const prior = previous.get(event.identity);
+      if (prior?.monotonicAt !== undefined && event.monotonicAt !== undefined) {
+        const key = `${prior.stage}->${event.stage}`; const values = adjacent.get(key) ?? [];
+        values.push(Math.max(0, event.monotonicAt - prior.monotonicAt)); adjacent.set(key, values);
+      }
+      previous.set(event.identity, event);
+    }
+    const adjacentStageLatency = Object.fromEntries([...adjacent].map(([key, values]) => [key, { count: values.length, p50: percentile(values, .5), p90: percentile(values, .9), p99: percentile(values, .99) }]));
     const stageTimes = new Map(this.events.map((event) => [`${event.identity}:${event.stage}`, event.at]));
     const segments = { p0ToExecutor: ['P0_HANDOFF', 'EXECUTOR_RECEIVED'], quoteBuild: ['BUILD_START', 'BUILD_END'], simulation: ['SIMULATION_START', 'SIMULATION_END'], candidateToReady: ['', 'READY_TO_EXECUTE'] };
     const timings = Object.fromEntries(Object.entries(segments).map(([label, [start, end]]) => {
@@ -91,14 +103,14 @@ export class ExecutionFunnel {
       for (const [key, value] of Object.entries(rawPrefilter.last15m.session)) session[stages[key] ?? key] = value;
     }
     return { startedAt: this.startedAt, session, last60s: counts(60_000), last5m: counts(300_000), last15m,
-      explanation, timings, rawPrefilter, lastPositiveSignals: structuredClone(this.signals), windowEventCapacity: 100_000 };
+      explanation, timings, adjacentStageLatency, rawPrefilter, lastPositiveSignals: structuredClone(this.signals), windowEventCapacity: 100_000 };
   }
 }
 export const executionFunnel = new ExecutionFunnel();
 
 /** Explicit scalar-only IPC payload: never forwards error URLs, signer data or transaction bytes. */
 export function emitFunnelExecutionStage(identity: string, stage: string, detectedAt: number, reason?: string, conservativeNetAtomic?: string): void {
-  const event: FunnelEvent = { identity, stage, detectedAt, at: Date.now(), reason, conservativeNetAtomic };
+  const event: FunnelEvent = { identity, stage, detectedAt, at: Date.now(), monotonicAt: Number(process.hrtime.bigint() / 1000000n), reason, conservativeNetAtomic };
   if (process.send && process.connected) {
     queueMicrotask(() => { if (process.connected) process.send?.({ type: 'EXECUTION_FUNNEL_EVENT', event }, () => undefined); });
   } else executionFunnel.record(event);

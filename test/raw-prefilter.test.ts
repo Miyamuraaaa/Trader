@@ -40,6 +40,7 @@ describe('TEST DATA ONLY: raw-positive constrained prefilter', () => {
   it('overlaps token policy with leg1, then propagates its enforceable minimum to leg2', async () => {
     vi.useFakeTimers(); const start = Date.now(); const calls: Array<{ at: number; amount: string }> = [];
     const result = buildExecutableCandidateFromRaw(raw(), costs, {
+      monotonicNow: () => Date.now() - start,
       policy: async () => { await delay(100); return supported(); },
       quote: async (provider, input, output, amount) => { calls.push({ at: Date.now() - start, amount }); await delay(provider === 'jupiter' ? 80 : 60); return quote(provider, input, output, amount); },
     });
@@ -110,6 +111,7 @@ describe('TEST DATA ONLY: raw-positive constrained prefilter', () => {
       const trace: PrefilterTrace = { rawPositiveDetectedAt: at, rawQuoteEvidenceAt: at, rawQuoteAgeAtDetectionMs: 0, executablePrefilterQueuedAt: at };
       ledger.register(String(i), trace);
       const pending = buildExecutableCandidateFromRaw(candidate, costs, { trace,
+        monotonicNow: () => Date.now() - at,
         policy: async () => { await delay(policyMs); return supported(); },
         quote: async (...args) => {
           await delay(args[0] === 'jupiter' ? leg1Ms : leg2Ms);

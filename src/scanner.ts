@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { executionFunnel } from './execution/execution-funnel.js';
 import { PrefilterCoalescer, type PrefilterTrace } from './execution/prefilter-trace.js';
 import { LiveSizeCadence } from './scanner-service-policy.js';
+import { scannerSizeDiagnostics } from './scanner-size-diagnostics.js';
 import { profileScannerStage, startScannerStage } from './scanner-stage-profile.js';
 const liveSizeCadence = new LiveSizeCadence();
 import { isExecutableProviderPair } from './execution/executable-route-policy.js';
@@ -123,7 +124,7 @@ function nextTradeSizes(): number[] {
   const sizes = CONFIG.tradeSizesUsdc;
   if (sizes.length === 0) return [];
   const count = Math.max(1, Math.min(CONFIG.tradeSizesPerScan, sizes.length));
-  if (CONFIG.executionMode === 'live') return [...new Set(Array.from({ length: count }, () => liveSizeCadence.next(sizes, CONFIG.firstLiveMaxInputUsdc)!))];
+  if (CONFIG.executionMode === 'live') return [...new Set(Array.from({ length: count }, () => liveSizeCadence.next(sizes, CONFIG.firstLiveMaxInputUsdc, (size) => scannerSizeDiagnostics.utility(size))!))];
   const selected = Array.from(
     { length: count },
     (_, offset) => sizes[(tradeSizeCursor + offset) % sizes.length]!,
@@ -377,6 +378,7 @@ function registerRawPositive(raw: RoundTripResult): PrefilterTrace {
   if (!raw.diagnosticSignalId) {
     raw.diagnosticSignalId = `${raw.buyQuote.id}:${raw.sellQuote.id}`;
     scannerStats.executionPrefilter.rawPositiveOpportunities++;
+    scannerSizeDiagnostics.record(Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC)), 'raw_positives');
     executionFunnel.record({ identity: raw.diagnosticSignalId, stage: 'RAW_POSITIVE', at: now, detectedAt: now });
     executionFunnel.raw.register(raw.diagnosticSignalId, trace);
     executionFunnel.signal({ id: raw.diagnosticSignalId, detectedAt: now, providers: `${raw.buyQuote.provider}->${raw.sellQuote.provider}`,
@@ -407,9 +409,11 @@ async function findExecutableCandidates(
     const result: ExecutablePrefilterResult = eligibility ? { status: eligibility, trace }
       : await prefilterCoalescer.schedule(key, trace.rawQuoteEvidenceAt, () => {
         event('PREFILTER_STARTED');
-        return buildExecutableCandidateFromRaw(raw, costs, { trace });
+        scannerSizeDiagnostics.record(Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC)), 'constrained_attempts');
+        return buildExecutableCandidateFromRaw(raw, costs, { trace, traceId: signalId });
       }, (status) => ({ status, trace }));
     executionFunnel.raw.finish(signalId, result.status, result.trace);
+    scannerSizeDiagnostics.record(Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC)), ({ EXECUTABLE_CANDIDATE: 'constrained_positives', ABOVE_LIVE_CAP: 'above_live_cap_positives', ECONOMICS_DIVERGED: 'economics_diverged', PREFILTER_RATE_LIMITED: 'rate_limited', PREFILTER_QUEUE_DEADLINE_EXCEEDED: 'deadline_dropped' } as Record<string, string>)[result.status] ?? result.status, result.costs);
     if (trace.executablePrefilterStartedAt !== undefined) event('PREFILTER_COMPLETED');
     event(result.status);
     // Publish only a freshly constrained executable route, before any history/UI persistence.
@@ -837,6 +841,7 @@ export async function scanOnce(
       throw new Error('SCAN_AMOUNTS_USDC must contain at least one positive quote size');
     }
     for (const tradeSizeUsdc of tradeSizesThisScan) {
+      scannerSizeDiagnostics.record(tradeSizeUsdc, 'discovery_attempts');
       scannerStats.currentTradeSizeUsdc = tradeSizeUsdc;
       scannerStats.currentPhase = 'FIRST_LEG_QUOTES';
       if (!Number.isFinite(tradeSizeUsdc) || tradeSizeUsdc <= 0 || tradeSizeUsdc > CONFIG.maxTradeSizeUsdc) {
@@ -1420,6 +1425,7 @@ function waitForMarketEventOrInterval(): Promise<void> {
 
 export function stopScanner(): void {
   running = false;
+  executionFunnel.raw.shutdown();
 }
 
 export async function scanLoop(): Promise<void> {

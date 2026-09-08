@@ -57,7 +57,7 @@ describe('bounded scanner request-budget service', () => {
       ledger.finish(String(i), status); ledger.finish(String(i), 'RAW_SIGNAL_ENDED');
     });
     expect(ledger.snapshot()).toMatchObject({ rawPositive: 5, accounted: 5, buckets: {
-      ABOVE_LIVE_CAP: 1, COALESCED: 1, MARKET_SIGNAL_ENDED_BEFORE_PREFILTER: 1, TOKEN_2022_DISCOVERY_ONLY: 1, ECONOMICS_DIVERGED: 1,
+      ABOVE_LIVE_CAP: 1, QUOTE_FAILED: 1, PREFILTER_QUEUE_DEADLINE_EXCEEDED: 1, TOKEN_2022_DISCOVERY_ONLY: 1, ECONOMICS_DIVERGED: 1,
     } });
   });
   it('benchmarks identical finite service budgets before/after fair scheduling (synthetic, no network)', () => {

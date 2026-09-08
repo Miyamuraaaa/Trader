@@ -1,4 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
+import { performance } from 'node:perf_hooks';
 import { getProviderQuote } from '../aggregators/index.js';
 import { isFullFillQuote, type Quote, type QuoteProviderName } from '../aggregators/types.js';
 import { CONFIG, DECIMALS, LAMPORTS_PER_SOL, MINTS } from '../config.js';
@@ -34,7 +35,7 @@ export type ExecutablePrefilterStatus =
   | 'ROUTE_POLICY_REJECTED'
   | 'ECONOMICS_DIVERGED'
   | 'QUOTE_FAILED' | 'ABOVE_LIVE_CAP' | 'RAW_SIGNAL_ENDED' | 'RAW_STALE_BEFORE_PREFILTER'
-  | 'PREFILTER_STALE' | 'PREFILTER_RATE_LIMITED' | 'COALESCED' | 'OBSERVATION_ONLY';
+  | 'PREFILTER_STALE' | 'PREFILTER_RATE_LIMITED' | 'PREFILTER_QUEUE_DEADLINE_EXCEEDED' | 'COALESCED' | 'OBSERVATION_ONLY';
 
 export interface ScannerExecutableCostSnapshot {
   referenceSolPriceUsdc: number;
@@ -45,6 +46,7 @@ export interface ScannerExecutableCostSnapshot {
 }
 
 export interface ExecutablePrefilterResult {
+  costs?: EstimatedCostInput;
   trace?: PrefilterTrace;
   estimatedAtaRentUsdc?: number;
   status: ExecutablePrefilterStatus;
@@ -96,7 +98,7 @@ export async function prewarmScannerExecutionMints(mints: readonly string[]): Pr
       new PublicKey(walletAddress),
       [MINTS.USDC, ...mints],
     ),
-    'HIGH',
+    'LOW',
   );
 }
 
@@ -139,6 +141,7 @@ async function constrainedQuote(
   inputMint: string,
   outputMint: string,
   amountAtomic: string,
+  scheduling?: { deadlineMono: number; traceId?: string },
 ): Promise<Quote> {
   const quote = await getProviderQuote(provider, {
     inputMint,
@@ -146,6 +149,7 @@ async function constrainedQuote(
     amountAtomic,
     slippageBps: CONFIG.slippageBps,
     priority: 'EXEC_PREFILTER_HIGH',
+    scheduling,
     ...executableQuoteConstraints(provider),
   });
   if (!isFullFillQuote(quote)) throw new Error(`${provider} returned a partial executable-prefilter fill`);
@@ -166,18 +170,21 @@ function exactPoolEvidence(quote: Quote): string[] {
 export async function buildExecutableCandidateFromRaw(
   raw: RoundTripResult,
   costs: ScannerExecutableCostSnapshot,
-  options: { trace?: PrefilterTrace; now?: () => number; policy?: typeof classifyIntermediate; quote?: typeof constrainedQuote } = {},
+  options: { traceId?: string; trace?: PrefilterTrace; now?: () => number; monotonicNow?: () => number; policy?: typeof classifyIntermediate; quote?: typeof constrainedQuote } = {},
 ): Promise<ExecutablePrefilterResult> {
   const now = options.now ?? Date.now;
+  const mono = options.monotonicNow ?? options.now ?? (() => performance.now());
+  const startedMono = mono();
   const trace = options.trace ?? { rawPositiveDetectedAt: now(), rawQuoteEvidenceAt: Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp), rawQuoteAgeAtDetectionMs: Math.max(0, now() - Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp)), executablePrefilterQueuedAt: now() };
   trace.executablePrefilterStartedAt = now(); trace.rawAgeAtPrefilterStartMs = Math.max(0, now() - trace.rawQuoteEvidenceAt);
   trace.prefilterQueueMs = now() - trace.executablePrefilterQueuedAt;
   const timed = async <T>(stage: 'tokenPolicy' | 'constrainedLeg1' | 'constrainedLeg2', work: () => Promise<T>): Promise<T> => {
     trace[`${stage}StartedAt`] = now();
-    try { return await work(); } finally { trace[`${stage}FinishedAt`] = now(); trace[`${stage}Ms`] = now() - trace[`${stage}StartedAt`]!; }
+    const stageMono = mono();
+    try { return await work(); } finally { trace[`${stage}FinishedAt`] = now(); trace[`${stage}Ms`] = Math.max(0, mono() - stageMono); }
   };
   const finish = (result: ExecutablePrefilterResult): ExecutablePrefilterResult => {
-    trace.prefilterFinishedAt = now(); trace.totalPrefilterMs = now() - trace.executablePrefilterStartedAt!;
+    trace.prefilterFinishedAt = now(); trace.totalPrefilterMs = Math.max(0, mono() - startedMono);
     return { ...result, trace };
   };
   const result = await (async (): Promise<ExecutablePrefilterResult> => {
@@ -194,9 +201,10 @@ export async function buildExecutableCandidateFromRaw(
     return { status: 'UNSUPPORTED_PROVIDER_PAIR' };
   }
   const quote = options.quote ?? constrainedQuote;
+  const scheduling = { deadlineMono: performance.now() + ([buyProvider, sellProvider].includes('raptor') ? CONFIG.raptorExecutionQuoteAgeMs : CONFIG.maxExecutionQuoteAgeMs), traceId: options.traceId };
   const [policyResult, buyResult] = await Promise.allSettled([
     timed('tokenPolicy', () => (options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint)),
-    timed('constrainedLeg1', () => quote(buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount)),
+    timed('constrainedLeg1', () => quote(buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount, scheduling)),
   ]);
   let tokenPolicy: Awaited<ReturnType<typeof classifyIntermediate>>;
   try { if (policyResult.status === 'rejected') throw policyResult.reason; tokenPolicy = policyResult.value; }
@@ -214,7 +222,7 @@ export async function buildExecutableCandidateFromRaw(
     // The executor's second instruction consumes the first instruction's
     // enforceable minimum. This is deliberately not the optimistic outAmount.
     const sell = await timed('constrainedLeg2', () => quote(
-      sellProvider, raw.buyQuote.outputMint, MINTS.USDC, buy.otherAmountThreshold,
+      sellProvider, raw.buyQuote.outputMint, MINTS.USDC, buy.otherAmountThreshold, scheduling,
     ));
     if (!isFullFillQuote(buy) || !isFullFillQuote(sell) || !quoteMatchesExecutableProviderPolicy(buy) || !quoteMatchesExecutableProviderPolicy(sell)) return { status: 'ROUTE_POLICY_REJECTED', reason: 'Constrained quotes escaped audited route policy' };
     if (buy.inputMint !== MINTS.USDC || buy.outputMint !== raw.buyQuote.outputMint || buy.inAmount !== raw.buyQuote.inAmount
@@ -260,13 +268,13 @@ export async function buildExecutableCandidateFromRaw(
     if (validationTier !== 'CONSERVATIVE_CANDIDATE'
       || !profit.estimatedNetProfitUsdc.gt(0)
       || !profit.worstCaseNetProfitUsdc.gt(0)) {
-      return { status: 'ECONOMICS_DIVERGED', route, estimatedAtaRentUsdc: Number(tokenPolicy.rentLamports) / LAMPORTS_PER_SOL * costs.referenceSolPriceUsdc, reason: 'Executor-constrained route is not conservatively profitable' };
+      return { status: 'ECONOMICS_DIVERGED', route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc), reason: 'Executor-constrained route is not conservatively profitable' };
     }
-    return { status: 'EXECUTABLE_CANDIDATE', route, estimatedAtaRentUsdc: Number(tokenPolicy.rentLamports) / LAMPORTS_PER_SOL * costs.referenceSolPriceUsdc };
+    return { status: 'EXECUTABLE_CANDIDATE', route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc) };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);
-    return { status: /429|backpressure|cooldown|capacity|rate.?limit/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason };
+    return { status: /QUEUE_DEADLINE|QUEUE_CANCELLED/.test(reason) ? 'PREFILTER_QUEUE_DEADLINE_EXCEEDED' : /QUOTE_RESULT_STALE/.test(reason) ? 'PREFILTER_STALE' : /429|backpressure|cooldown|capacity|rate.?limit|OVERFLOW/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason };
   }
   })();
   return finish(result);

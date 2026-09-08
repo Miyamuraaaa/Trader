@@ -1,4 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
+import { BoundedAdvisoryCache } from '../bounded-advisory-cache.js';
 import {
   associatedTokenAddress,
   inspectAssociatedTokenAccount,
@@ -16,8 +17,9 @@ import type { ExecutionNetworkProfiler } from './network-profiler.js';
 // ATA existence is structural and the live balance gate refreshes spendable
 // amounts immediately before submission. Keep this off the candidate hot path.
 const ATA_TTL_MS = 300_000;
-const mintCache = new Map<string, Promise<TokenProgramAnalysis>>();
-const ataCache = new Map<string, { expiresAt: number; value: Promise<TokenAccountPreflight> }>();
+const mintCache = new BoundedAdvisoryCache<string, Promise<TokenProgramAnalysis>>('RPC mint policy', 60_000);
+const ataCache = new BoundedAdvisoryCache<string, { expiresAt: number; value: Promise<TokenAccountPreflight> }>('RPC ATA metadata', ATA_TTL_MS);
+export function executionPreflightCacheHealth() { return { mints: mintCache.snapshot(), atas: ataCache.snapshot() }; }
 
 export function getCachedExecutionMintAnalysis(
   connection: Connection,
