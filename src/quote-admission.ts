@@ -36,6 +36,33 @@ export class QuoteAdmission {
   private ewma: number | undefined;
   private lastDispatchMono = -Infinity;
   private counters: Record<string, number> = {};
+  private reservations = new Map<symbol, { deadlineMono: number; readyMono: number; serviceMs: number }>();
+  /** Protect only a future legal slot, never grant quota or authorize a transaction. */
+  reserveWorkflow(deadlineMono: number, readyMono: number, serviceMs: number): () => void {
+    this.pruneReservations();
+    if (![deadlineMono, readyMono, serviceMs].every(Number.isFinite) || serviceMs < 0 || deadlineMono <= this.now()
+      || readyMono + serviceMs > deadlineMono) throw new QuoteAdmissionError('PREFILTER_QUEUE_DEADLINE_EXCEEDED');
+    if (this.reservations.size >= 16) throw new QuoteAdmissionError('PREFILTER_QUEUE_OVERFLOW');
+    const id = Symbol(); this.reservations.set(id, { deadlineMono, readyMono, serviceMs });
+    this.count('workflow_reservations');
+    return () => { this.reservations.delete(id); };
+  }
+  private pruneReservations() {
+    for (const [id, reservation] of this.reservations) if (reservation.deadlineMono <= this.now()) this.reservations.delete(id);
+  }
+  discoveryReservationDelayMs(): number {
+    this.pruneReservations();
+    const interval = typeof this.intervalMs === 'function' ? this.intervalMs() : this.intervalMs;
+    const now = this.now();
+    for (const reservation of this.reservations.values()) {
+      // Borrowing this slot is safe only if another legal send can still finish the reserved leg.
+      if (now + interval + reservation.serviceMs > reservation.deadlineMono) {
+        this.count('observation_slot_borrow_prevented');
+        return Math.max(1, Math.min(25, reservation.deadlineMono - now));
+      }
+    }
+    return 0;
+  }
   private cooldownCause: { requestClass: string; durationMs: number; traceId?: string; amountAtomic?: string; endpoint: string } | null = null;
   recordRateLimit(priority: QuoteParams['priority'], durationMs: number, traceId?: string, amountAtomic?: string, endpoint = 'quote') {
     const requestClass = priority === 'EXEC_PREFILTER_HIGH' ? 'P0' : priority === 'HIGH' || priority === 'DISCOVERY_HIGH' ? 'P1' : 'P2';
@@ -99,7 +126,7 @@ export class QuoteAdmission {
       const sameClass = waiting.filter((e) => e.deadline.requestClass === deadline.requestClass).length;
       if (this.entries.size >= 128 || sameClass >= (deadline.requestClass === 'EXECUTION_PREFILTER' ? 32 : 48)) this.reject(deadline, 'OVERFLOW');
       // Fair service bounds legal start opportunities; HTTP estimate excludes queue residence.
-      const ahead = deadline.requestClass === 'EXECUTION_PREFILTER' ? sameClass * 2 + (waiting.length ? 1 : 0) : waiting.length;
+      const ahead = deadline.requestClass === 'EXECUTION_PREFILTER' ? sameClass * 2 : waiting.length;
       const interval = typeof this.intervalMs === 'function' ? this.intervalMs() : this.intervalMs;
       const pacingRemaining = Math.max(0, this.forecast(deadline.budgetMs).predictedStartMono - this.now());
       this.check(deadline, pacingRemaining + ahead * interval);
@@ -132,7 +159,8 @@ export class QuoteAdmission {
     });
   }
   snapshot() {
-    return { ...this.counters, cooldownCause: this.cooldownCause, active_shared_requests: this.entries.size,
+    this.pruneReservations();
+    return { ...this.counters, active_workflow_reservations: this.reservations.size, cooldownCause: this.cooldownCause, active_shared_requests: this.entries.size,
       lanes: ['EXECUTION_PREFILTER','HIGH_PRIORITY_DISCOVERY','LOW_PRIORITY_DISCOVERY'].map((requestClass) => {
         const entries = [...this.entries.values()].filter((e) => e.deadline.requestClass === requestClass);
         return { requestClass, queued: entries.filter((e) => !e.dispatched).length, active: entries.filter((e) => e.dispatched).length,

@@ -111,7 +111,7 @@ const queue: QueuedRequest[] = [];
 export const jupiterAdmission = new QuoteAdmission('jupiter', () => CONFIG.jupiterApiKey ? CONFIG.jupiterSafetyIntervalMs : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050),
   () => performance.now(), () => Date.now(), () => ({
     nextLegalSendMono: performance.now() + Math.max(0, jupiterStats.lastRequestTime + (CONFIG.jupiterApiKey ? CONFIG.jupiterSafetyIntervalMs : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050)) - Date.now()),
-    cooldownUntilMono: performance.now() + Math.max(0, rateLimitBackoffUntil - Date.now()),
+    cooldownUntilMono: rateLimitBackoffUntil > Date.now() ? performance.now() + rateLimitBackoffUntil - Date.now() : 0,
   }));
 let isProcessingQueue = false;
 let rateLimitBackoffUntil = 0;
@@ -155,6 +155,8 @@ export function getJupiterJson<T>(url: string, operation: string): Promise<T> {
         : 250;
       await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
+    const reservedDelay = jupiterAdmission.discoveryReservationDelayMs();
+    if (reservedDelay > 0) { await new Promise((resolve) => setTimeout(resolve, reservedDelay)); continue; }
     const effectiveIntervalMs = CONFIG.jupiterApiKey
       ? CONFIG.jupiterSafetyIntervalMs
       : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050);
@@ -262,6 +264,10 @@ async function processQueue() {
       }
 
       // Dequeue next highest priority request
+      const reservedDelay = jupiterAdmission.discoveryReservationDelayMs();
+      if (reservedDelay > 0 && !queue.some((request) => request.params.priority === 'EXEC_PREFILTER_HIGH')) {
+        await new Promise((resolve) => setTimeout(resolve, reservedDelay)); continue;
+      }
       const req = fairService.take(queue, (request) => request.params.priority, (request) => request.deadline.deadlineMono);
       if (!req) continue;
 

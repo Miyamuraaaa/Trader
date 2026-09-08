@@ -19,7 +19,7 @@ Branch: `codex/workflow-admission`, based on `23e9ffb` on `codex/deadline-admiss
 
 New coverage: dependent-workflow deadlines, pacing/cooldown projections, 60/30/10 saturated service, borrowing reclamation, history pressure, executable-surface policy, Retry-After attribution, independent coalesced waiter expiry/error cleanup, Jupiter auxiliary/quote pacing and concurrency, fake diagnostic-capability rejection, invalid future evidence, no-broadcast acceptance guard, and soak continuity.
 
-Final validation: typecheck PASS, 204/204 tests across 29 files PASS, build PASS. Existing alignment, risk, freshness, manual-approval and execution tests remain included.
+Validation after downstream-reservation repair: typecheck PASS, 209/209 tests across 30 files PASS, build PASS. Existing alignment, risk, freshness, manual-approval and execution tests remain included.
 
 ## Actual production evidence — NOT a completed 30-minute soak
 
@@ -86,3 +86,31 @@ Two above-cap shadow attempts: one deadline rejection, one rate-limit classifica
 Outstanding: continuous soak on an awake/stable host, eligible-candidate production traces, precise per-class legal/concurrency-wait metrics, complete cost/shadow samples, and production proof of urgent reservation behavior. Do not declare the task's market-success criterion achieved.
 
 No real .env edits, secrets exposed, freshness/profitability/alignment relaxations, cap increases, Token-2022 enablement, unaudited execution enablement, automatic submission, journal deletion, or merge. Normal manual ACCEPT & EXECUTE remains mandatory; the diagnostic process refuses acceptance entirely.
+
+## Follow-up production trace and targeted reservation repair
+
+Second artifact: `data/production-soak-1788901191531.json.checkpoint.json`. This ran the `a3aba4a` startup code. Its continuous prefix reached 540,227.886 ms (9.004 minutes), followed by an approximately 666-second gap. It was stopped after the gap; its checkpoints and sandbox state remain intact. It is **not** a completed 30-minute soak.
+
+This run found five **in-cap $0.50** positives. All reconciled to PREFILTER_QUEUE_DEADLINE_EXCEEDED; zero missing/duplicate outcomes, P0/executor/simulation/READY all zero. Raw-to-prefilter queue p50/p90/p99 was 1/6/6 ms. No $0.25 positive occurred.
+
+| Trace prefix | Pair | Raw expected / worst USDC | Evidence age at detection ms | Primary observed stage |
+|---|---|---:|---:|---|
+| 65ccceee | Jupiter -> Raptor, WSOL | +0.000613 / +0.000362 | 1962 | Already beyond 1800 ms at detection |
+| 38fb5f27 | Jupiter -> Raptor, WSOL | +0.000400 / +0.000149 | 2281 | Already beyond 1800 ms at detection |
+| 0c28f6ff | Jupiter -> Raptor, USDT | +0.000896 / +0.000644 | 315 | Initial workflow feasible; rejected after leg one |
+| afee5cf6…093a | Jupiter -> Raptor, USDT | +0.000896 / +0.000644 | 1321 | Whole remaining workflow infeasible |
+| afee5cf6…727e | Jupiter -> Orca, USDT | +0.000875 / +0.000623 | 1846 | Already beyond normal 1200 ms at detection |
+
+For `0c28f6ff`, initial parent deadline was monotonic 167346.714 ms. Predicted whole-workflow completion was 167011.265 ms (335 ms spare). Leg one completed in 692.890 ms, with token policy taking 6.220 ms. Leg two was never sent. The governor forecast anticipated a Raptor legal slot at 166548.871 ms, but no reservation protected it while leg one was outstanding. Other discovery was allowed to consume future capacity. This is a software scheduling gap, not proof that the constrained route was profitable. Complete per-request attribution was not retained in the original artifact; BEFORE_LEG2 projections were added for the next run.
+
+Repairs following this trace:
+
+- Bounded downstream workflow reservations protect a needed future legal slot while leg one runs. Earlier slots remain borrowable if another legal send can still meet the deadline. Reservations release before exact leg-two queueing, on every terminal exit, or at deadline; maximum 16/provider. Shadow diagnostics cannot reserve P0 capacity.
+- Existing RPS/concurrency/cooldown authority still governs every send. No quota is minted. Discovery resumes on release/expiry; existing class fairness applies when actual P0 work queues.
+- Removed an artificial extra discovery slot from admission's first-P0 estimate; the scheduler already reclaims its next protected slot.
+- Inactive cooldown now reports zero, not current time. Previously, already-expired evidence could be mislabeled as mandatory cooldown. No Jupiter/Raptor 429 was observed in this prefix, so those old cooldown labels are not valid rate-limit evidence.
+- Added exact-timing regression tests for future-slot protection, bounded/expired reservation cleanup, mandatory cooldown authority and first-P0 reclaimed-slot admission.
+
+Latest valid 60-second window before the gap: Raptor queue 690/1677/1706 ms and HTTP 323/375/473 ms (p50/p90/p99); Jupiter queue 961/2784/3075 ms and HTTP 72/100/123 ms. Scanner RPC accumulated 30 429s. These are **pre-reservation-fix** measurements. There is no valid production after-fix latency or READY result yet.
+
+Current root-cause classification: **SOFTWARE_SCHEDULER_OR_ADMISSION_ERROR identified and repaired in code; INSUFFICIENT_DATA for post-fix production acceptance.** Do not classify the eligible raw positives as market absence: they did not complete constrained economics. Cap economics remain unproven. Both long sampling gaps require a stable/awake host before the mandatory validation can complete.

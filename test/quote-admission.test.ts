@@ -72,6 +72,18 @@ describe('monotonic quote admission and semantic sharing', () => {
     await expect(admission.request(params, (d) => admission.dispatch(d, async () => ({ ...result(), responseTimestamp: -10000 })))).rejects.toThrow('QUOTE_RESULT_STALE');
     expect(admission.snapshot().coalescing_rejected_freshness).toBe(1);
   });
+  it('does not charge a reclaimed P0 slot for a queued discovery request', async () => {
+    let mono=0;
+    const admission=new QuoteAdmission('raptor',1000,()=>mono,()=>1000,()=>({nextLegalSendMono:100,cooldownUntilMono:0}));
+    await admission.request(params,(d)=>admission.dispatch(d,async()=>{mono=100;return result();}));
+    await Promise.resolve(); await Promise.resolve();
+    let completeDiscovery!: (quote: Quote)=>void;
+    const discovery=admission.request({...params,priority:'DISCOVERY_LOW'},()=>new Promise<Quote>((resolve)=>{completeDiscovery=resolve;}));
+    await Promise.resolve(); await Promise.resolve();
+    const urgent=admission.request({...params,scheduling:{deadlineMono:900}},(d)=>admission.dispatch(d,async()=>result()));
+    expect(await urgent).toMatchObject({outAmount:'100'});
+    completeDiscovery(result()); await discovery;
+  });
   it('bounds waiters and cleans abandoned queued requests without dispatch', async () => {
     vi.useFakeTimers(); let mono = 0; const admission = new QuoteAdmission('raptor', 0, () => mono, () => 1000);
     const enqueue = vi.fn((d: QuoteDeadline) => new Promise<Quote>((_, reject) => d.signal!.addEventListener('abort', () => reject(new Error('CANCELLED')), { once: true })));

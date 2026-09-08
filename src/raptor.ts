@@ -73,7 +73,7 @@ const queue: QueuedRaptorRequest<Quote>[] = [];
 export const raptorAdmission = new QuoteAdmission('raptor', () => CONFIG.raptorSafetyIntervalMs,
   () => performance.now(), () => Date.now(), () => ({
     nextLegalSendMono: performance.now() + Math.max(0, raptorStats.lastRequestTime + CONFIG.raptorSafetyIntervalMs - Date.now()),
-    cooldownUntilMono: performance.now() + Math.max(0, backoffUntil - Date.now()),
+    cooldownUntilMono: backoffUntil > Date.now() ? performance.now() + backoffUntil - Date.now() : 0,
   }));
 let isProcessingQueue = false;
 let backoffUntil = 0;
@@ -119,6 +119,10 @@ async function processQueue(): Promise<void> {
   try {
     while (queue.length > 0) {
       await paceRequest();
+      const reservedDelay = raptorAdmission.discoveryReservationDelayMs();
+      if (reservedDelay > 0 && !queue.some((request) => request.priority === 'EXEC_PREFILTER_HIGH')) {
+        await sleep(reservedDelay); continue;
+      }
       const request = fairService.take(queue, (request) => request.priority, (request) => request.deadline.deadlineMono);
       if (!request) continue;
       raptorStats.throttleState = 'ACTIVE';

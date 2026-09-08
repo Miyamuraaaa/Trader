@@ -192,6 +192,7 @@ export async function buildExecutableCandidateFromRaw(
     trace.prefilterFinishedAt = now(); trace.totalPrefilterMs = Math.max(0, mono() - startedMono);
     return { ...result, trace };
   };
+  let releaseDownstream: (() => void) | undefined;
   const result = await (async (): Promise<ExecutablePrefilterResult> => {
   // Defense in depth for quote-only callers outside scanner admission; no network work above cap.
   if (options.diagnosticCapability !== SHADOW_CAP_DIAGNOSTIC && BigInt(raw.buyQuote.inAmount) > BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC))) return { status: 'ABOVE_LIVE_CAP' };
@@ -222,6 +223,10 @@ export async function buildExecutableCandidateFromRaw(
     recordWorkflowProjection(options.traceId, 'BEFORE_LEG1', projected);
     if (!projected.feasible) return { status: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED', reason: projected.cause };
     scheduling.deadlineMono = projected.leg1Deadline;
+    if (options.diagnosticCapability !== SHADOW_CAP_DIAGNOSTIC) {
+      try { releaseDownstream = secondGovernor.reserveWorkflow(projected.leg2Deadline, first.predictedCompletionMono, second.serviceMs); }
+      catch { return { status: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED', reason: 'DOWNSTREAM_RESERVATION_UNAVAILABLE' }; }
+    }
   }
   const [policyResult, buyResult] = await Promise.allSettled([
     timed('tokenPolicy', () => (options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint)),
@@ -243,11 +248,16 @@ export async function buildExecutableCandidateFromRaw(
     scheduling.deadlineMono = parentDeadline - (options.quote ? 0 : localReserveMs);
     if (!options.quote && secondGovernor) {
       const second = secondGovernor.forecast(windowMs);
+      const completedAt = performance.now();
+      recordWorkflowProjection(options.traceId, 'BEFORE_LEG2', projectWorkflow(parentDeadline,
+        { provider: buyProvider, serviceMs: 0, predictedStartMono: completedAt, predictedCompletionMono: completedAt, cooldownUntilMono: 0 },
+        second, localReserveMs)); // Leg 1 is complete: its remaining service is zero.
       if (second.predictedCompletionMono > scheduling.deadlineMono) return { status: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED',
         reason: second.cooldownUntilMono > scheduling.deadlineMono ? 'PROVIDER_RATE_LIMIT_OR_MANDATORY_COOLDOWN' : 'PROVIDER_SERVICE_TOO_SLOW_FOR_REMAINING_BUDGET' };
     }
     // The executor's second instruction consumes the first instruction's
     // enforceable minimum. This is deliberately not the optimistic outAmount.
+    releaseDownstream?.();
     const sell = await timed('constrainedLeg2', () => quote(
       sellProvider, raw.buyQuote.outputMint, MINTS.USDC, buy.otherAmountThreshold, scheduling,
     ));
@@ -304,7 +314,7 @@ export async function buildExecutableCandidateFromRaw(
     const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);
     return { status: /QUEUE_DEADLINE|QUEUE_CANCELLED/.test(reason) ? 'PREFILTER_QUEUE_DEADLINE_EXCEEDED' : /QUOTE_RESULT_STALE/.test(reason) ? 'PREFILTER_STALE' : /429|backpressure|cooldown|capacity|rate.?limit|OVERFLOW/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason };
   }
-  })();
+  })().finally(() => releaseDownstream?.());
   return finish(result);
 }
 

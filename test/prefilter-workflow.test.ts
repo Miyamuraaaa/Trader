@@ -29,6 +29,10 @@ describe('dependent constrained workflow admission', () => {
     const first = { ...second, provider: 'jupiter', predictedStartMono: 100, predictedCompletionMono: 400, cooldownUntilMono: 0 };
     expect(projectWorkflow(1800, first, second, 45)).toMatchObject({ feasible: false, cause: 'PROVIDER_RATE_LIMIT_OR_MANDATORY_COOLDOWN' });
   });
+  it('does not invent a cooldown when evidence already predates its parent deadline', () => {
+    const leg = { provider:'raptor',serviceMs:350,predictedStartMono:2000,predictedCompletionMono:2350,cooldownUntilMono:0 };
+    expect(projectWorkflow(1800,leg,{...leg,predictedStartMono:2350,predictedCompletionMono:2700},45).cause).toBe('PROVIDER_SERVICE_TOO_SLOW_FOR_REMAINING_BUDGET');
+  });
   it('blocks soak manual acceptance before journal approval or broadcaster construction', async () => {
     const source = await readFile('src/live-execution-worker.ts', 'utf8');
     const approve = source.slice(source.indexOf('const approveManual ='));

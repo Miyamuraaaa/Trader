@@ -12,7 +12,7 @@ export function projectWorkflow(parentDeadline: number, first: WorkflowProjectio
     leg1Deadline: parentDeadline - downstream.serviceMs - localReserveMs,
     leg2Deadline: parentDeadline - localReserveMs,
     feasible: first.predictedCompletionMono <= downstream.predictedStartMono && completion <= parentDeadline,
-    cause: completion <= parentDeadline ? 'FEASIBLE' : Math.max(first.cooldownUntilMono, downstream.cooldownUntilMono) > parentDeadline
+    cause: completion <= parentDeadline ? 'FEASIBLE' : Math.max(first.cooldownUntilMono, downstream.cooldownUntilMono) > 0 && Math.max(first.cooldownUntilMono, downstream.cooldownUntilMono) > parentDeadline
       ? 'PROVIDER_RATE_LIMIT_OR_MANDATORY_COOLDOWN' : 'PROVIDER_SERVICE_TOO_SLOW_FOR_REMAINING_BUDGET' };
 }
 const projections: Array<{ candidateId: string; stage: string; projection: ReturnType<typeof projectWorkflow> }> = [];
