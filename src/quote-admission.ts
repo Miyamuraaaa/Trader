@@ -36,8 +36,27 @@ export class QuoteAdmission {
   private ewma: number | undefined;
   private lastDispatchMono = -Infinity;
   private counters: Record<string, number> = {};
+  private cooldownCause: { requestClass: string; durationMs: number; traceId?: string; amountAtomic?: string; endpoint: string } | null = null;
+  recordRateLimit(priority: QuoteParams['priority'], durationMs: number, traceId?: string, amountAtomic?: string, endpoint = 'quote') {
+    const requestClass = priority === 'EXEC_PREFILTER_HIGH' ? 'P0' : priority === 'HIGH' || priority === 'DISCOVERY_HIGH' ? 'P1' : 'P2';
+    this.count(`rateLimits_${requestClass}`);
+    this.counters[`requestedCooldownMs_${requestClass}`] = (this.counters[`requestedCooldownMs_${requestClass}`] ?? 0) + durationMs;
+    this.cooldownCause = { requestClass, durationMs, traceId, amountAtomic, endpoint };
+  }
   constructor(readonly provider: string, private readonly intervalMs: number | (() => number),
-    private readonly now: () => number = () => performance.now(), private readonly wall: () => number = Date.now) {}
+    private readonly now: () => number = () => performance.now(), private readonly wall: () => number = Date.now,
+    private readonly governorState?: () => { nextLegalSendMono: number; cooldownUntilMono: number }) {}
+  forecast(budgetMs: number, earliestMono = this.now()) {
+    const interval = typeof this.intervalMs === 'function' ? this.intervalMs() : this.intervalMs;
+    const state = this.governorState?.();
+    const serviceMs = this.estimate(budgetMs);
+    const active = [...this.entries.values()].filter((e) => e.dispatched).length;
+    const ready = Math.max(earliestMono, state?.nextLegalSendMono ?? this.lastDispatchMono + interval,
+      state?.cooldownUntilMono ?? 0, active ? this.lastDispatchMono + serviceMs : 0);
+    return { provider: this.provider, earliestMono, nextLegalSendMono: state?.nextLegalSendMono ?? this.lastDispatchMono + interval,
+      cooldownUntilMono: state?.cooldownUntilMono ?? 0, serviceMs, samples: this.samples.length, active,
+      predictedStartMono: ready, predictedCompletionMono: ready + serviceMs, cooldownCause: this.cooldownCause };
+  }
   private count(key: string) { this.counters[key] = (this.counters[key] ?? 0) + 1; }
   estimate(budget: number): number {
     this.samples = this.samples.filter((s) => this.now() - s.at < 60_000).slice(-256);
@@ -82,7 +101,7 @@ export class QuoteAdmission {
       // Fair service bounds legal start opportunities; HTTP estimate excludes queue residence.
       const ahead = deadline.requestClass === 'EXECUTION_PREFILTER' ? sameClass * 2 + (waiting.length ? 1 : 0) : waiting.length;
       const interval = typeof this.intervalMs === 'function' ? this.intervalMs() : this.intervalMs;
-      const pacingRemaining = Math.max(0, this.lastDispatchMono + interval - this.now());
+      const pacingRemaining = Math.max(0, this.forecast(deadline.budgetMs).predictedStartMono - this.now());
       this.check(deadline, pacingRemaining + ahead * interval);
       let resolve!: (q: Quote) => void, reject!: (e: unknown) => void;
       const promise = new Promise<Quote>((yes, no) => { resolve = yes; reject = no; });
@@ -113,7 +132,7 @@ export class QuoteAdmission {
     });
   }
   snapshot() {
-    return { ...this.counters, active_shared_requests: this.entries.size,
+    return { ...this.counters, cooldownCause: this.cooldownCause, active_shared_requests: this.entries.size,
       lanes: ['EXECUTION_PREFILTER','HIGH_PRIORITY_DISCOVERY','LOW_PRIORITY_DISCOVERY'].map((requestClass) => {
         const entries = [...this.entries.values()].filter((e) => e.deadline.requestClass === requestClass);
         return { requestClass, queued: entries.filter((e) => !e.dispatched).length, active: entries.filter((e) => e.dispatched).length,

@@ -37,6 +37,20 @@ describe('TEST DATA ONLY: raw-positive constrained prefilter', () => {
     expect((await buildExecutableCandidateFromRaw(candidate, costs, { policy, quote: quoted })).status).toBe('ABOVE_LIVE_CAP');
     expect(policy).not.toHaveBeenCalled(); expect(quoted).not.toHaveBeenCalled();
   });
+  it('cannot bypass the live cap with a caller-created diagnostic symbol', async () => {
+    const candidate = raw(); candidate.buyQuote.inAmount = '1000000000000';
+    const policy = vi.fn(supported); const quoted = vi.fn(async (...args: Parameters<typeof quote>) => quote(...args));
+    const result = await buildExecutableCandidateFromRaw(candidate, costs, { policy, quote: quoted, diagnosticCapability: Symbol('SHADOW_CAP_DIAGNOSTIC') });
+    expect(result.status).toBe('ABOVE_LIVE_CAP');
+    expect(policy).not.toHaveBeenCalled(); expect(quoted).not.toHaveBeenCalled();
+  });
+  it('records future raw evidence as a terminal prefilter result without provider work', async () => {
+    const candidate = raw(); candidate.buyQuote.responseTimestamp += 60000; candidate.sellQuote.responseTimestamp += 60000;
+    const quoted = vi.fn(async (...args: Parameters<typeof quote>) => quote(...args));
+    const result = await buildExecutableCandidateFromRaw(candidate, costs, { policy: supported, quote: quoted });
+    expect(result).toMatchObject({ status: 'PREFILTER_STALE', reason: 'INVALID_OR_FUTURE_MARKET_EVIDENCE' });
+    expect(quoted).not.toHaveBeenCalled(); expect(result.trace?.prefilterFinishedAt).toBeDefined();
+  });
   it('overlaps token policy with leg1, then propagates its enforceable minimum to leg2', async () => {
     vi.useFakeTimers(); const start = Date.now(); const calls: Array<{ at: number; amount: string }> = [];
     const result = buildExecutableCandidateFromRaw(raw(), costs, {

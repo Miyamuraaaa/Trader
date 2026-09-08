@@ -1,5 +1,8 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { performance } from 'node:perf_hooks';
+import { jupiterAdmission } from '../jupiter.js';
+import { raptorAdmission } from '../raptor.js';
+import { workflowParentDeadline, projectWorkflow, recordWorkflowProjection } from './prefilter-workflow.js';
 import { getProviderQuote } from '../aggregators/index.js';
 import { isFullFillQuote, type Quote, type QuoteProviderName } from '../aggregators/types.js';
 import { CONFIG, DECIMALS, LAMPORTS_PER_SOL, MINTS } from '../config.js';
@@ -25,6 +28,7 @@ import {
 } from './executable-route-policy.js';
 import { assertIntermediateTokenExecutionPolicy } from './token-analysis.js';
 import type { PrefilterTrace } from './prefilter-trace.js';
+const SHADOW_CAP_DIAGNOSTIC = Symbol('NON_AUTHORIZING_SHADOW_CAP_DIAGNOSTIC');
 
 export type ExecutablePrefilterStatus =
   | 'EXECUTABLE_CANDIDATE'
@@ -142,13 +146,14 @@ async function constrainedQuote(
   outputMint: string,
   amountAtomic: string,
   scheduling?: { deadlineMono: number; traceId?: string },
+  shadow = false,
 ): Promise<Quote> {
   const quote = await getProviderQuote(provider, {
     inputMint,
     outputMint,
     amountAtomic,
     slippageBps: CONFIG.slippageBps,
-    priority: 'EXEC_PREFILTER_HIGH',
+    priority: shadow ? 'DISCOVERY_LOW' : 'EXEC_PREFILTER_HIGH',
     scheduling,
     ...executableQuoteConstraints(provider),
   });
@@ -170,7 +175,7 @@ function exactPoolEvidence(quote: Quote): string[] {
 export async function buildExecutableCandidateFromRaw(
   raw: RoundTripResult,
   costs: ScannerExecutableCostSnapshot,
-  options: { traceId?: string; trace?: PrefilterTrace; now?: () => number; monotonicNow?: () => number; policy?: typeof classifyIntermediate; quote?: typeof constrainedQuote } = {},
+  options: { diagnosticCapability?: symbol; traceId?: string; trace?: PrefilterTrace; now?: () => number; monotonicNow?: () => number; policy?: typeof classifyIntermediate; quote?: typeof constrainedQuote } = {},
 ): Promise<ExecutablePrefilterResult> {
   const now = options.now ?? Date.now;
   const mono = options.monotonicNow ?? options.now ?? (() => performance.now());
@@ -189,7 +194,7 @@ export async function buildExecutableCandidateFromRaw(
   };
   const result = await (async (): Promise<ExecutablePrefilterResult> => {
   // Defense in depth for quote-only callers outside scanner admission; no network work above cap.
-  if (BigInt(raw.buyQuote.inAmount) > BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC))) return { status: 'ABOVE_LIVE_CAP' };
+  if (options.diagnosticCapability !== SHADOW_CAP_DIAGNOSTIC && BigInt(raw.buyQuote.inAmount) > BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC))) return { status: 'ABOVE_LIVE_CAP' };
   if (now() - trace.rawPositiveDetectedAt > CONFIG.opportunityExpiryMs) return { status: 'RAW_SIGNAL_ENDED' };
   if (trace.rawAgeAtPrefilterStartMs! > CONFIG.maxQuoteAgeMs) return { status: 'RAW_STALE_BEFORE_PREFILTER' };
   if (!raw.profit.estimatedNetProfitUsdc.gt(0) || !raw.profit.worstCaseNetProfitUsdc.gt(0)) {
@@ -200,8 +205,24 @@ export async function buildExecutableCandidateFromRaw(
   if (!isExecutableProviderPair(buyProvider, sellProvider)) {
     return { status: 'UNSUPPORTED_PROVIDER_PAIR' };
   }
-  const quote = options.quote ?? constrainedQuote;
-  const scheduling = { deadlineMono: performance.now() + ([buyProvider, sellProvider].includes('raptor') ? CONFIG.raptorExecutionQuoteAgeMs : CONFIG.maxExecutionQuoteAgeMs), traceId: options.traceId };
+  const quote = options.quote ?? ((provider, input, output, amount, scheduling) => constrainedQuote(provider, input, output, amount, scheduling, options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC));
+  const windowMs = [buyProvider, sellProvider].includes('raptor') ? CONFIG.raptorExecutionQuoteAgeMs : CONFIG.maxExecutionQuoteAgeMs;
+  let parentDeadline: number;
+  try { parentDeadline = workflowParentDeadline(performance.now(), now(), trace.rawQuoteEvidenceAt, windowMs); }
+  catch { return { status: 'PREFILTER_STALE', reason: 'INVALID_OR_FUTURE_MARKET_EVIDENCE' }; }
+  const scheduling = { deadlineMono: parentDeadline, traceId: options.traceId };
+  const admission = (provider: QuoteProviderName) => provider === 'jupiter' ? jupiterAdmission : provider === 'raptor' ? raptorAdmission : undefined;
+  const firstGovernor = admission(buyProvider), secondGovernor = admission(sellProvider);
+  // Reserve 20ms for local policy/economics and 25ms for P0 delivery, never extra freshness.
+  const localReserveMs = 45;
+  if (!options.quote && firstGovernor && secondGovernor) {
+    const first = firstGovernor.forecast(windowMs);
+    const second = secondGovernor.forecast(windowMs, first.predictedCompletionMono);
+    const projected = projectWorkflow(parentDeadline, first, second, localReserveMs);
+    recordWorkflowProjection(options.traceId, 'BEFORE_LEG1', projected);
+    if (!projected.feasible) return { status: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED', reason: projected.cause };
+    scheduling.deadlineMono = projected.leg1Deadline;
+  }
   const [policyResult, buyResult] = await Promise.allSettled([
     timed('tokenPolicy', () => (options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint)),
     timed('constrainedLeg1', () => quote(buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount, scheduling)),
@@ -219,11 +240,18 @@ export async function buildExecutableCandidateFromRaw(
     if (buyResult.status === 'rejected') throw buyResult.reason;
     const buy = buyResult.value;
     if (now() - buy.responseTimestamp > CONFIG.maxQuoteAgeMs) return { status: 'PREFILTER_STALE' };
+    scheduling.deadlineMono = parentDeadline - (options.quote ? 0 : localReserveMs);
+    if (!options.quote && secondGovernor) {
+      const second = secondGovernor.forecast(windowMs);
+      if (second.predictedCompletionMono > scheduling.deadlineMono) return { status: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED',
+        reason: second.cooldownUntilMono > scheduling.deadlineMono ? 'PROVIDER_RATE_LIMIT_OR_MANDATORY_COOLDOWN' : 'PROVIDER_SERVICE_TOO_SLOW_FOR_REMAINING_BUDGET' };
+    }
     // The executor's second instruction consumes the first instruction's
     // enforceable minimum. This is deliberately not the optimistic outAmount.
     const sell = await timed('constrainedLeg2', () => quote(
       sellProvider, raw.buyQuote.outputMint, MINTS.USDC, buy.otherAmountThreshold, scheduling,
     ));
+    if (!options.quote && performance.now() > parentDeadline) return { status: 'PREFILTER_STALE', reason: 'PARENT_WORKFLOW_DEADLINE_EXCEEDED' };
     if (!isFullFillQuote(buy) || !isFullFillQuote(sell) || !quoteMatchesExecutableProviderPolicy(buy) || !quoteMatchesExecutableProviderPolicy(sell)) return { status: 'ROUTE_POLICY_REJECTED', reason: 'Constrained quotes escaped audited route policy' };
     if (buy.inputMint !== MINTS.USDC || buy.outputMint !== raw.buyQuote.outputMint || buy.inAmount !== raw.buyQuote.inAmount
       || sell.inputMint !== buy.outputMint || sell.outputMint !== MINTS.USDC) return { status: 'ROUTE_POLICY_REJECTED', reason: 'Constrained mint/input path mismatch' };
@@ -278,4 +306,12 @@ export async function buildExecutableCandidateFromRaw(
   }
   })();
   return finish(result);
+}
+
+/** Diagnostic output cannot be handed off: it has no route, instructions, DTO or authority. */
+export async function evaluateAboveCapShadow(raw: RoundTripResult, costs: ScannerExecutableCostSnapshot) {
+  const result = await buildExecutableCandidateFromRaw(raw, costs, { diagnosticCapability: SHADOW_CAP_DIAGNOSTIC });
+  return { status: result.status === 'EXECUTABLE_CANDIDATE' ? 'SHADOW_CONSTRAINED_POSITIVE' : result.status,
+    expectedNet: result.route?.profit.estimatedNetProfitUsdc.toFixed(6), conservativeNet: result.route?.profit.worstCaseNetProfitUsdc.toFixed(6), costs: result.costs,
+    authoritative: false as const, p0Allowed: false as const };
 }

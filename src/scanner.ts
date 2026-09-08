@@ -3,8 +3,13 @@ import { executionFunnel } from './execution/execution-funnel.js';
 import { PrefilterCoalescer, type PrefilterTrace } from './execution/prefilter-trace.js';
 import { LiveSizeCadence } from './scanner-service-policy.js';
 import { scannerSizeDiagnostics } from './scanner-size-diagnostics.js';
+import { executableSurfaceProvider } from './scanner-executable-plane.js';
+import { scannerHistoryBuffer } from './scanner-history-buffer.js';
+let executableSurfaceTurn = 0;
 import { profileScannerStage, startScannerStage } from './scanner-stage-profile.js';
 const liveSizeCadence = new LiveSizeCadence();
+let shadowBusy = false;
+let lastShadowAt = -Infinity;
 import { isExecutableProviderPair } from './execution/executable-route-policy.js';
 import { prioritizeDirectMarketPair } from './direct-market-stream.js';
 import { ScannerFirstLegBulkheads, ScannerBackgroundLane } from './scanner-bulkheads.js';
@@ -33,6 +38,7 @@ import { aggregatorHandoffIdentity, quoteRouteEvidence, routeEvidenceFingerprint
 import { logExecutionStage } from './execution/execution-diagnostics.js';
 import {
   buildExecutableCandidateFromRaw,
+  evaluateAboveCapShadow,
   prewarmScannerExecutionMints,
   type ScannerExecutableCostSnapshot,
   type ExecutablePrefilterResult,
@@ -413,6 +419,17 @@ async function findExecutableCandidates(
         return buildExecutableCandidateFromRaw(raw, costs, { trace, traceId: signalId });
       }, (status) => ({ status, trace }));
     executionFunnel.raw.finish(signalId, result.status, result.trace);
+    // Above-cap diagnostics use P2 only, at most one attempt/minute and never return a handoff route.
+    if (result.status === 'ABOVE_LIVE_CAP' && !shadowBusy && performance.now() - lastShadowAt >= 60000
+      && prefilterCoalescer.activeRoutes === 0 && isExecutableProviderPair(raw.buyQuote.provider, raw.sellQuote.provider)
+      && (raw.buyQuote.outputMint === MINTS.SOL || getDynamicTokens().some((token) => token.mint === raw.buyQuote.outputMint && token.executionPrecheck === 'PASS'))) {
+      shadowBusy = true; lastShadowAt = performance.now();
+      const size = Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC));
+      scannerSizeDiagnostics.record(size, 'shadow_attempts');
+      void evaluateAboveCapShadow(raw, costs).then((diagnostic) => {
+        scannerSizeDiagnostics.record(size, diagnostic.status === 'SHADOW_CONSTRAINED_POSITIVE' ? 'shadow_constrained_positives' : 'shadow_' + diagnostic.status, diagnostic.costs);
+      }).catch(() => scannerSizeDiagnostics.record(size, 'shadow_QUOTE_FAILED')).finally(() => { shadowBusy = false; });
+    }
     scannerSizeDiagnostics.record(Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC)), ({ EXECUTABLE_CANDIDATE: 'constrained_positives', ABOVE_LIVE_CAP: 'above_live_cap_positives', ECONOMICS_DIVERGED: 'economics_diverged', PREFILTER_RATE_LIMITED: 'rate_limited', PREFILTER_QUEUE_DEADLINE_EXCEEDED: 'deadline_dropped' } as Record<string, string>)[result.status] ?? result.status, result.costs);
     if (trace.executablePrefilterStartedAt !== undefined) event('PREFILTER_COMPLETED');
     event(result.status);
@@ -857,10 +874,19 @@ export async function scanOnce(
         scanMode,
         referencePrice: String(referenceSolPriceUsdc),
       };
-      insertScan(scanRow);
+      if (CONFIG.executionMode === 'live') scannerHistoryBuffer.enqueue(() => insertScan(scanRow));
+      else insertScan(scanRow);
 
       const buyAmount = toAtomic(tradeSizeUsdc, DECIMALS.USDC);
-      const allProviders = getEnabledProviders();
+      const configuredProviders = getEnabledProviders();
+      const tokenMetadata = getDynamicTokens().find((token) => token.mint === cycle.intermediateMint);
+      const eligibleMetadata = tradeSizeUsdc <= CONFIG.firstLiveMaxInputUsdc
+        && (cycle.intermediateMint === MINTS.SOL || tokenMetadata?.executionPrecheck === 'PASS');
+      // Preserve a bounded unrestricted in-cap diagnostic sample as well as above-cap observation.
+      const useExecutableSurface = eligibleMetadata && executableSurfaceTurn++ % 10 !== 9;
+      const allProviders = CONFIG.executionMode === 'live'
+        ? configuredProviders.map((provider) => executableSurfaceProvider(provider, configuredProviders, useExecutableSurface))
+        : configuredProviders;
       const releaseDirect = backgroundDirect && !CONFIG.directDexOnly ? directBackgroundLane.reserve() : undefined;
       const scanProviders = CONFIG.directDexOnly
         ? allProviders.filter((provider) => provider.kind === 'direct')
@@ -879,7 +905,10 @@ export async function scanOnce(
         const finished = startScannerStage('firstLegPersistenceAndBookkeeping');
         try {
         recordProviderQuoteResults(results);
-        for (const quote of successfulQuotes(results).filter(isFullFillQuote)) insertQuote(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`));
+        for (const quote of successfulQuotes(results).filter(isFullFillQuote)) {
+          const write = () => insertQuote(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`));
+          if (CONFIG.executionMode === 'live') scannerHistoryBuffer.enqueue(write); else write();
+        }
         return results;
         } finally { finished(); }
       };

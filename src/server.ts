@@ -6,6 +6,8 @@ import { jupiterAdmission } from './jupiter.js';
 import { raptorAdmission } from './raptor.js';
 import { dispatchDiagnostics } from './dispatch-diagnostics.js';
 import { scannerSizeDiagnostics } from './scanner-size-diagnostics.js';
+import { workflowProjectionSnapshot } from './execution/prefilter-workflow.js';
+import { scannerHistoryBuffer } from './scanner-history-buffer.js';
 import { scannerOperationalMetrics } from './scanner.js';
 import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
 import { directMarketStreamHealth } from './direct-market-stream.js';
@@ -219,6 +221,8 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
         executionFunnel: executionFunnel.snapshot(),
         scannerStageProfile: scannerStageProfile(),
         quoteAdmission: { jupiter: jupiterAdmission.snapshot(), raptor: raptorAdmission.snapshot() },
+        prefilterWorkflows: workflowProjectionSnapshot(),
+        scannerHistory: scannerHistoryBuffer.snapshot(),
         dispatchDiagnostics: dispatchDiagnostics(),
         sizeDiagnostics: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps),
         scannerOperationalMetrics: scannerOperationalMetrics(),
@@ -367,6 +371,8 @@ export function startServer(port: number = 3000, liveApproval?: LiveApprovalBrid
           executionFunnel: executionFunnel.snapshot(),
           scannerStageProfile: scannerStageProfile(),
           quoteAdmission: { jupiter: jupiterAdmission.snapshot(), raptor: raptorAdmission.snapshot() },
+          prefilterWorkflows: workflowProjectionSnapshot(),
+          scannerHistory: scannerHistoryBuffer.snapshot(),
           dispatchDiagnostics: dispatchDiagnostics(),
           sizeDiagnostics: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps),
           scannerOperationalMetrics: scannerOperationalMetrics(),

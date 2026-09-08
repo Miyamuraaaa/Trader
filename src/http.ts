@@ -14,6 +14,7 @@ export class HttpError extends Error {
     message: string,
     readonly status?: number,
     readonly retriable = false,
+    readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'HttpError';
@@ -29,7 +30,7 @@ export interface GetJsonOptions {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function retryAfterMs(value: string | null): number | undefined {
+export function retryAfterMs(value: string | null): number | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
@@ -68,7 +69,7 @@ export async function getJson<T = unknown>(
         const backoffMs = retryAfter !== undefined
           ? retryAfter
           : withJitter(Math.min(baseBackoffMs * 2 ** attempt, 8000));
-        lastErr = new HttpError(`HTTP ${res.status} from ${short(url)}`, res.status, true);
+        lastErr = new HttpError(`HTTP ${res.status} from ${short(url)}`, res.status, true, retryAfter);
         if (attempt < maxRetries) {
           log.warn(`${provider} HTTP ${res.status}; backing off`, {
             attempt: attempt + 1,

@@ -2,12 +2,36 @@
 export class ScannerFairService {
   private prefilterRun = 0;
   private cursor = 0;
+  private protectedCursor = 0;
+  private hadPrefilter = false;
+  private borrowed = 0;
+  private reclaimed = 0;
+  private discoveryTurns = 0;
+  private readonly protectedSlots = ['EXEC_PREFILTER_HIGH','EXEC_PREFILTER_HIGH','DISCOVERY_HIGH','EXEC_PREFILTER_HIGH','EXEC_PREFILTER_HIGH','DISCOVERY_LOW','DISCOVERY_HIGH','EXEC_PREFILTER_HIGH','DISCOVERY_HIGH','EXEC_PREFILTER_HIGH'] as const;
+  snapshot() { return { reservation: { P0: .6, P1: .3, P2: .1 }, borrowedDebt: this.borrowed, reclaimed: this.reclaimed }; }
   private readonly slots = ['EXEC_PREFILTER_HIGH', 'EXEC_PREFILTER_HIGH', 'DISCOVERY_HIGH', 'DISCOVERY_LOW'] as const;
   take<T>(queue: T[], priority: (item: T) => string | undefined, deadline?: (item: T) => number): T | undefined {
     const tier = (value: string | undefined) => value === 'EXEC_PREFILTER_HIGH' ? value : value === 'HIGH' || value === 'DISCOVERY_HIGH' ? 'DISCOVERY_HIGH' : 'DISCOVERY_LOW';
     const choose = (kind: string) => queue.reduce((best, item, index) => tier(priority(item)) === kind && (best < 0 || (deadline?.(item) ?? 0) < (deadline?.(queue[best]!) ?? 0)) ? index : best, -1);
     const remove = (index: number) => { const item = queue.splice(index, 1)[0]!; this.prefilterRun = tier(priority(item)) === 'EXEC_PREFILTER_HIGH' ? this.prefilterRun + 1 : 0; return item; };
-    if (deadline && this.prefilterRun < 2) { const urgent = choose('EXEC_PREFILTER_HIGH'); if (urgent >= 0) return remove(urgent); }
+    if (deadline && queue.length) {
+      const p0 = choose('EXEC_PREFILTER_HIGH');
+      if (p0 >= 0 && !this.hadPrefilter) { this.protectedCursor = 0; this.reclaimed += this.borrowed; this.borrowed = 0; }
+      this.hadPrefilter = p0 >= 0;
+      const slot = this.protectedSlots[this.protectedCursor++ % this.protectedSlots.length]!;
+      // Repeated arrivals cannot continually reset reservations and starve discovery.
+      if (slot === 'EXEC_PREFILTER_HIGH' && p0 >= 0 && this.prefilterRun >= 3) {
+        const discovery = choose(this.discoveryTurns++ % 4 === 3 ? 'DISCOVERY_LOW' : 'DISCOVERY_HIGH');
+        if (discovery >= 0) return remove(discovery);
+      }
+      let index = choose(slot);
+      if (index < 0) {
+        if (slot === 'EXEC_PREFILTER_HIGH') this.borrowed = Math.min(6, this.borrowed + 1);
+        index = p0 >= 0 ? p0 : choose('DISCOVERY_HIGH');
+        if (index < 0) index = choose('DISCOVERY_LOW');
+      }
+      return index >= 0 ? remove(index) : undefined;
+    }
     const discoveryWaiting = queue.some((item) => tier(priority(item)) !== 'EXEC_PREFILTER_HIGH');
     for (let checked = 0; checked < this.slots.length; checked++) {
       const slot = this.slots[this.cursor++ % this.slots.length]!;

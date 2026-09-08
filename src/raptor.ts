@@ -70,7 +70,11 @@ interface QueuedRaptorRequest<T> {
   reject: (error: unknown) => void;
 }
 const queue: QueuedRaptorRequest<Quote>[] = [];
-export const raptorAdmission = new QuoteAdmission('raptor', () => CONFIG.raptorSafetyIntervalMs);
+export const raptorAdmission = new QuoteAdmission('raptor', () => CONFIG.raptorSafetyIntervalMs,
+  () => performance.now(), () => Date.now(), () => ({
+    nextLegalSendMono: performance.now() + Math.max(0, raptorStats.lastRequestTime + CONFIG.raptorSafetyIntervalMs - Date.now()),
+    cooldownUntilMono: performance.now() + Math.max(0, backoffUntil - Date.now()),
+  }));
 let isProcessingQueue = false;
 let backoffUntil = 0;
 let consecutiveFailures = 0;
@@ -228,7 +232,8 @@ async function executeQuote(params: QuoteParams): Promise<Quote> {
     consecutiveFailures++;
     if (error instanceof HttpError && error.status === 429) {
       raptorStats.rateLimits429++;
-      backoffUntil = Date.now() + 5000;
+      backoffUntil = Math.max(backoffUntil, Date.now() + Math.max(5000, error.retryAfterMs ?? 0));
+      raptorAdmission.recordRateLimit(params.priority, Math.max(5000, error.retryAfterMs ?? 0), params.scheduling?.traceId, params.amountAtomic);
       log.warn('Raptor rate-limited after bounded retries; provider cooling down', {
         backoffMs: 5000,
       });

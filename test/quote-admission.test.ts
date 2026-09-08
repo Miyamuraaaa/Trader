@@ -37,6 +37,34 @@ describe('monotonic quote admission and semantic sharing', () => {
     const pending = admission.request({ ...params, scheduling: { deadlineMono: 1000 } }, async (d) => { mono = 200; return admission.dispatch(d, work); });
     await expect(pending).rejects.toThrow('PREFILTER_QUEUE_DEADLINE_EXCEEDED'); expect(work).not.toHaveBeenCalled();
   });
+  it('keeps a later waiter alive when the already-dispatched leader waiter expires', async () => {
+    vi.useFakeTimers(); let mono = 0;
+    const admission = new QuoteAdmission('raptor', 0, () => mono, () => 1000);
+    let complete!: (q: Quote) => void;
+    const work = vi.fn((d: QuoteDeadline) => admission.dispatch(d, () => new Promise<Quote>((resolve) => { complete = resolve; })));
+    const leader = admission.request({ ...params, scheduling: { deadlineMono: 1000 } }, work);
+    const rejected = expect(leader).rejects.toThrow('PREFILTER_QUEUE_DEADLINE_EXCEEDED');
+    await vi.advanceTimersByTimeAsync(0);
+    const follower = admission.request({ ...params, scheduling: { deadlineMono: 1700 } }, work);
+    mono = 1001; await vi.advanceTimersByTimeAsync(1001); await rejected;
+    mono = 1100; complete(result());
+    expect(await follower).toMatchObject({ outAmount: '100' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(admission.snapshot()).toMatchObject({ active_shared_requests: 0, waiter_deadline_expired: 1 });
+  });
+  it('never caches a failed shared request and cleans up all remaining waiters', async () => {
+    const admission = new QuoteAdmission('raptor', 0, () => 0, () => 1000);
+    const fail = vi.fn((d: QuoteDeadline) => admission.dispatch(d, async () => { throw new Error('HTTP 429'); }));
+    await Promise.all([
+      expect(admission.request(params, fail)).rejects.toThrow('HTTP 429'),
+      expect(admission.request(params, fail)).rejects.toThrow('HTTP 429'),
+    ]);
+    await Promise.resolve(); await Promise.resolve();
+    expect(admission.snapshot().active_shared_requests).toBe(0);
+    await expect(admission.request(params, fail)).rejects.toThrow('HTTP 429');
+    expect(fail).toHaveBeenCalledTimes(2);
+  });
   it('keeps queue residence out of service estimation and rejects stale successful responses', async () => {
     let mono = 0; const admission = new QuoteAdmission('raptor', 0, () => mono, () => 1000);
     await admission.request(params, async (d) => { mono = 300; return admission.dispatch(d, async () => { mono = 400; return result(); }); });

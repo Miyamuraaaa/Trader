@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { performance } from 'node:perf_hooks';
+import { retryAfterMs } from './http.js';
 import { dispatchDrift } from './dispatch-diagnostics.js';
 import { QuoteAdmission, semanticQuoteKey, type QuoteDeadline } from './quote-admission.js';
 import { ScannerFairService } from './scanner-service-policy.js';
@@ -107,7 +108,11 @@ interface QueuedRequest {
 }
 
 const queue: QueuedRequest[] = [];
-export const jupiterAdmission = new QuoteAdmission('jupiter', () => CONFIG.jupiterApiKey ? CONFIG.jupiterSafetyIntervalMs : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050));
+export const jupiterAdmission = new QuoteAdmission('jupiter', () => CONFIG.jupiterApiKey ? CONFIG.jupiterSafetyIntervalMs : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050),
+  () => performance.now(), () => Date.now(), () => ({
+    nextLegalSendMono: performance.now() + Math.max(0, jupiterStats.lastRequestTime + (CONFIG.jupiterApiKey ? CONFIG.jupiterSafetyIntervalMs : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050)) - Date.now()),
+    cooldownUntilMono: performance.now() + Math.max(0, rateLimitBackoffUntil - Date.now()),
+  }));
 let isProcessingQueue = false;
 let rateLimitBackoffUntil = 0;
 
@@ -127,6 +132,7 @@ export function getQueueLength(): number {
 }
 
 let auxiliaryRequestTail: Promise<void> = Promise.resolve();
+let auxiliaryInFlight: Promise<void> | null = null;
 
 /**
  * Low-priority Jupiter JSON request sharing the same free-tier pacing state as
@@ -140,6 +146,9 @@ export function getJupiterJson<T>(url: string, operation: string): Promise<T> {
     rejectResult = reject;
   });
   auxiliaryRequestTail = auxiliaryRequestTail.then(async () => {
+    // Recheck the shared pacing authority after every await. A quote may have
+    // consumed the legal slot while this low-priority request was sleeping.
+    for (;;) {
     while (isProcessingQueue || queue.length > 0 || isRateLimited()) {
       const waitMs = isRateLimited()
         ? Math.max(100, Math.min(1000, rateLimitBackoffUntil - Date.now()))
@@ -150,7 +159,11 @@ export function getJupiterJson<T>(url: string, operation: string): Promise<T> {
       ? CONFIG.jupiterSafetyIntervalMs
       : Math.max(CONFIG.jupiterSafetyIntervalMs, 2050);
     const remaining = effectiveIntervalMs - (Date.now() - jupiterStats.lastRequestTime);
-    if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+    if (remaining > 0) { await new Promise((resolve) => setTimeout(resolve, remaining)); continue; }
+    break;
+    }
+    let releaseAuxiliary!: () => void;
+    auxiliaryInFlight = new Promise<void>((resolve) => { releaseAuxiliary = resolve; });
 
     const startedAt = Date.now();
     jupiterStats.lastRequestTime = startedAt;
@@ -172,9 +185,9 @@ export function getJupiterJson<T>(url: string, operation: string): Promise<T> {
       if (response.status === 429) {
         jupiterStats.rateLimits429++;
         jupiterStats.last429Time = finishedAt;
-        const retryAfter = Number(response.headers.get('retry-after'));
-        const delayMs = Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter * 1000 : 5000;
+        const delayMs = retryAfterMs(response.headers.get('retry-after')) ?? 5000;
         rateLimitBackoffUntil = Date.now() + delayMs;
+        jupiterAdmission.recordRateLimit('DISCOVERY_LOW', delayMs, undefined, undefined, 'market-discovery');
         throw new Error(`Jupiter ${operation} rate-limited (429); cooldown ${delayMs}ms`);
       }
       if (!response.ok) throw new Error(`Jupiter ${operation} HTTP ${response.status}: ${body.slice(0, 300)}`);
@@ -186,6 +199,8 @@ export function getJupiterJson<T>(url: string, operation: string): Promise<T> {
     } catch (error) {
       if (!(error instanceof Error) || !error.message.includes('429')) jupiterStats.otherErrors++;
       rejectResult(error);
+    } finally {
+      auxiliaryInFlight = null; releaseAuxiliary();
     }
   }).catch((error) => {
     rejectResult(error);
@@ -223,6 +238,7 @@ async function processQueue() {
 
   try {
     while (queue.length > 0) {
+      if (auxiliaryInFlight) { await auxiliaryInFlight; continue; }
       if (isRateLimited()) {
         jupiterStats.throttleState = 'BACKOFF';
         const waitMs = rateLimitBackoffUntil - Date.now();
@@ -372,13 +388,14 @@ async function executeQuote(params: QuoteParams): Promise<Quote> {
       jupiterStats.last429Time = resTs;
       
       const retryAfterHeader = res.headers.get('retry-after');
-      const baseDelay = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 5000;
+      const baseDelay = retryAfterMs(retryAfterHeader) ?? 5000;
       // Exponential backoff with jitter (§6)
       const attempt = Math.min(jupiterStats.rateLimits429, 5);
       const jitter = Math.random() * 1000;
       const delay = baseDelay * Math.pow(1.5, attempt - 1) + jitter;
       
       rateLimitBackoffUntil = Date.now() + delay;
+      jupiterAdmission.recordRateLimit(params.priority, delay, params.scheduling?.traceId, params.amountAtomic);
       log.warn('Jupiter rate-limited (429), slowing global queue', { delayMs: Math.round(delay) });
       throw new Error(`Jupiter API rate-limited (429). Retry after ${Math.round(delay)}ms`);
     }
