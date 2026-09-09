@@ -38,7 +38,7 @@ export type QuotePriority = 'HIGH' | 'LOW' | 'EXEC_PREFILTER_HIGH' | 'DISCOVERY_
 
 export interface QuoteParams {
   /** Scanner-only monotonic scheduling metadata; never included in HTTP parameters. */
-  scheduling?: { deadlineMono: number; traceId?: string };
+  scheduling?: { deadlineMono: number; traceId?: string; entitlement?: import('../provider-entitlement.js').EntitlementClaim };
   inputMint: string;
   outputMint: string;
   amountAtomic: string;

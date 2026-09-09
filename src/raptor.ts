@@ -123,7 +123,7 @@ async function processQueue(): Promise<void> {
       if (reservedDelay > 0 && !queue.some((request) => request.priority === 'EXEC_PREFILTER_HIGH')) {
         await sleep(reservedDelay); continue;
       }
-      const request = fairService.take(queue, (request) => request.priority, (request) => request.deadline.deadlineMono);
+      const request = raptorAdmission.takeClaimed(queue,request=>request.deadline) ?? fairService.take(queue, (request) => request.priority, (request) => request.deadline.deadlineMono);
       if (!request) continue;
       raptorStats.throttleState = 'ACTIVE';
       let finish: ReturnType<typeof raptorWorkMetrics.start> | undefined;

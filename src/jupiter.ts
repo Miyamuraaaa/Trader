@@ -190,7 +190,7 @@ export function getJupiterJson<T>(url: string, operation: string): Promise<T> {
         const delayMs = retryAfterMs(response.headers.get('retry-after')) ?? 5000;
         rateLimitBackoffUntil = Date.now() + delayMs;
         jupiterAdmission.recordRateLimit('DISCOVERY_LOW', delayMs, undefined, undefined, 'market-discovery');
-        throw new Error(`Jupiter ${operation} rate-limited (429); cooldown ${delayMs}ms`);
+        throw Object.assign(new Error(`Jupiter ${operation} rate-limited (429); cooldown ${delayMs}ms`),{status:429,retryAfterMs:delayMs});
       }
       if (!response.ok) throw new Error(`Jupiter ${operation} HTTP ${response.status}: ${body.slice(0, 300)}`);
       let parsed: unknown;
@@ -268,7 +268,7 @@ async function processQueue() {
       if (reservedDelay > 0 && !queue.some((request) => request.params.priority === 'EXEC_PREFILTER_HIGH')) {
         await new Promise((resolve) => setTimeout(resolve, reservedDelay)); continue;
       }
-      const req = fairService.take(queue, (request) => request.params.priority, (request) => request.deadline.deadlineMono);
+      const req = jupiterAdmission.takeClaimed(queue,request=>request.deadline) ?? fairService.take(queue, (request) => request.params.priority, (request) => request.deadline.deadlineMono);
       if (!req) continue;
 
       jupiterStats.throttleState = 'ACTIVE';
@@ -403,7 +403,7 @@ async function executeQuote(params: QuoteParams): Promise<Quote> {
       rateLimitBackoffUntil = Date.now() + delay;
       jupiterAdmission.recordRateLimit(params.priority, delay, params.scheduling?.traceId, params.amountAtomic);
       log.warn('Jupiter rate-limited (429), slowing global queue', { delayMs: Math.round(delay) });
-      throw new Error(`Jupiter API rate-limited (429). Retry after ${Math.round(delay)}ms`);
+      throw Object.assign(new Error(`Jupiter API rate-limited (429). Retry after ${Math.round(delay)}ms`),{status:429,retryAfterMs:delay});
     }
 
     if (!res.ok) {
