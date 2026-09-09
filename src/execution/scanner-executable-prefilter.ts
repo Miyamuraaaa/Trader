@@ -23,6 +23,7 @@ import {
   getCachedExecutionMintAnalysis,
   preloadExecutionPreflight,
   peekExecutionPreflight,
+  isExecutionPreflightBackpressure,
 } from './execution-preflight-cache.js';
 import {
   executableQuoteConstraints,
@@ -99,8 +100,11 @@ export async function prewarmScannerExecutionMints(mints: readonly string[]): Pr
   const walletAddress = CONFIG.botWalletAddress;
   if (!walletAddress || mints.length === 0) return;
   const wallet = new PublicKey(walletAddress);
+  try {
   const cached = [MINTS.USDC,...mints].map((mint)=>peekExecutionPreflight(scannerPolicyConnection,wallet,mint));
-  if(cached.every((entry)=>entry!==undefined)){await Promise.all(cached);return;}
+  // Observe every existing probe even when another mint misses the cache.
+  await Promise.all(cached);
+  if(cached.every((entry)=>entry!==undefined))return;
   await runScannerRpc(
     'scanner.prefilter.prewarmExecutionMints',
     () => preloadExecutionPreflight(
@@ -110,6 +114,12 @@ export async function prewarmScannerExecutionMints(mints: readonly string[]): Pr
     ),
     'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT',
   );
+  } catch (error) {
+    // Background-only warmup: leave missing/failed entries unavailable. A later
+    // normal refresh may try again; do not retry here or extend cache freshness.
+    if (isExecutionPreflightBackpressure(error)) return;
+    throw error;
+  }
 }
 
 export async function classifyIntermediate(mint: string, priority: import('../scanner-rpc-limiter.js').ScannerRpcPriority = 'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT'): Promise<{

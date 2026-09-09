@@ -14,6 +14,31 @@ import {
 } from './token-analysis.js';
 import type { ExecutionNetworkProfiler } from './network-profiler.js';
 
+// Match structurally: importing the scanner governor here would expand the
+// isolated executor's dependency surface.
+export function isExecutionPreflightBackpressure(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const value = error as { code?: unknown; name?: unknown };
+  return value.code === 'SCANNER_RPC_BACKPRESSURE'
+    || value.code === 'RPC_BACKPRESSURE'
+    || value.name === 'ScannerRpcBackpressureError';
+}
+
+function observePreflight<T>(promise: Promise<T>): Promise<T> {
+  const pending = promise.catch((error: unknown) => {
+    if (isExecutionPreflightBackpressure(error)) {
+      throw Object.assign(new Error('RPC_BACKPRESSURE: PREFLIGHT_UNAVAILABLE'), {
+        code: 'RPC_BACKPRESSURE', reason: 'PREFLIGHT_UNAVAILABLE',
+      });
+    }
+    throw error;
+  });
+  // Cache probes may be abandoned by a background caller. Observe rejection
+  // immediately, but return the rejecting promise so active callers fail closed.
+  void pending.catch(() => {});
+  return pending;
+}
+
 // ATA existence is structural and the live balance gate refreshes spendable
 // amounts immediately before submission. Keep this off the candidate hot path.
 const ATA_TTL_MS = 300_000;
@@ -25,7 +50,7 @@ export function peekExecutionPreflight(connection: Connection, wallet: PublicKey
   const analysis = mintCache.get(`${connection.rpcEndpoint}:${mint}`);
   const ata = ataCache.get(`${connection.rpcEndpoint}:${wallet.toBase58()}:${mint}`);
   if (!analysis || !ata || ata.expiresAt <= Date.now()) return undefined;
-  return Promise.all([analysis, ata.value]);
+  return observePreflight(Promise.all([analysis, ata.value]));
 }
 
 export function getCachedExecutionMintAnalysis(
@@ -36,10 +61,10 @@ export function getCachedExecutionMintAnalysis(
   const key = `${connection.rpcEndpoint}:${mint}`;
   const cached = mintCache.get(key);
   if (cached) return cached;
-  const pending = analyzeTokenMint(connection, mint, profiler).catch((error) => {
+  const pending = observePreflight(analyzeTokenMint(connection, mint, profiler).catch((error) => {
     mintCache.delete(key);
     throw error;
-  });
+  }));
   mintCache.set(key, pending);
   return pending;
 }
@@ -53,12 +78,12 @@ export function getCachedExecutionAta(
   const key = `${connection.rpcEndpoint}:${wallet.toBase58()}:${mint}`;
   const cached = ataCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
-  const pending = inspectAssociatedTokenAccount(
+  const pending = observePreflight(inspectAssociatedTokenAccount(
     connection, wallet, new PublicKey(mint), TOKEN_PROGRAM_ID, profiler,
   ).catch((error) => {
     ataCache.delete(key);
     throw error;
-  });
+  }));
   ataCache.set(key, { expiresAt: Date.now() + ATA_TTL_MS, value: pending });
   return pending;
 }
@@ -101,21 +126,21 @@ export async function preloadExecutionPreflight(
     })();
     missingMints.forEach((mint, index) => {
       const key = `${endpoint}:${mint}`;
-      const value = batch.then(({ mintValues }) =>
-        analyzeParsedTokenMint(mint, mintValues[index] ?? null));
+      const value = observePreflight(batch.then(({ mintValues }) =>
+        analyzeParsedTokenMint(mint, mintValues[index] ?? null)));
       void value.catch(() => mintCache.delete(key));
       mintCache.set(key, value);
     });
     missingAtas.forEach((mint, index) => {
       const key = `${endpoint}:${wallet.toBase58()}:${mint}`;
-      const value = batch.then(({ ataValues, rentLamports }) =>
+      const value = observePreflight(batch.then(({ ataValues, rentLamports }) =>
         inspectParsedAssociatedTokenAccount(
           ataValues[index] ?? null,
           wallet,
           new PublicKey(mint),
           TOKEN_PROGRAM_ID,
           rentLamports,
-        ));
+        )));
       void value.catch(() => ataCache.delete(key));
       ataCache.set(key, {
         expiresAt: Date.now() + ATA_TTL_MS,
