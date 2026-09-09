@@ -46,9 +46,10 @@ export class ScannerFairService {
 /** Three eligible turns then one observation turn, with independent round-robin cursors. */
 export class LiveSizeCadence {
   private turn = 0; private eligibleCursor = 0; private observationCursor = 0;
-  next(sizes: readonly number[], cap: number, utility?: (size: number) => number): number | undefined {
+  next(sizes: readonly number[], cap: number, utility?: (size: number) => number, pressure = false): number | undefined {
     const eligible = sizes.filter((n) => n <= cap), observations = sizes.filter((n) => n > cap);
-    const observe = !eligible.length || (!!observations.length && this.turn++ % 4 === 3);
+    const cadence = pressure ? Math.max(12,eligible.length*4) : Math.max(4,eligible.length*2+2);
+    const observe = !eligible.length || (!!observations.length && this.turn++ % cadence === cadence-1);
     const group = observe ? observations : eligible;
     const cursor = observe ? this.observationCursor++ : this.eligibleCursor++;
     // Half the slots remain unconditional round-robin exploration. Utility is bounded/advisory.

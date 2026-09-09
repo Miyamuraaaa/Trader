@@ -27,6 +27,8 @@ export type OpportunityScope =
   | 'DISCOVERY_ONLY_TOKEN_2022';
 
 export interface RoundTripResult {
+  previousSignalId?: string;
+  refreshIdentity?: string;
   diagnosticSignalId?: string;
   buyQuote: Quote;
   sellQuote: Quote;

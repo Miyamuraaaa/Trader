@@ -43,6 +43,7 @@ const { getScanCycles } = await import('./token-universe.js');
 const { toAtomic } = await import('./math.js');
 const { db } = await import('./db.js');
 const { scannerHistoryBuffer } = await import('./scanner-history-buffer.js');
+const { executablePairCoordinator } = await import('./executable-pair-coordinator.js');
 const { writeAtomicJson } = await import('./persistence/atomic-json-file.js');
 const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx'), fileURLToPath(new URL('./production-soak-child.ts', import.meta.url))],
   { cwd: sandbox, env: process.env, stdio: ['ignore','ignore','ignore','ipc'], windowsHide: true });
@@ -72,7 +73,7 @@ const samples: Array<ReturnType<typeof snapshot>> = [];
 const snapshot = () => ({ elapsedMs: performance.now() - start, executorReady, executorExit, scannerFailed, p0Deliveries,
   scanner: scanner.scannerOperationalMetrics(), stages: scannerStageProfile(), funnel: executionFunnel.snapshot(), workflows: workflowProjectionSnapshot(),
   jupiter: { work: jupiterWorkMetrics.snapshot(), admission: jupiterAdmission.snapshot() }, raptor: { work: raptorWorkMetrics.snapshot(), admission: raptorAdmission.snapshot() },
-  rpc: scannerRpcLimiter.snapshot(), dispatch: dispatchDiagnostics(), scannerHistory: scannerHistoryBuffer.snapshot(), sizes: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps) });
+  pairs:executablePairCoordinator.snapshot(), rpc: scannerRpcLimiter.snapshot(), dispatch: dispatchDiagnostics(), scannerHistory: scannerHistoryBuffer.snapshot(), sizes: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps) });
 const outputPath = join(workspace, 'data', `production-soak-${Date.now()}.json`);
 const safeJson = (value: unknown) => JSON.stringify(value, (_key, item: unknown) => typeof item === 'string' && /https?:\/\/|api[_-]?key=|bearer\s/i.test(item) ? '[REDACTED_ENDPOINT_OR_CREDENTIAL]' : item, 2);
 let stopping = false;

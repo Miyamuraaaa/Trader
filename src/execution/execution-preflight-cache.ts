@@ -20,6 +20,13 @@ const ATA_TTL_MS = 300_000;
 const mintCache = new BoundedAdvisoryCache<string, Promise<TokenProgramAnalysis>>('RPC mint policy', 60_000);
 const ataCache = new BoundedAdvisoryCache<string, { expiresAt: number; value: Promise<TokenAccountPreflight> }>('RPC ATA metadata', ATA_TTL_MS);
 export function executionPreflightCacheHealth() { return { mints: mintCache.snapshot(), atas: ataCache.snapshot() }; }
+/** Read-only cache lookup: never starts RPC, and preserves both existing TTLs. */
+export function peekExecutionPreflight(connection: Connection, wallet: PublicKey, mint: string): Promise<[TokenProgramAnalysis, TokenAccountPreflight]> | undefined {
+  const analysis = mintCache.get(`${connection.rpcEndpoint}:${mint}`);
+  const ata = ataCache.get(`${connection.rpcEndpoint}:${wallet.toBase58()}:${mint}`);
+  if (!analysis || !ata || ata.expiresAt <= Date.now()) return undefined;
+  return Promise.all([analysis, ata.value]);
+}
 
 export function getCachedExecutionMintAnalysis(
   connection: Connection,

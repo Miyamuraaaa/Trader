@@ -1,10 +1,11 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { performance } from 'node:perf_hooks';
+import { providerFailureReason } from '../provider-failure.js';
 import { jupiterAdmission } from '../jupiter.js';
 import { raptorAdmission } from '../raptor.js';
 import { workflowParentDeadline, projectWorkflow, recordWorkflowProjection } from './prefilter-workflow.js';
 import { getProviderQuote } from '../aggregators/index.js';
-import { isFullFillQuote, type Quote, type QuoteProviderName } from '../aggregators/types.js';
+import { isFullFillQuote, type Quote, type QuoteProviderName, type QuoteParams } from '../aggregators/types.js';
 import { CONFIG, DECIMALS, LAMPORTS_PER_SOL, MINTS } from '../config.js';
 import { fromAtomic, toAtomic } from '../math.js';
 import { calculateEstimatedRoundTripProfit, type EstimatedCostInput } from '../profit.js';
@@ -20,6 +21,7 @@ import {
   getCachedExecutionAta,
   getCachedExecutionMintAnalysis,
   preloadExecutionPreflight,
+  peekExecutionPreflight,
 } from './execution-preflight-cache.js';
 import {
   executableQuoteConstraints,
@@ -95,6 +97,9 @@ function scannerExecutionCosts(
 export async function prewarmScannerExecutionMints(mints: readonly string[]): Promise<void> {
   const walletAddress = CONFIG.botWalletAddress;
   if (!walletAddress || mints.length === 0) return;
+  const wallet = new PublicKey(walletAddress);
+  const cached = [MINTS.USDC,...mints].map((mint)=>peekExecutionPreflight(scannerPolicyConnection,wallet,mint));
+  if(cached.every((entry)=>entry!==undefined)){await Promise.all(cached);return;}
   await runScannerRpc(
     'scanner.prefilter.prewarmExecutionMints',
     () => preloadExecutionPreflight(
@@ -102,11 +107,11 @@ export async function prewarmScannerExecutionMints(mints: readonly string[]): Pr
       new PublicKey(walletAddress),
       [MINTS.USDC, ...mints],
     ),
-    'LOW',
+    'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT',
   );
 }
 
-export async function classifyIntermediate(mint: string): Promise<{
+export async function classifyIntermediate(mint: string, priority: import('../scanner-rpc-limiter.js').ScannerRpcPriority = 'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT'): Promise<{
   status: 'SUPPORTED' | 'TOKEN_2022' | 'REJECTED';
   rentLamports: number;
   reason?: string;
@@ -115,14 +120,14 @@ export async function classifyIntermediate(mint: string): Promise<{
     status: 'REJECTED', rentLamports: 0, reason: 'BOT_WALLET_ADDRESS is required for executable prefiltering',
   };
   const wallet = new PublicKey(CONFIG.botWalletAddress);
-  const [analysis, ata] = await runScannerRpc(
+  const [analysis, ata] = await (peekExecutionPreflight(scannerPolicyConnection, wallet, mint) ?? runScannerRpc(
     `scanner.prefilter.tokenPolicy.${mint}`,
     () => Promise.all([
       getCachedExecutionMintAnalysis(scannerPolicyConnection, mint),
       getCachedExecutionAta(scannerPolicyConnection, wallet, mint),
     ]),
-    'HIGH',
-  );
+    priority,
+  ));
   if (analysis.programId === TOKEN_2022_PROGRAM_ID.toBase58()) {
     return { status: 'TOKEN_2022', rentLamports: ata.creationRentLamports };
   }
@@ -145,7 +150,7 @@ async function constrainedQuote(
   inputMint: string,
   outputMint: string,
   amountAtomic: string,
-  scheduling?: { deadlineMono: number; traceId?: string },
+  scheduling?: QuoteParams['scheduling'],
   shadow = false,
 ): Promise<Quote> {
   const quote = await getProviderQuote(provider, {
@@ -193,6 +198,7 @@ export async function buildExecutableCandidateFromRaw(
     return { ...result, trace };
   };
   let releaseDownstream: (() => void) | undefined;
+  let downstreamClaim: import('../provider-entitlement.js').EntitlementClaim | undefined;
   const result = await (async (): Promise<ExecutablePrefilterResult> => {
   // Defense in depth for quote-only callers outside scanner admission; no network work above cap.
   if (options.diagnosticCapability !== SHADOW_CAP_DIAGNOSTIC && BigInt(raw.buyQuote.inAmount) > BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC))) return { status: 'ABOVE_LIVE_CAP' };
@@ -211,7 +217,7 @@ export async function buildExecutableCandidateFromRaw(
   let parentDeadline: number;
   try { parentDeadline = workflowParentDeadline(performance.now(), now(), trace.rawQuoteEvidenceAt, windowMs); }
   catch { return { status: 'PREFILTER_STALE', reason: 'INVALID_OR_FUTURE_MARKET_EVIDENCE' }; }
-  const scheduling = { deadlineMono: parentDeadline, traceId: options.traceId };
+  const scheduling: NonNullable<QuoteParams['scheduling']> = { deadlineMono: parentDeadline, traceId: options.traceId };
   const admission = (provider: QuoteProviderName) => provider === 'jupiter' ? jupiterAdmission : provider === 'raptor' ? raptorAdmission : undefined;
   const firstGovernor = admission(buyProvider), secondGovernor = admission(sellProvider);
   // Reserve 20ms for local policy/economics and 25ms for P0 delivery, never extra freshness.
@@ -224,19 +230,23 @@ export async function buildExecutableCandidateFromRaw(
     if (!projected.feasible) return { status: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED', reason: projected.cause };
     scheduling.deadlineMono = projected.leg1Deadline;
     if (options.diagnosticCapability !== SHADOW_CAP_DIAGNOSTIC) {
-      try { releaseDownstream = secondGovernor.reserveWorkflow(projected.leg2Deadline, first.predictedCompletionMono, second.serviceMs); }
+      try {
+        downstreamClaim = secondGovernor.reserveOwnedWorkflow(projected.leg2Deadline,first.predictedCompletionMono,second.serviceMs,options.traceId??raw.buyQuote.id,
+          {inputMint:raw.buyQuote.outputMint,outputMint:MINTS.USDC,amountAtomic:'UNBOUND',slippageBps:CONFIG.slippageBps,priority:'EXEC_PREFILTER_HIGH',...executableQuoteConstraints(sellProvider)});
+        releaseDownstream=()=>secondGovernor.releaseOwnedWorkflow(downstreamClaim!);
+      }
       catch { return { status: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED', reason: 'DOWNSTREAM_RESERVATION_UNAVAILABLE' }; }
     }
   }
   const [policyResult, buyResult] = await Promise.allSettled([
-    timed('tokenPolicy', () => (options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint)),
+    timed('tokenPolicy', () => (options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint,'RPC_P0_EXECUTION_CRITICAL')),
     timed('constrainedLeg1', () => quote(buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount, scheduling)),
   ]);
   let tokenPolicy: Awaited<ReturnType<typeof classifyIntermediate>>;
   try { if (policyResult.status === 'rejected') throw policyResult.reason; tokenPolicy = policyResult.value; }
   catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    return { status: /429|backpressure|cooldown|capacity|rate.?limit/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : 'QUOTE_FAILED', reason };
+    return { status: /429|backpressure|cooldown|capacity|rate.?limit/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : 'QUOTE_FAILED', reason: 'TOKEN_POLICY:' + providerFailureReason(error) };
   }
   if (tokenPolicy.status === 'TOKEN_2022') return { status: 'DISCOVERY_ONLY_TOKEN_2022' };
   if (tokenPolicy.status !== 'SUPPORTED') return { status: 'TOKEN_POLICY_REJECTED', reason: tokenPolicy.reason };
@@ -257,7 +267,7 @@ export async function buildExecutableCandidateFromRaw(
     }
     // The executor's second instruction consumes the first instruction's
     // enforceable minimum. This is deliberately not the optimistic outAmount.
-    releaseDownstream?.();
+    scheduling.entitlement=downstreamClaim;
     const sell = await timed('constrainedLeg2', () => quote(
       sellProvider, raw.buyQuote.outputMint, MINTS.USDC, buy.otherAmountThreshold, scheduling,
     ));
@@ -312,7 +322,7 @@ export async function buildExecutableCandidateFromRaw(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);
-    return { status: /QUEUE_DEADLINE|QUEUE_CANCELLED/.test(reason) ? 'PREFILTER_QUEUE_DEADLINE_EXCEEDED' : /QUOTE_RESULT_STALE/.test(reason) ? 'PREFILTER_STALE' : /429|backpressure|cooldown|capacity|rate.?limit|OVERFLOW/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason };
+    return { status: /QUEUE_DEADLINE|QUEUE_CANCELLED/.test(reason) ? 'PREFILTER_QUEUE_DEADLINE_EXCEEDED' : /QUOTE_RESULT_STALE/.test(reason) ? 'PREFILTER_STALE' : /429|backpressure|cooldown|capacity|rate.?limit|OVERFLOW/i.test(reason) ? 'PREFILTER_RATE_LIMITED' : policy ? 'ROUTE_POLICY_REJECTED' : 'QUOTE_FAILED', reason: providerFailureReason(error) };
   }
   })().finally(() => releaseDownstream?.());
   return finish(result);

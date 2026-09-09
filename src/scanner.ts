@@ -5,6 +5,8 @@ import { LiveSizeCadence } from './scanner-service-policy.js';
 import { scannerSizeDiagnostics } from './scanner-size-diagnostics.js';
 import { executableSurfaceProvider } from './scanner-executable-plane.js';
 import { scannerHistoryBuffer } from './scanner-history-buffer.js';
+import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
+import { executablePairCoordinator } from './executable-pair-coordinator.js';
 let executableSurfaceTurn = 0;
 import { profileScannerStage, startScannerStage } from './scanner-stage-profile.js';
 const liveSizeCadence = new LiveSizeCadence();
@@ -130,7 +132,8 @@ function nextTradeSizes(): number[] {
   const sizes = CONFIG.tradeSizesUsdc;
   if (sizes.length === 0) return [];
   const count = Math.max(1, Math.min(CONFIG.tradeSizesPerScan, sizes.length));
-  if (CONFIG.executionMode === 'live') return [...new Set(Array.from({ length: count }, () => liveSizeCadence.next(sizes, CONFIG.firstLiveMaxInputUsdc, (size) => scannerSizeDiagnostics.utility(size))!))];
+  if (CONFIG.executionMode === 'live') return [...new Set(Array.from({ length: count }, () => liveSizeCadence.next(sizes, CONFIG.firstLiveMaxInputUsdc,
+    (size) => scannerSizeDiagnostics.utility(size)+(size===0.5?0.05:0), scannerRpcLimiter.isCoolingDown())!))];
   const selected = Array.from(
     { length: count },
     (_, offset) => sizes[(tradeSizeCursor + offset) % sizes.length]!,
@@ -382,12 +385,12 @@ function registerRawPositive(raw: RoundTripResult): PrefilterTrace {
   const trace: PrefilterTrace = { rawPositiveDetectedAt: now, rawQuoteEvidenceAt: Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp),
     rawQuoteAgeAtDetectionMs: Math.max(0, now - Math.min(raw.buyQuote.responseTimestamp, raw.sellQuote.responseTimestamp)), executablePrefilterQueuedAt: now };
   if (!raw.diagnosticSignalId) {
-    raw.diagnosticSignalId = `${raw.buyQuote.id}:${raw.sellQuote.id}`;
+    raw.diagnosticSignalId = raw.refreshIdentity??`${raw.buyQuote.id}:${raw.sellQuote.id}`;
     scannerStats.executionPrefilter.rawPositiveOpportunities++;
     scannerSizeDiagnostics.record(Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC)), 'raw_positives');
     executionFunnel.record({ identity: raw.diagnosticSignalId, stage: 'RAW_POSITIVE', at: now, detectedAt: now });
     executionFunnel.raw.register(raw.diagnosticSignalId, trace);
-    executionFunnel.signal({ id: raw.diagnosticSignalId, detectedAt: now, providers: `${raw.buyQuote.provider}->${raw.sellQuote.provider}`,
+    executionFunnel.signal({ id: raw.diagnosticSignalId, previousSignalId:raw.previousSignalId, detectedAt: now, providers: `${raw.buyQuote.provider}->${raw.sellQuote.provider}`,
       intermediateMint: raw.buyQuote.outputMint, inputAmount: raw.buyQuote.inAmount, rawNet: raw.profit.estimatedNetProfitUsdc.toFixed(6), rawWorstCase: raw.profit.worstCaseNetProfitUsdc.toFixed(6),
       pools: [raw.buyQuote.poolIds, raw.sellQuote.poolIds], prefilterTrace: trace, p0Handoff: false });
   }
@@ -419,6 +422,9 @@ async function findExecutableCandidates(
         return buildExecutableCandidateFromRaw(raw, costs, { trace, traceId: signalId });
       }, (status) => ({ status, trace }));
     executionFunnel.raw.finish(signalId, result.status, result.trace);
+    if(result.status==='PREFILTER_QUEUE_DEADLINE_EXCEEDED'&&!raw.previousSignalId){
+      void executablePairCoordinator.refresh(raw,costs).then((fresh)=>fresh?findExecutableCandidates([fresh],costs):undefined).catch(()=>{});
+    }
     // Above-cap diagnostics use P2 only, at most one attempt/minute and never return a handoff route.
     if (result.status === 'ABOVE_LIVE_CAP' && !shadowBusy && performance.now() - lastShadowAt >= 60000
       && prefilterCoalescer.activeRoutes === 0 && isExecutableProviderPair(raw.buyQuote.provider, raw.sellQuote.provider)
@@ -443,7 +449,7 @@ async function findExecutableCandidates(
       }
     }
     log.info('RAW_POSITIVE_PREFILTER', { correlationId: signalId, ...trace, result: result.status });
-    executionFunnel.update(signalId, { prefilterResult: result.status,
+    executionFunnel.update(signalId, { prefilterResult: result.status, prefilterReason: result.reason,
       prefilterTrace: result.trace, constrainedNet: result.route?.profit.estimatedNetProfitUsdc.toFixed(6), constrainedWorstCase: result.route?.profit.worstCaseNetProfitUsdc.toFixed(6),
       networkFee: String(costs.estimatedNetworkCostsUsdc.baseNetworkFeeUsdc), priorityFee: String(costs.estimatedNetworkCostsUsdc.priorityFeeUsdc),
       ataRent: result.estimatedAtaRentUsdc === undefined ? undefined : String(result.estimatedAtaRentUsdc),
@@ -874,7 +880,7 @@ export async function scanOnce(
         scanMode,
         referencePrice: String(referenceSolPriceUsdc),
       };
-      if (CONFIG.executionMode === 'live') scannerHistoryBuffer.enqueue(() => insertScan(scanRow));
+      if (CONFIG.executionMode === 'live') scannerHistoryBuffer.enqueueScan(scanRow);
       else insertScan(scanRow);
 
       const buyAmount = toAtomic(tradeSizeUsdc, DECIMALS.USDC);
@@ -907,7 +913,7 @@ export async function scanOnce(
         recordProviderQuoteResults(results);
         for (const quote of successfulQuotes(results).filter(isFullFillQuote)) {
           const write = () => insertQuote(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`));
-          if (CONFIG.executionMode === 'live') scannerHistoryBuffer.enqueue(write); else write();
+          if (CONFIG.executionMode === 'live') scannerHistoryBuffer.enqueueQuote(quoteToRow(quote,scanRowId,`BUY_${quote.provider.toUpperCase()}`)); else write();
         }
         return results;
         } finally { finished(); }

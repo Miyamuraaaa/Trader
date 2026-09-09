@@ -7,6 +7,8 @@ export const FunnelTelemetry = z.object({ identity: z.string().max(200), stage: 
   at: z.number().finite(), detectedAt: z.number().finite(), reason: z.string().max(100).optional(), conservativeNetAtomic: z.string().regex(/^-?\d+$/).optional() }).strict();
 export type FunnelEvent = z.infer<typeof FunnelTelemetry>;
 export interface PositiveSignal {
+  previousSignalId?: string;
+  prefilterReason?: string;
   prefilterTrace?: PrefilterTrace;
   liveEligibility?: string;
   id: string; detectedAt: number; providers: string; intermediateMint: string; inputAmount: string;

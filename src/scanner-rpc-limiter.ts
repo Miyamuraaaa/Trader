@@ -2,7 +2,8 @@ import { log } from './logger.js';
 import { RollingWorkMetrics } from './work-metrics.js';
 import { SCANNER_RPC_CONFIG } from './config.js';
 
-export type ScannerRpcPriority = 'HIGH' | 'LOW';
+export type ScannerRpcPriority = 'HIGH' | 'LOW' | 'RPC_P0_EXECUTION_CRITICAL' | 'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT' | 'RPC_P2_BROAD_DISCOVERY';
+const rpcClass = (priority:ScannerRpcPriority) => priority === 'RPC_P0_EXECUTION_CRITICAL' ? 'P0' : priority === 'HIGH' || priority === 'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT' ? 'P1' : 'P2';
 
 export class ScannerRpcBackpressureError extends Error {
   readonly code = 'SCANNER_RPC_BACKPRESSURE';
@@ -27,6 +28,7 @@ export interface ScannerRpcLimiterOptions {
 }
 
 export interface ScannerRpcLimiterSnapshot {
+  classes: Record<string,Record<string,number>>;
   sources: Record<string, ReturnType<RollingWorkMetrics['snapshot']>>;
   work: ReturnType<RollingWorkMetrics['snapshot']>;
   rejectedQueuedByBackpressure: number;
@@ -55,7 +57,7 @@ interface QueueEntry<T> {
 
 function isRateLimit(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /\b429\b|too many requests|rate.?limit/i.test(message);
+  return (error as {status?:number})?.status===429 || /\b429\b|too many requests/i.test(message);
 }
 
 /**
@@ -73,6 +75,8 @@ function isRateLimit(error: unknown): boolean {
  * restores shared concurrency gradually.
  */
 export class ScannerRpcLimiter {
+  private classCounts: Record<string,Record<string,number>> = {};
+  private countClass(priority:ScannerRpcPriority,event:string) { const counts=this.classCounts[rpcClass(priority)]??={};counts[event]=(counts[event]??0)+1; }
   private sourceMetrics = new Map<string, RollingWorkMetrics>();
   private workMetrics = new RollingWorkMetrics();
   private rejectedQueuedByBackpressure = 0;
@@ -107,6 +111,7 @@ export class ScannerRpcLimiter {
   run<T>(label: string, task: () => Promise<T>, priority: ScannerRpcPriority = 'LOW'): Promise<T> {
     const cooldownRemainingMs = this.cooldownRemainingMs();
     if (cooldownRemainingMs > 0) {
+      this.countClass(priority,'cooldownSkipped');
       this.skippedDuringCooldown++;
       return Promise.reject(new ScannerRpcBackpressureError(cooldownRemainingMs));
     }
@@ -124,7 +129,8 @@ export class ScannerRpcLimiter {
       } as QueueEntry<unknown>);
       this.workMetrics.observeQueue(this.queue.length);
       this.queue.sort((a, b) => {
-        const priorityDelta = (b.priority === 'HIGH' ? 1 : 0) - (a.priority === 'HIGH' ? 1 : 0);
+        const rank = (priority:ScannerRpcPriority) => rpcClass(priority)==='P0'?2:rpcClass(priority)==='P1'?1:0;
+        const priorityDelta = rank(b.priority)-rank(a.priority);
         return priorityDelta !== 0 ? priorityDelta : a.sequence - b.sequence;
       });
       this.drain();
@@ -137,6 +143,7 @@ export class ScannerRpcLimiter {
 
   snapshot(): ScannerRpcLimiterSnapshot {
     return {
+      classes:structuredClone(this.classCounts),
       sources: Object.fromEntries([...this.sourceMetrics].map(([source, metric]) => [source, metric.snapshot()])),
       work: this.workMetrics.snapshot(), rejectedQueuedByBackpressure: this.rejectedQueuedByBackpressure,
       skippedDuringCooldown: this.skippedDuringCooldown, totalCooldowns: this.rateLimits429,
@@ -177,6 +184,7 @@ export class ScannerRpcLimiter {
     }
 
     const next = this.queue.shift()!;
+    this.countClass(next.priority,'dispatched');
     const finish = this.workMetrics.start(next.queuedAt);
     // Fixed source vocabulary prevents dynamic mint/URL labels leaking into the API or growing the map.
     const source = /orca/i.test(next.label) ? 'orca' : /meteora/i.test(next.label) ? 'meteora'
@@ -195,6 +203,7 @@ export class ScannerRpcLimiter {
         this.onSuccess(next.label);
         next.resolve(value);
       }, (error) => {
+        this.countClass(next.priority,'failed');if(isRateLimit(error))this.countClass(next.priority,'http429');
         finish(false, isRateLimit(error));
         finishSource(false, isRateLimit(error));
         this.onFailure(next.label, error);
@@ -219,10 +228,11 @@ export class ScannerRpcLimiter {
     this.healthySince429 = 0;
     this.effectiveConcurrency = 1;
     this.cooldownLevel = Math.min(this.cooldownLevel + 1, 8);
-    const cooldownMs = Math.min(
+    const retryAfter=Number((error as {retryAfterMs?:number})?.retryAfterMs);
+    const cooldownMs = Math.max(Number.isFinite(retryAfter)&&retryAfter>0?retryAfter:0,Math.min(
       this.options.maxCooldownMs,
       this.options.baseCooldownMs * 2 ** Math.max(0, this.cooldownLevel - 1),
-    );
+    ));
     this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + cooldownMs);
     const queued = this.queue.length;
     this.rejectQueuedForBackpressure(cooldownMs);
@@ -242,7 +252,7 @@ export class ScannerRpcLimiter {
     if (this.queue.length === 0) return;
     const error = new ScannerRpcBackpressureError(cooldownRemainingMs);
     this.rejectedQueuedByBackpressure += this.queue.length;
-    for (const queued of this.queue.splice(0)) queued.reject(error);
+    for (const queued of this.queue.splice(0)) { this.countClass(queued.priority,'queuedCooldownRejected');queued.reject(error); }
   }
 
   private onSuccess(label: string): void {
