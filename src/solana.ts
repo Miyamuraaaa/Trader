@@ -1,4 +1,4 @@
-import { createSolanaRpc, mainnet } from '@solana/kit';
+import { scannerConnection,scannerKitRpc } from './scanner-rpc-transport.js';
 import { Connection, PublicKey } from '@solana/web3.js';
 import {
   CONFIG,
@@ -19,7 +19,7 @@ import { runScannerRpc } from './scanner-rpc-limiter.js';
  * does not use this module-level limiter.
  */
 
-const solanaRpcs = CONFIG.rpcUrls.map((url) => createSolanaRpc(mainnet(url)));
+const solanaRpcs = CONFIG.rpcUrls.map((url) => scannerKitRpc(url));
 let activeRpcIndex = 0;
 export let solanaRpc = solanaRpcs[0]!;
 
@@ -64,7 +64,7 @@ export async function verifyCanonicalTokenMints(): Promise<void> {
     { symbol: 'SOL/WSOL', mint: CONFIG.scanTokens.includes('SOL') ? MINTS.SOL : '', decimals: DECIMALS.SOL },
     { symbol: 'USDT', mint: CONFIG.scanTokens.includes('USDT') ? MINTS.USDT : '', decimals: DECIMALS.USDT },
   ].filter((token) => token.mint !== '');
-  const connection = new Connection(rpcMetrics.activeEndpoint, {
+  const connection = scannerConnection(rpcMetrics.activeEndpoint, {
     commitment: 'confirmed',
     disableRetryOnRateLimit: true,
   });

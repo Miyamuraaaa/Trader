@@ -1,6 +1,12 @@
 import { log } from './logger.js';
 import { RollingWorkMetrics } from './work-metrics.js';
 import { SCANNER_RPC_CONFIG } from './config.js';
+import { performance } from 'node:perf_hooks';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+export interface RpcTaskContext { label:string; priority:ScannerRpcPriority; deadlineMono?:number; traceId?:string; liveDependency?:boolean }
+export const scannerRpcContext=new AsyncLocalStorage<RpcTaskContext>();
+export interface RpcAdmissionOptions { deadlineMono?:number; serviceMs?:number; liveDependency?:boolean; signal?:AbortSignal; onDispatch?:(timing:Record<string,number>)=>void }
 
 export type ScannerRpcPriority = 'HIGH' | 'LOW' | 'RPC_P0_EXECUTION_CRITICAL' | 'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT' | 'RPC_P2_BROAD_DISCOVERY';
 const rpcClass = (priority:ScannerRpcPriority) => priority === 'RPC_P0_EXECUTION_CRITICAL' ? 'P0' : priority === 'HIGH' || priority === 'RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT' ? 'P1' : 'P2';
@@ -46,6 +52,10 @@ export interface ScannerRpcLimiterSnapshot {
 }
 
 interface QueueEntry<T> {
+  options:RpcAdmissionOptions;
+  waitSince:number;
+  waitKind:string;
+  waits:Record<string,number>;
   queuedAt: number;
   label: string;
   priority: ScannerRpcPriority;
@@ -85,7 +95,7 @@ export class ScannerRpcLimiter {
   private active = 0;
   private effectiveConcurrency: number;
   private timer: ReturnType<typeof setTimeout> | undefined;
-  private lastStartAt = 0;
+  private lastStartAt = -Infinity;
   private cooldownUntil = 0;
   private cooldownLevel = 0;
   private healthySince429 = 0;
@@ -94,6 +104,7 @@ export class ScannerRpcLimiter {
   private successfulTasks = 0;
   private failedTasks = 0;
   private last429At: number | null = null;
+  private p0Run=0;
 
   constructor(private readonly options: ScannerRpcLimiterOptions) {
     if (!Number.isInteger(options.maxConcurrency) || options.maxConcurrency < 1) {
@@ -108,30 +119,35 @@ export class ScannerRpcLimiter {
     this.effectiveConcurrency = options.maxConcurrency;
   }
 
-  run<T>(label: string, task: () => Promise<T>, priority: ScannerRpcPriority = 'LOW'): Promise<T> {
+  run<T>(label: string, task: () => Promise<T>, priority: ScannerRpcPriority = 'LOW', options:RpcAdmissionOptions={}): Promise<T> {
     const cooldownRemainingMs = this.cooldownRemainingMs();
-    if (cooldownRemainingMs > 0) {
+    const usefulAfterCooldown=priority!=='LOW'&&priority!=='RPC_P2_BROAD_DISCOVERY'&&Number.isFinite(options.deadlineMono)&&performance.now()+cooldownRemainingMs+(options.serviceMs??0)<options.deadlineMono!;
+    if (cooldownRemainingMs > 0&&!usefulAfterCooldown) {
       this.countClass(priority,'cooldownSkipped');
       this.skippedDuringCooldown++;
       return Promise.reject(new ScannerRpcBackpressureError(cooldownRemainingMs));
     }
+    if(performance.now()+Math.max(0,this.lastStartAt+this.options.minIntervalMs-performance.now())+(options.serviceMs??0)>(options.deadlineMono??Infinity))return Promise.reject(new Error('INTERNAL_PACING_DEADLINE'));
 
     return new Promise<T>((resolve, reject) => {
       if (this.queue.length >= 128) { reject(new Error('Scanner RPC bounded queue capacity exceeded')); return; }
-      this.queue.push({
+      const entry={
+        options,waitSince:performance.now(),waitKind:'queue',waits:{queue:0,pacing:0,concurrency:0,cooldown:0},
         queuedAt: Date.now(),
         label,
         priority,
         sequence: this.sequence++,
         task,
-        resolve,
-        reject,
-      } as QueueEntry<unknown>);
+        resolve:(value:unknown)=>{options.signal?.removeEventListener('abort',cancel);resolve(value as T);},
+        reject:(error:unknown)=>{options.signal?.removeEventListener('abort',cancel);reject(error);},
+      } as QueueEntry<unknown>;
+      const cancel=()=>{const index=this.queue.indexOf(entry);if(index>=0){this.queue.splice(index,1);entry.reject(new Error('CANCELLED'));}};
+      this.queue.push(entry);options.signal?.addEventListener('abort',cancel,{once:true});if(options.signal?.aborted){cancel();return;}
       this.workMetrics.observeQueue(this.queue.length);
       this.queue.sort((a, b) => {
         const rank = (priority:ScannerRpcPriority) => rpcClass(priority)==='P0'?2:rpcClass(priority)==='P1'?1:0;
         const priorityDelta = rank(b.priority)-rank(a.priority);
-        return priorityDelta !== 0 ? priorityDelta : a.sequence - b.sequence;
+        return priorityDelta !== 0 ? priorityDelta : Number(b.options.liveDependency??false)-Number(a.options.liveDependency??false)||a.sequence - b.sequence;
       });
       this.drain();
     });
@@ -160,21 +176,28 @@ export class ScannerRpcLimiter {
   }
 
   private cooldownRemainingMs(): number {
-    return Math.max(0, this.cooldownUntil - Date.now());
+    return Math.max(0, this.cooldownUntil - performance.now());
   }
 
+  private markWait(kind:string){const now=performance.now();for(const entry of this.queue){entry.waits[entry.waitKind]=(entry.waits[entry.waitKind]??0)+now-entry.waitSince;entry.waitSince=now;entry.waitKind=kind;}}
+  admissionState(){return {nextLegalSendMono:this.lastStartAt+this.options.minIntervalMs,cooldownUntilMono:this.cooldownUntil,active:this.active,queued:this.queue.length,concurrency:this.effectiveConcurrency,oldestQueueAgeMs:this.queue.length?Date.now()-this.queue[0]!.queuedAt:0};}
+
   private drain(): void {
-    if (this.timer || this.active >= this.effectiveConcurrency || this.queue.length === 0) return;
+    if(this.queue.length===0)return;
+    if(this.active>=this.effectiveConcurrency){this.markWait('concurrency');return;}
+    if(this.timer){this.markWait(this.isCoolingDown()?'cooldown':'pacing');return;}
 
     const cooldownRemainingMs = this.cooldownRemainingMs();
     if (cooldownRemainingMs > 0) {
       this.rejectQueuedForBackpressure(cooldownRemainingMs);
+      if(this.queue.length){this.markWait('cooldown');this.timer=setTimeout(()=>{this.timer=undefined;this.drain();},cooldownRemainingMs);this.timer.unref?.();}
       return;
     }
 
-    const now = Date.now();
+    const now = performance.now();
     const waitMs = Math.max(0, this.options.minIntervalMs - (now - this.lastStartAt));
     if (waitMs > 0) {
+      this.markWait('pacing');
       this.timer = setTimeout(() => {
         this.timer = undefined;
         this.drain();
@@ -183,8 +206,18 @@ export class ScannerRpcLimiter {
       return;
     }
 
-    const next = this.queue.shift()!;
+    this.markWait('queue');
+    let index=0;
+    if(this.p0Run>=4&&rpcClass(this.queue[0]!.priority)==='P0'){
+      const p1=this.queue.findIndex(q=>rpcClass(q.priority)==='P1');
+      const head=this.queue[0]!;
+      if(p1>=0&&now+this.options.minIntervalMs+(this.queue[p1]!.options.serviceMs??0)+(head.options.serviceMs??0)<(head.options.deadlineMono??Infinity))index=p1;
+    }
+    const next = this.queue.splice(index,1)[0]!;
+    if(now+(next.options.serviceMs??0)>(next.options.deadlineMono??Infinity)){next.reject(new Error(next.waits.concurrency!>0?'CONCURRENCY_DEADLINE':'QUEUE_DEADLINE'));this.drain();return;}
+    next.options.onDispatch?.({...next.waits,dispatchMono:now});
     this.countClass(next.priority,'dispatched');
+    this.p0Run=rpcClass(next.priority)==='P0'?this.p0Run+1:0;
     const finish = this.workMetrics.start(next.queuedAt);
     // Fixed source vocabulary prevents dynamic mint/URL labels leaking into the API or growing the map.
     const source = /orca/i.test(next.label) ? 'orca' : /meteora/i.test(next.label) ? 'meteora'
@@ -233,7 +266,7 @@ export class ScannerRpcLimiter {
       this.options.maxCooldownMs,
       this.options.baseCooldownMs * 2 ** Math.max(0, this.cooldownLevel - 1),
     ));
-    this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + cooldownMs);
+    this.cooldownUntil = Math.max(this.cooldownUntil, performance.now() + cooldownMs);
     const queued = this.queue.length;
     this.rejectQueuedForBackpressure(cooldownMs);
     log.warn('Scanner RPC limiter entered adaptive cooldown after rate limit', {
@@ -251,8 +284,10 @@ export class ScannerRpcLimiter {
     }
     if (this.queue.length === 0) return;
     const error = new ScannerRpcBackpressureError(cooldownRemainingMs);
-    this.rejectedQueuedByBackpressure += this.queue.length;
-    for (const queued of this.queue.splice(0)) { this.countClass(queued.priority,'queuedCooldownRejected');queued.reject(error); }
+    for (const queued of this.queue.splice(0)) {
+      if(rpcClass(queued.priority)!=='P2'&&Number.isFinite(queued.options.deadlineMono)&&performance.now()+cooldownRemainingMs+(queued.options.serviceMs??0)<queued.options.deadlineMono!){this.queue.push(queued);continue;}
+      this.rejectedQueuedByBackpressure++;this.countClass(queued.priority,'queuedCooldownRejected');queued.reject(error);
+    }
   }
 
   private onSuccess(label: string): void {
@@ -278,5 +313,6 @@ export function runScannerRpc<T>(
   task: () => Promise<T>,
   priority: ScannerRpcPriority = 'LOW',
 ): Promise<T> {
-  return scannerRpcLimiter.run(label, task, priority);
+  // Logical tasks may issue multiple concurrent SDK reads. Only transports spend HTTP capacity.
+  return scannerRpcContext.run({...scannerRpcContext.getStore(),label,priority},task);
 }

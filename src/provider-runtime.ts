@@ -122,7 +122,7 @@ export class QuoteProviderRuntime {
       try {
         const runTask = () => task();
         const quote = this.provider === 'orca' || this.provider === 'meteora'
-          ? await runScannerRpc(`${this.provider}.quote`, runTask, priority === 'LOW' || priority === 'DISCOVERY_LOW' ? 'LOW' : 'HIGH')
+          ? await runScannerRpc(`${this.provider}.quote`, runTask, this.provider==='meteora'||priority === 'LOW' || priority === 'DISCOVERY_LOW' ? 'LOW' : 'HIGH')
           : await runTask();
         this.counters.successes++;
         finish(true);

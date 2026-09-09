@@ -5,6 +5,7 @@ import { getJupiterJson } from './jupiter.js';
 import { log } from './logger.js';
 import { recordRpcRequests, rpcMetrics } from './solana.js';
 import { runScannerRpc } from './scanner-rpc-limiter.js';
+import { scannerConnection } from './scanner-rpc-transport.js';
 import { MINTS } from './tokens.js';
 
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
@@ -131,7 +132,7 @@ async function fetchCategory(category: 'toptrending' | 'toptraded' | 'toporganic
 
 async function verifyOnChain(candidates: RawDiscoveredToken[]): Promise<RawDiscoveredToken[]> {
   if (candidates.length === 0) return [];
-  const connection = new Connection(rpcMetrics.activeEndpoint, {
+  const connection = scannerConnection(rpcMetrics.activeEndpoint, {
     commitment: 'confirmed',
     disableRetryOnRateLimit: true,
   });

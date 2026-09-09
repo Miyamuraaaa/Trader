@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { performance } from 'node:perf_hooks';
 import {
   ScannerRpcBackpressureError,
   ScannerRpcLimiter,
 } from '../src/scanner-rpc-limiter.js';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-afterEach(() => vi.useRealTimers());
+afterEach(() => {vi.useRealTimers();vi.restoreAllMocks();});
 
 describe('shared scanner RPC limiter', () => {
   it('prioritizes executable-prefilter work ahead of queued discovery work', async () => {
@@ -68,7 +69,7 @@ describe('shared scanner RPC limiter', () => {
 
   it('rejects queued and new scanner work immediately while a 429 cooldown is active', async () => {
     // Deterministic clock: a busy Windows runner must not consume this test's 20ms cooldown.
-    vi.useFakeTimers();
+    vi.useFakeTimers();vi.spyOn(performance,'now').mockImplementation(()=>Date.now());
     const limiter = new ScannerRpcLimiter({
       maxConcurrency: 1,
       minIntervalMs: 0,

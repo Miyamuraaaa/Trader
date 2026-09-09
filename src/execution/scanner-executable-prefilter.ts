@@ -9,7 +9,8 @@ import { isFullFillQuote, type Quote, type QuoteProviderName, type QuoteParams }
 import { CONFIG, DECIMALS, LAMPORTS_PER_SOL, MINTS } from '../config.js';
 import { fromAtomic, toAtomic } from '../math.js';
 import { calculateEstimatedRoundTripProfit, type EstimatedCostInput } from '../profit.js';
-import { runScannerRpc } from '../scanner-rpc-limiter.js';
+import { runScannerRpc,scannerRpcContext } from '../scanner-rpc-limiter.js';
+import { scannerConnection } from '../scanner-rpc-transport.js';
 import {
   categorizeProfit,
   classifyRoute,
@@ -62,7 +63,7 @@ export interface ExecutablePrefilterResult {
 
 // Scanner-side policy reads use the scanner RPC. The isolated executor keeps
 // its own dedicated connection and repeats every execution-authorizing check.
-const scannerPolicyConnection = new Connection(CONFIG.rpcUrl, {
+const scannerPolicyConnection = scannerConnection(CONFIG.rpcUrl, {
   commitment: 'confirmed',
   disableRetryOnRateLimit: true,
 });
@@ -239,7 +240,7 @@ export async function buildExecutableCandidateFromRaw(
     }
   }
   const [policyResult, buyResult] = await Promise.allSettled([
-    timed('tokenPolicy', () => (options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint,'RPC_P0_EXECUTION_CRITICAL')),
+    timed('tokenPolicy', () => scannerRpcContext.run({label:'prefilter.tokenPolicy',priority:'RPC_P0_EXECUTION_CRITICAL',traceId:options.traceId,deadlineMono:scheduling.deadlineMono,liveDependency:true},()=>(options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint,'RPC_P0_EXECUTION_CRITICAL'))),
     timed('constrainedLeg1', () => quote(buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount, scheduling)),
   ]);
   let tokenPolicy: Awaited<ReturnType<typeof classifyIntermediate>>;

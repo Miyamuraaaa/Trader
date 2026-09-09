@@ -1,5 +1,6 @@
 import { Connection, PublicKey, type AccountInfo } from '@solana/web3.js';
 import { CONFIG } from './config.js';
+import { scannerConnection } from './scanner-rpc-transport.js';
 import { log } from './logger.js';
 import { SubscriptionPriorityManager, type SubscriptionPriority } from './subscription-priority.js';
 
@@ -17,7 +18,7 @@ interface CachedDirectAccount {
   receivedAt: number;
 }
 
-const connection = new Connection(CONFIG.rpcUrl, {
+const connection = scannerConnection(CONFIG.rpcUrl, {
   commitment: 'confirmed',
   disableRetryOnRateLimit: true,
   ...(CONFIG.scannerWsUrl ? { wsEndpoint: CONFIG.scannerWsUrl } : {}),

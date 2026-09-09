@@ -16,6 +16,7 @@ import {
   type QuoteProvider,
 } from './aggregators/types.js';
 import { watchDirectMarketAccounts } from './direct-market-stream.js';
+import { scannerConnection } from './scanner-rpc-transport.js';
 
 // @meteora-ag/dlmm 1.9.14 publishes both ESM and CommonJS. Its ESM build uses
 // a named BN import that Node 22 cannot resolve from Anchor's CommonJS export.
@@ -63,7 +64,7 @@ const MeteoraPoolSchema = z.object({
 
 const MeteoraPoolsResponseSchema = z.object({ data: z.array(MeteoraPoolSchema) });
 
-const connection = new Connection(CONFIG.rpcUrl, {
+const connection = scannerConnection(CONFIG.rpcUrl, {
   commitment: 'confirmed',
   // The SDK's default web3.js behavior retries 429s internally several times,
   // outside our provider scheduler. Disable that hidden retry layer so the

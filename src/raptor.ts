@@ -2,8 +2,13 @@ import crypto from 'crypto';
 import { performance } from 'node:perf_hooks';
 import { dispatchDrift } from './dispatch-diagnostics.js';
 import { QuoteAdmission, semanticQuoteKey, type QuoteDeadline } from './quote-admission.js';
+import { providerFailureReason } from './provider-failure.js';
 import { ScannerFairService } from './scanner-service-policy.js';
 const fairService = new ScannerFairService();
+const legalEvents:Array<Record<string,unknown>>=[];
+const legalCounts:Record<string,number>={};
+const legalEvent=(event:Record<string,unknown>)=>{legalEvents.push({atMono:performance.now(),...event});if(legalEvents.length>1024)legalEvents.shift();};
+export function raptorLegalSendSnapshot(){return {counts:{...legalCounts},events:[...legalEvents]};}
 import { z } from 'zod';
 import { CONFIG } from './config.js';
 import { getJson, HttpError } from './http.js';
@@ -87,7 +92,8 @@ function cacheKey(params: QuoteParams): string {
   return semanticQuoteKey('raptor', params);
 }
 
-async function paceRequest(): Promise<void> {
+async function paceRequest(): Promise<{pacingThisTurnMs:number;cooldownThisTurnMs:number}> {
+  const start=performance.now();
   const waitForBackoff = Math.max(0, backoffUntil - Date.now());
   const waitForInterval = Math.max(
     0,
@@ -99,6 +105,7 @@ async function paceRequest(): Promise<void> {
     const expected = performance.now() + waitMs;
     await sleep(waitMs); dispatchDrift('raptor', expected);
   }
+  return {pacingThisTurnMs:waitForBackoff>=waitForInterval?0:performance.now()-start,cooldownThisTurnMs:waitForBackoff>=waitForInterval?performance.now()-start:0};
 }
 
 function enqueue(task: () => Promise<Quote>, priority: QuoteParams['priority'], deadline: QuoteDeadline): Promise<Quote> {
@@ -118,22 +125,28 @@ async function processQueue(): Promise<void> {
   isProcessingQueue = true;
   try {
     while (queue.length > 0) {
-      await paceRequest();
+      const waits=await paceRequest();
       const reservedDelay = raptorAdmission.discoveryReservationDelayMs();
       if (reservedDelay > 0 && !queue.some((request) => request.priority === 'EXEC_PREFILTER_HIGH')) {
+        legalCounts.protectedBorrowDenied=(legalCounts.protectedBorrowDenied??0)+1;
+        legalEvent({capacity:'deferred',reason:'OWNED_ENTITLEMENT_PROTECTED',queueDepth:queue.length});
         await sleep(reservedDelay); continue;
       }
       const request = raptorAdmission.takeClaimed(queue,request=>request.deadline) ?? fairService.take(queue, (request) => request.priority, (request) => request.deadline.deadlineMono);
       if (!request) continue;
       raptorStats.throttleState = 'ACTIVE';
       let finish: ReturnType<typeof raptorWorkMetrics.start> | undefined;
+      const cls=request.priority==='EXEC_PREFILTER_HIGH'?'P0':request.priority==='HIGH'||request.priority==='DISCOVERY_HIGH'?'P1':'P2';
+      const event:Record<string,unknown>={...waits,class:cls,candidateId:request.deadline.traceId,reservationId:request.deadline.entitlement?.reservationId,queueAndPacingMs:Date.now()-request.queuedAt,queueDepth:queue.length,capacity:request.deadline.entitlement?'protected':'native',nextLegalSendAt:raptorStats.lastRequestTime+CONFIG.raptorSafetyIntervalMs,cooldownRemainingMs:Math.max(0,backoffUntil-Date.now())};
       try {
-        request.resolve(await raptorAdmission.dispatch(request.deadline, () => { finish = raptorWorkMetrics.start(request.queuedAt); return request.task(); }));
+        request.resolve(await raptorAdmission.dispatch(request.deadline, () => { event.httpStartMono=performance.now();legalCounts[cls]=(legalCounts[cls]??0)+1;finish = raptorWorkMetrics.start(request.queuedAt); return request.task(); }));
+        event.result='SUCCESS';
         finish?.(true);
       } catch (error) {
+        event.result=providerFailureReason(error);event.httpStatus=error instanceof HttpError?error.status:undefined;
         finish?.(false, /429/.test(String(error)));
         request.reject(error);
-      }
+      }finally{event.finishedMono=performance.now();legalEvent(event);}
     }
   } finally {
     raptorStats.throttleState = 'IDLE';
