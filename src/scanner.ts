@@ -7,6 +7,10 @@ import { executableSurfaceProvider } from './scanner-executable-plane.js';
 import { scannerHistoryBuffer } from './scanner-history-buffer.js';
 import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
 import { executablePairCoordinator } from './executable-pair-coordinator.js';
+import { constrainedStop } from './soak-controls.js';
+import { executableCoverage } from './executable-coverage.js';
+import { jupiterAdmission } from './jupiter.js';
+import { raptorAdmission } from './raptor.js';
 let executableSurfaceTurn = 0;
 import { profileScannerStage, startScannerStage } from './scanner-stage-profile.js';
 const liveSizeCadence = new LiveSizeCadence();
@@ -200,6 +204,7 @@ async function publishSupportedAggregatorHandoff(
   detectedAt: number,
   confidenceScore?: number,
 ): Promise<void> {
+  if(constrainedStop.blocksP0)return;
   const { buyQuote, sellQuote, profit } = route;
   if (!isAuditedAggregatorHandoffRoute(route)
     && !isAuditedMixedHandoffRoute(route)
@@ -439,6 +444,11 @@ async function findExecutableCandidates(
     scannerSizeDiagnostics.record(Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC)), ({ EXECUTABLE_CANDIDATE: 'constrained_positives', ABOVE_LIVE_CAP: 'above_live_cap_positives', ECONOMICS_DIVERGED: 'economics_diverged', PREFILTER_RATE_LIMITED: 'rate_limited', PREFILTER_QUEUE_DEADLINE_EXCEEDED: 'deadline_dropped' } as Record<string, string>)[result.status] ?? result.status, result.costs);
     if (trace.executablePrefilterStartedAt !== undefined) event('PREFILTER_COMPLETED');
     event(result.status);
+    if(constrainedStop.blocksP0&&result.route){
+      const provider=result.route.sellQuote.provider;
+      const governor=provider==='raptor'?raptorAdmission:provider==='jupiter'?jupiterAdmission:undefined;
+      await constrainedStop.consider({candidateId:signalId,status:result.status,leg1Completed:result.trace?.constrainedLeg1FinishedAt!==undefined,leg2Completed:result.trace?.constrainedLeg2FinishedAt!==undefined,reservationRequired:governor!==undefined,reservationConsumed:governor?.snapshot().entitlements.events.some(e=>e.workflowId===signalId&&e.state==='CONSUMED')??false,expectedNet:result.route.profit.estimatedNetProfitUsdc.toFixed(6),conservativeNet:result.route.profit.worstCaseNetProfitUsdc.toFixed(6),input:raw.buyQuote.inAmount,providers:[raw.buyQuote.provider,provider],costs:result.costs,trace:result.trace,legs:[result.route.buyQuote,result.route.sellQuote].map(q=>({provider:q.provider,inputMint:q.inputMint,outputMint:q.outputMint,input:q.inAmount,minimumOutput:q.otherAmountThreshold,expectedOutput:q.outAmount,evidenceAt:q.responseTimestamp,pools:q.poolIds}))});
+    }
     // Publish only a freshly constrained executable route, before any history/UI persistence.
     if (result.status === 'EXECUTABLE_CANDIDATE' && result.route) {
       result.route.diagnosticSignalId = signalId;
@@ -948,6 +958,7 @@ export async function scanOnce(
       // Submit all independent second-leg work now. Each provider's own runtime
       // remains responsible for pacing/concurrency, so a slow Jupiter/Raptor
       // request cannot serialize direct-DEX route discovery.
+      if(!CONFIG.directDexOnly&&aggregatorProviders.length>=2)executableCoverage.plan(String(tradeSizeUsdc),2);
       const fastMatrixPromise = !CONFIG.directDexOnly && aggregatorProviders.length >= 2
         ? aggregatorFirstLegsPromise.then((aggregatorFirstLegs) => buildRoundTripMatrix(
           aggregatorFirstLegs,
@@ -1316,6 +1327,7 @@ function recordMatrixEvaluations(routes: RoundTripResult[], lane: 'aggregator' |
   const dynamicByMint = new Map(getDynamicTokens().map((token) => [token.mint, token]));
   const token2022Program = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
   for (const route of routes) {
+    if(lane==='aggregator')executableCoverage.record(route,route.buyQuote.outputMint===MINTS.SOL||route.buyQuote.outputMint===MINTS.USDT||dynamicByMint.get(route.buyQuote.outputMint)?.executionPrecheck==='PASS');
     if (route.opportunityScope !== 'EXECUTABLE_CANDIDATE'
       && route.profit.estimatedNetProfitUsdc.gt(0)
       && route.profit.worstCaseNetProfitUsdc.gt(0)) {

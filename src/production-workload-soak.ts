@@ -5,12 +5,13 @@ import { tmpdir } from 'node:os';
 import { mkdtemp, mkdir, copyFile, writeFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { soakContinuity } from './soak-continuity.js';
+import { parseSoakArguments,safetyFingerprint,constrainedStop,validLongSoak,type ConstrainedEvidence } from './soak-controls.js';
+import { summarizeRpcTraces } from './rpc-soak-report.js';
 
 // Actual scanner + isolated executor, no HTTP server and no approval bridge.
 console.log = console.warn = console.error = () => {};
 const workspace = fileURLToPath(new URL('../', import.meta.url));
-const durationMs = Number(process.argv.find((arg) => arg.startsWith('--duration-ms='))?.split('=')[1] ?? 1800000);
-if (!Number.isInteger(durationMs) || durationMs < 1800000 || durationMs > 3600000) throw new Error('Production soak must run 30..60 minutes');
+const {durationMs,earlyStop}=parseSoakArguments(process.argv.slice(2));
 const { config } = await import('dotenv');
 config({ path: join(workspace, '.env') }); // Normal runtime loading; contents never printed or copied.
 process.env.EXECUTION_MODE = 'live';
@@ -26,13 +27,18 @@ for (const name of ['execution-risk.json','execution-journal.json']) {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 }
 process.chdir(sandbox);
-const { CONFIG, DECIMALS } = await import('./config.js');
+const { CONFIG, DECIMALS,SCANNER_RPC_CONFIG } = await import('./config.js');
+const {EXECUTABLE_POLICY_HASH}=await import('./execution/executable-route-policy.js');
+const fingerprint=()=>safetyFingerprint({...CONFIG,scannerRpc:SCANNER_RPC_CONFIG,routePolicyHash:EXECUTABLE_POLICY_HASH});
+const safetyStart=fingerprint();
+const {scannerRpcTransportSnapshot}=await import('./scanner-rpc-transport.js');
+const {executableCoverage}=await import('./executable-coverage.js');
 const scanner = await import('./scanner.js');
 const { executionFunnel, FunnelTelemetry } = await import('./execution/execution-funnel.js');
 const { scannerStageProfile } = await import('./scanner-stage-profile.js');
 const { workflowProjectionSnapshot } = await import('./execution/prefilter-workflow.js');
 const { jupiterAdmission, jupiterWorkMetrics } = await import('./jupiter.js');
-const { raptorAdmission, raptorWorkMetrics } = await import('./raptor.js');
+const { raptorAdmission, raptorWorkMetrics,raptorLegalSendSnapshot } = await import('./raptor.js');
 const { scannerSizeDiagnostics } = await import('./scanner-size-diagnostics.js');
 const { scannerRpcLimiter } = await import('./scanner-rpc-limiter.js');
 const { dispatchDiagnostics } = await import('./dispatch-diagnostics.js');
@@ -48,6 +54,7 @@ const { writeAtomicJson } = await import('./persistence/atomic-json-file.js');
 const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx'), fileURLToPath(new URL('./production-soak-child.ts', import.meta.url))],
   { cwd: sandbox, env: process.env, stdio: ['ignore','ignore','ignore','ipc'], windowsHide: true });
 let executorReady = false, executorExit: number | null = null, p0Deliveries = 0;
+let executorExited=false;
 child.on('message', (message: unknown) => {
   if (!message || typeof message !== 'object') return;
   const value = message as { type?: string; event?: unknown };
@@ -55,7 +62,7 @@ child.on('message', (message: unknown) => {
   if (value.type === 'EXECUTION_FUNNEL_EVENT') { const event = FunnelTelemetry.safeParse(value.event); if (event.success) executionFunnel.record(event.data); }
   // LIVE_APPROVAL_UPDATE is intentionally ignored. No acceptance can be sent.
 });
-child.on('exit', (code) => { executorExit = code; });
+child.on('exit', (code) => { executorExit = code;executorExited=true; });
 const unsubscribe = scanner.subscribeLiveExecutionHandoffs((candidate) => {
   if (child.connected && executorReady) { p0Deliveries++; child.send({ type: 'LIVE_EXECUTOR_HANDOFF', candidate }); }
 });
@@ -67,13 +74,18 @@ const stream = CONFIG.enableRaptor && CONFIG.enableRaptorStream ? new RaptorQuot
   ({ quote }) => scanner.notifyMarketChange(quote.inputMint, quote.outputMint)) : null;
 stream?.start();
 const start = performance.now();
+const wallStart=Date.now();
+let constrainedEvidence:ConstrainedEvidence|undefined;
+if(earlyStop)constrainedStop.configure(process.env.LIVE_TRADING_ENABLED==='false'&&process.env.TRADER_PRODUCTION_SOAK==='1',async evidence=>{constrainedEvidence=evidence;queueMicrotask(()=>void finish());});
 let scannerFailed = false;
 void scanner.scanLoop().catch(() => { scannerFailed = true; });
 const samples: Array<ReturnType<typeof snapshot>> = [];
-const snapshot = () => ({ elapsedMs: performance.now() - start, executorReady, executorExit, scannerFailed, p0Deliveries,
+const rpcTraceCursor=new Map<string,number>();
+const snapshot = () => ({ elapsedMs: performance.now() - start,wallElapsedMs:Date.now()-wallStart, executorReady, executorExit,executorExited, scannerFailed, p0Deliveries,
+  rpcTransport:scannerRpcTransportSnapshot(rpcTraceCursor),coverage:executableCoverage.snapshot(),
   scanner: scanner.scannerOperationalMetrics(), stages: scannerStageProfile(), funnel: executionFunnel.snapshot(), workflows: workflowProjectionSnapshot(),
   jupiter: { work: jupiterWorkMetrics.snapshot(), admission: jupiterAdmission.snapshot() }, raptor: { work: raptorWorkMetrics.snapshot(), admission: raptorAdmission.snapshot() },
-  pairs:executablePairCoordinator.snapshot(), rpc: scannerRpcLimiter.snapshot(), dispatch: dispatchDiagnostics(), scannerHistory: scannerHistoryBuffer.snapshot(), sizes: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps) });
+  raptorLegal:raptorLegalSendSnapshot(),pairs:executablePairCoordinator.snapshot(), rpc: scannerRpcLimiter.snapshot(), dispatch: dispatchDiagnostics(), scannerHistory: scannerHistoryBuffer.snapshot(), sizes: scannerSizeDiagnostics.snapshot(CONFIG.tradeSizesUsdc, CONFIG.firstLiveMaxInputUsdc, CONFIG.minNetProfitUsdc, CONFIG.minProfitBps) });
 const outputPath = join(workspace, 'data', `production-soak-${Date.now()}.json`);
 const safeJson = (value: unknown) => JSON.stringify(value, (_key, item: unknown) => typeof item === 'string' && /https?:\/\/|api[_-]?key=|bearer\s/i.test(item) ? '[REDACTED_ENDPOINT_OR_CREDENTIAL]' : item, 2);
 let stopping = false;
@@ -84,15 +96,21 @@ const finish = async () => {
   scanner.stopScanner(); dynamic.stopDynamicTokenDiscovery(); stream?.stop(); unsubscribe();
   child.kill('SIGTERM');
   const report = { kind: 'PRODUCTION_SCANNER_ISOLATED_EXECUTOR_NO_BROADCAST', requestedDurationMs: durationMs, durationMs: performance.now() - start,
-    manualApprovalAvailable: false, broadcasts: 0, checkpointFailures,
+    manualApprovalAvailable: false, approvals:0,submissions:0,submittedSignatures:[],broadcasts: 0, checkpointFailures,
+    earlyStop,constrainedEvidence,safetyStart,safetyEnd:fingerprint(),safetyUnchanged:safetyStart===fingerprint(),
+    healthySamples:samples.length>0&&samples.every(s=>s.executorReady&&!s.scannerFailed&&!s.executorExited),
+    wallClockDriftMaxMs:Math.max(0,...samples.map(s=>Math.abs(s.wallElapsedMs-s.elapsedMs))),
     continuity: soakContinuity(samples.map((sample) => sample.elapsedMs), durationMs), snapshot: snapshot(), samples };
-  await writeFile(outputPath, safeJson(report), { flag: 'wx' });
+  const rpcSummary=summarizeRpcTraces([...samples,report.snapshot].flatMap(s=>s.rpcTransport.endpoints.flatMap(e=>e.traces)),report.durationMs);
+  const validProductionSoak=validLongSoak({continuity:report.continuity.validProductionSoak,healthySamples:report.healthySamples,safetyUnchanged:report.safetyUnchanged,checkpointFailures,wallClockDriftMaxMs:report.wallClockDriftMaxMs,executorReady,executorExited,scannerFailed});
+  await writeFile(outputPath, safeJson({...report,validProductionSoak,rpcSummary}), { flag: 'wx' });
   // Evidence must be durable before potentially hanging WebSocket unsubscribe.
   void direct.stopDirectMarketStream().catch(() => {});
   try { db.close(); } catch { /* independent asynchronous scanner drain */ }
   await lock.release();
-  process.stdout.write(JSON.stringify({ finished: true, outputPath, durationMs: report.durationMs, executorReady, executorExit, scannerFailed, broadcasts: 0 }) + '\n');
-  process.exit(report.continuity.validProductionSoak ? 0 : 2);
+  const earlyStopValid=earlyStop&&!!constrainedEvidence&&p0Deliveries===0&&report.safetyUnchanged;
+  process.stdout.write(JSON.stringify({ finished: true, outputPath, durationMs: report.durationMs,executorReady,executorExit,scannerFailed,validProductionSoak,earlyStopValid,safetyUnchanged:report.safetyUnchanged,broadcasts:0 })+'\n');
+  process.exit((validProductionSoak||earlyStopValid)&&report.safetyUnchanged&&!scannerFailed ? 0 : 2);
 };
 const timer = setInterval(() => {
   samples.push(snapshot());
