@@ -26,6 +26,7 @@ export async function scannerDeadline<T>(work: Promise<T>, ms: number, fallback:
 
 export class ScannerFirstLegBulkheads {
   private readonly pending = new Map<string, Promise<ProviderQuoteResult>>();
+  private aggregatorCursor = 0;
   constructor(private readonly quote: (providers: QuoteProvider[], params: QuoteParams) => Promise<ProviderQuoteResult[]>) {}
 
   start(providers: QuoteProvider[], params: QuoteParams, directDeadlineMs: number,
@@ -35,17 +36,31 @@ export class ScannerFirstLegBulkheads {
       && params.inputMint === MINTS.USDC
       && /^\d+$/.test(params.amountAtomic)
       && BigInt(params.amountAtomic) <= BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC));
-    // Do not let one slow first-leg aggregator age a faster quote for several
-    // seconds before the round-trip matrix can begin. This is only a scanner
-    // admission deadline; it does not extend execution freshness or cancel the
-    // already-bounded underlying provider request.
-    const aggregatorFreshnessDeadlineMs = Math.max(
-      1,
-      Math.min(directDeadlineMs, Math.floor(CONFIG.raptorExecutionQuoteAgeMs / 2)),
-    );
+
+    const allAggregatorProviders = providers.filter((provider) => provider.kind === 'aggregator');
+    let liveAggregatorProviders = allAggregatorProviders;
+    if (liveInCapUsdc && allAggregatorProviders.length > 1) {
+      // A live executable-size round trip only needs one fresh buy-side
+      // aggregator quote before the matrix can immediately quote the opposite
+      // provider for leg 2. Waiting for every aggregator first leg ages the
+      // first quote before raw-positive promotion. Rotate the buy provider each
+      // scan so both directions keep coverage without adding requests.
+      let selectedIndex = this.aggregatorCursor % allAggregatorProviders.length;
+      for (let offset = 0; offset < allAggregatorProviders.length; offset++) {
+        const candidateIndex = (this.aggregatorCursor + offset) % allAggregatorProviders.length;
+        if (!allAggregatorProviders[candidateIndex]!.isRateLimited()) {
+          selectedIndex = candidateIndex;
+          break;
+        }
+      }
+      liveAggregatorProviders = [allAggregatorProviders[selectedIndex]!];
+      this.aggregatorCursor = (selectedIndex + 1) % allAggregatorProviders.length;
+    }
+
     const lane = (kind: 'aggregator' | 'direct') => {
       const finish = startScannerStage(`${kind}FirstLeg`);
-      return Promise.all(providers.filter((p) => p.kind === kind).map((provider) => {
+      const laneProviders = kind === 'aggregator' ? liveAggregatorProviders : providers.filter((provider) => provider.kind === 'direct');
+      return Promise.all(laneProviders.map((provider) => {
       const unavailable = (reason: string): ProviderQuoteResult => ({ provider: provider.name, error: new Error(reason) });
       if (provider.isRateLimited()) return Promise.resolve(unavailable('Provider cooling down; scanner skipped'));
       // Executable-size discovery should not sit behind ordinary low-priority
@@ -63,9 +78,12 @@ export class ScannerFirstLegBulkheads {
           .finally(() => this.pending.delete(key));
         this.pending.set(key, work);
       }
-      if (kind === 'direct') return scannerDeadline(work, directDeadlineMs, unavailable('DIRECT_FIRST_LEG_SOFT_DEADLINE'));
-      return liveInCapUsdc
-        ? scannerDeadline(work, aggregatorFreshnessDeadlineMs, unavailable('AGGREGATOR_FIRST_LEG_FRESHNESS_DEADLINE'))
+      // Direct/RPC discovery remains bounded by its scanner-only soft deadline.
+      // Aggregator first legs deliberately wait for their legal provider slot:
+      // freshness starts at the returned quote timestamp, and the matrix can
+      // now begin immediately because only one rotated buy provider is awaited.
+      return kind === 'direct'
+        ? scannerDeadline(work, directDeadlineMs, unavailable('DIRECT_FIRST_LEG_SOFT_DEADLINE'))
         : work;
     })).then((results) => { observed(kind, Date.now() - start); return results; }).finally(finish);
     };
