@@ -654,18 +654,120 @@ export async function startLiveExecutionWorker(
     }
   };
 
+  /**
+   * Autonomous execution path — replaces the manual approval gate.
+   * Performs the same safety checks (freshness, balance, profitability, risk)
+   * that approveManual did, then broadcasts immediately. The dashboard receives
+   * real-time status updates through emitApproval just like the old flow.
+   */
+  const autoExecute = async (current: PendingManualApproval): Promise<void> => {
+    if (noBroadcast) {
+      log.info('Auto-execute skipped: noBroadcast mode', { identity: current.identity });
+      await releasePending();
+      return;
+    }
+    try {
+      await journal.transition(current.identity, 'APPROVED_BY_USER', { messageHash: current.approved.messageHash });
+      logExecutionStage(current.identity, 'APPROVED_BY_USER', current.candidate.detectedAt, {
+        readyToClickMs: 0, autoExecuted: true,
+      });
+      updatePending('EXECUTING');
+
+      const evidenceAt = (): number => current.approved.signedSimulation?.timing.simulationResponseAt
+        ?? current.unsignedSimulation.timing.simulationResponseAt;
+      const needsRefresh = (): boolean => Date.now() - evidenceAt() > executionQuoteAgeLimit(current.plan)
+        || Date.now() - current.unsignedSimulation.timing.blockhashRetrievedAt > CONFIG.maxApprovedBlockhashAgeMs;
+      let refreshed = false;
+
+      // Refresh once if the evidence window has elapsed during preparation.
+      if (needsRefresh()) {
+        const refreshReason = await refreshPendingOnce(current);
+        if (refreshReason) {
+          await finalizeAutoReject(current, refreshReason);
+          return;
+        }
+        refreshed = true;
+      }
+
+      await captureAndValidateLiveBalances(connection, current.plan);
+
+      if (current.economics.conservativeNetAtomic < BigInt(toAtomic(CONFIG.minNetProfitUsdc, DECIMALS.USDC))
+        || current.economics.conservativeRoiBps < BigInt(CONFIG.minProfitBps)) {
+        await finalizeAutoReject(current, 'OPPORTUNITY_NO_LONGER_PROFITABLE');
+        return;
+      }
+
+      // Balance read may consume the strict window; refresh once more if needed.
+      if (needsRefresh()) {
+        if (refreshed) {
+          await finalizeAutoReject(current, 'Refreshed execution evidence aged out before submission');
+          return;
+        }
+        const refreshReason = await refreshPendingOnce(current);
+        if (refreshReason) {
+          await finalizeAutoReject(current, refreshReason);
+          return;
+        }
+        await captureAndValidateLiveBalances(connection, current.plan);
+      }
+
+      risk.assertCanExecute(current.identity, current.economics.conservativeNetAtomic);
+
+      const submissionTransport = CONFIG.executionSubmissionTransport === 'jito'
+        ? new JitoBlockEngineSubmissionTransport()
+        : new SolanaRpcSubmissionTransport(connection);
+      const broadcaster = new OneShotBroadcaster(
+        submissionTransport, journal, risk, { readinessReady: EXECUTION_IMPLEMENTATION_READY },
+      );
+      const signature = await broadcaster.submit(current.approved);
+      logExecutionStage(current.identity, 'SUBMITTED', current.candidate.detectedAt, { signature });
+      updatePending('SUBMITTED', { signature });
+      log.warn('Auto-executed live transaction submitted; waiting for confirmation', {
+        signature, identity: current.identity,
+      });
+      // Kick off async confirmation — pending is released after it settles.
+      void confirmPending(current, signature);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const currentState = journal.get(current.identity)?.state;
+      if (currentState === 'APPROVED_BY_USER') {
+        await journal.transition(current.identity, /stale|expired|age/i.test(reason) ? 'EXPIRED' : 'REJECTED', { reason });
+      }
+      if (currentState === 'SUBMITTING') {
+        updatePending('SUBMISSION_UNKNOWN', { reason });
+        log.error('Auto-execution submission ambiguous; requires reconciliation', { identity: current.identity, reason });
+        // A possible network submission is reconciled from its deterministic signature; never release/retry.
+        return;
+      }
+      updatePending(/stale|expired|age/i.test(reason) ? 'APPROVAL_EXPIRED' : 'REJECTED', { reason });
+      log.warn('Auto-execution failed closed', { identity: current.identity, reason });
+      await releasePending(false);
+      clearTerminalViewLater();
+    }
+  };
+
+  const finalizeAutoReject = async (current: PendingManualApproval, reason: string): Promise<void> => {
+    const currentState = journal.get(current.identity)?.state;
+    if (currentState === 'APPROVED_FOR_SUBMISSION' || currentState === 'APPROVED_BY_USER') {
+      await journal.transition(current.identity, /profit|roi|net/i.test(reason) ? 'EXPIRED' : 'REJECTED', { reason });
+    }
+    recordLiveCandidateOutcome({
+      identity: current.identity, outcome: 'EXPIRED', reason,
+      lastCompletedStage: 'READY_TO_EXECUTE',
+      candidateToOutcomeMs: Math.max(0, Date.now() - current.candidate.detectedAt), recordedAt: Date.now(),
+    });
+    updatePending('REJECTED', { reason });
+    log.info('Auto-execution rejected candidate', { identity: current.identity, reason });
+    await releasePending(false);
+    clearTerminalViewLater();
+  };
+
   const tick = async (): Promise<void> => {
     if (tickInFlight || stopped || executionDisabledReason) return;
     tickInFlight = true;
     try {
-      // A prepared transaction owns the persistent execution lock but does not
-      // pause the scanner. Wait for the local user, or expire it deterministically.
-      if (pending) {
-        if (pending.view.state === 'READY_TO_EXECUTE' && Date.now() >= pending.view.expiresAt) {
-          await expirePending('Manual approval window expired');
-        }
-        return;
-      }
+      // Auto-execution: if a broadcast is in-flight (confirming), skip this tick.
+      if (pending) return;
       const unresolved = journal.unresolved();
       if (unresolved.length > 0) {
         const recovery = await journal.recoverInterruptedPreSubmission(
@@ -730,12 +832,14 @@ export async function startLiveExecutionWorker(
       });
       const prepared = await prepareCandidate(candidate, connection, journal, risk, signer);
       if (prepared) {
+        // ── AUTO-EXECUTION: bypass manual approval, broadcast immediately ──
         pending = prepared;
         emitApproval(prepared.view);
-        log.warn('Prepared exact signed transaction awaiting local dashboard approval', {
+        log.warn('Auto-executing validated trade — no manual approval required', {
           identity: prepared.identity, messageHash: prepared.approved.messageHash,
-          expiresAt: prepared.view.expiresAt, quoteAgeMs: prepared.view.quoteAgeMs,
+          quoteAgeMs: prepared.view.quoteAgeMs,
         });
+        await autoExecute(prepared);
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -766,7 +870,7 @@ export async function startLiveExecutionWorker(
     void tick().finally(schedule);
   };
   void tick().finally(schedule);
-  log.warn('Continuous live executor started', {
+  log.warn('Autonomous live executor started — trades execute without manual approval', {
     pollMs: CONFIG.liveExecutionPollMs, maxTransactions: CONFIG.liveMaxTransactions,
     maxSessionLossUsdc: CONFIG.maxSessionLossUsdc,
   });

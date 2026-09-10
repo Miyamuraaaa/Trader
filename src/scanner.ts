@@ -44,6 +44,7 @@ import { aggregatorHandoffIdentity, quoteRouteEvidence, routeEvidenceFingerprint
 import { logExecutionStage } from './execution/execution-diagnostics.js';
 import {
   buildExecutableCandidateFromRaw,
+  buildExecutableFastLane,
   evaluateAboveCapShadow,
   prewarmScannerExecutionMints,
   type ScannerExecutableCostSnapshot,
@@ -960,22 +961,72 @@ export async function scanOnce(
       // request cannot serialize direct-DEX route discovery.
       if(!CONFIG.directDexOnly&&aggregatorProviders.length>=2)executableCoverage.plan(String(tradeSizeUsdc),2);
       const fastMatrixPromise = !CONFIG.directDexOnly && aggregatorProviders.length >= 2
-        ? aggregatorFirstLegsPromise.then((aggregatorFirstLegs) => buildRoundTripMatrix(
-          aggregatorFirstLegs,
-          aggregatorProviders,
-          {
-            intermediateMint: cycle.intermediateMint,
-            startingMint: cycle.outputMint,
-            slippageBps: CONFIG.slippageBps,
-            dexes: CONFIG.sellDexes.length > 0 ? CONFIG.sellDexes : undefined,
-            priority: 'HIGH',
-          },
-          estimatedNetworkCostsUsdc,
-          spreadPrefilter(aggregatorFirstLegs),
-          undefined,
-          promoteRawImmediately,
-          'aggregatorMatrix',
-        ))
+        ? aggregatorFirstLegsPromise.then(async (aggregatorFirstLegs) => {
+            const fastLaneRoutes: RoundTripResult[] = [];
+            if (useExecutableSurface && eligibleMetadata) {
+              const executableFirstLegs = aggregatorFirstLegs.map(r => r.quote).filter(q => q && isFullFillQuote(q)) as Quote[];
+              const jobs = executableFirstLegs.flatMap(buy =>
+                aggregatorProviders
+                  .filter(p => p.name !== buy.provider && isExecutableProviderPair(buy.provider, p.name))
+                  .map(async sellProvider => {
+                    const signalId = crypto.randomUUID();
+                    const trace: import('./execution/prefilter-trace.js').PrefilterTrace = { rawPositiveDetectedAt: buy.responseTimestamp, rawQuoteEvidenceAt: buy.responseTimestamp, rawQuoteAgeAtDetectionMs: 0, executablePrefilterQueuedAt: Date.now(), executablePrefilterStartedAt: Date.now(), rawAgeAtPrefilterStartMs: Math.max(0, Date.now() - buy.responseTimestamp), prefilterQueueMs: 0 };
+                    
+                    executionFunnel.record({ identity: signalId, stage: 'RAW_POSITIVE', at: Date.now(), detectedAt: buy.responseTimestamp });
+                    executionFunnel.signal({ id: signalId, detectedAt: Date.now(), providers: `${buy.provider}->${sellProvider.name}`, intermediateMint: buy.outputMint, inputAmount: buy.inAmount, rawNet: '0.000000', rawWorstCase: '0.000000', pools: [buy.poolIds, []], prefilterTrace: trace, p0Handoff: false });
+                    executionFunnel.raw.register(signalId, trace);
+                    executionFunnel.update(signalId, { liveEligibility: 'ELIGIBLE_FOR_PREFILTER', prefilterTrace: trace });
+                    executionFunnel.record({ identity: signalId, stage: 'PREFILTER_STARTED', at: Date.now(), detectedAt: buy.responseTimestamp });
+
+                    const result = await buildExecutableFastLane(buy, sellProvider.name, { referenceSolPriceUsdc, estimatedNetworkCostsUsdc }, { traceId: signalId });
+                    
+                    executionFunnel.raw.finish(signalId, result.status, result.trace);
+                    executionFunnel.record({ identity: signalId, stage: 'PREFILTER_COMPLETED', at: Date.now(), detectedAt: buy.responseTimestamp });
+                    executionFunnel.record({ identity: signalId, stage: result.status, at: Date.now(), detectedAt: buy.responseTimestamp });
+                    
+                    if (result.route) {
+                       result.route.diagnosticSignalId = signalId;
+                       prefilterJobs.set(result.route, Promise.resolve([result.route]));
+                       executionFunnel.update(signalId, { prefilterResult: result.status, prefilterReason: result.reason, prefilterTrace: result.trace, constrainedNet: result.route.profit.estimatedNetProfitUsdc.toFixed(6), constrainedWorstCase: result.route.profit.worstCaseNetProfitUsdc.toFixed(6), networkFee: String(estimatedNetworkCostsUsdc.baseNetworkFeeUsdc), priorityFee: String(estimatedNetworkCostsUsdc.priorityFeeUsdc), ataRent: result.estimatedAtaRentUsdc === undefined ? undefined : String(result.estimatedAtaRentUsdc), pools: [result.route.buyQuote.poolIds, result.route.sellQuote.poolIds] });
+
+                       if (result.status === 'EXECUTABLE_CANDIDATE') {
+                          if (isFreshPositiveAuditedExecutionSignal(result.route) && shouldPublishFreshLiveHandoff(result.route)) {
+                             const oppId = crypto.randomUUID();
+                             preparedOpportunityIds.set(result.route, oppId);
+                             await publishSupportedAggregatorHandoff(result.route, oppId, buy.responseTimestamp, calculateConfidence(result.route, tradeSizeUsdc));
+                          }
+                       }
+                       fastLaneRoutes.push(result.route);
+                    } else {
+                       executionFunnel.update(signalId, { prefilterResult: result.status, prefilterReason: result.reason, prefilterTrace: result.trace });
+                    }
+                  })
+              );
+              await Promise.all(jobs);
+            }
+
+            const matrix = await buildRoundTripMatrix(
+              aggregatorFirstLegs,
+              aggregatorProviders,
+              {
+                intermediateMint: cycle.intermediateMint,
+                startingMint: cycle.outputMint,
+                slippageBps: CONFIG.slippageBps,
+                dexes: CONFIG.sellDexes.length > 0 ? CONFIG.sellDexes : undefined,
+                priority: 'HIGH',
+              },
+              estimatedNetworkCostsUsdc,
+              spreadPrefilter(aggregatorFirstLegs, (buy, sellProvider) => {
+                if (useExecutableSurface && eligibleMetadata && isExecutableProviderPair(buy.provider, sellProvider.name)) return false;
+                return true;
+              }),
+              undefined,
+              promoteRawImmediately,
+              'aggregatorMatrix',
+            );
+            matrix.routes.push(...fastLaneRoutes);
+            return matrix;
+          })
         : undefined;
       const directMatrixPromise = directFirstLegsPromise.then((directFirstLegs) => buildRoundTripMatrix(
         directFirstLegs,
