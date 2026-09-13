@@ -58,19 +58,20 @@ describe('TEST DATA ONLY: raw-positive constrained prefilter', () => {
       policy: async () => { await delay(100); return supported(); },
       quote: async (provider, input, output, amount) => { calls.push({ at: Date.now() - start, amount }); await delay(provider === 'jupiter' ? 80 : 60); return quote(provider, input, output, amount); },
     });
-    await vi.advanceTimersByTimeAsync(81); expect(calls).toEqual([{ at: 0, amount: '50000' }]);
+    await vi.advanceTimersByTimeAsync(81); expect(calls).toEqual([{ at: 0, amount: '50000' },{at:80,amount:'990'}]);
     await vi.advanceTimersByTimeAsync(80); const value = await result;
-    expect(calls[1]).toEqual({ at: 100, amount: '990' });
+    expect(calls[1]).toEqual({ at: 80, amount: '990' });
     expect(value.status).toBe('EXECUTABLE_CANDIDATE');
-    expect(value.trace).toMatchObject({ tokenPolicyMs: 100, constrainedLeg1Ms: 80, constrainedLeg2Ms: 60, totalPrefilterMs: 160 });
+    expect(value.trace).toMatchObject({ tokenPolicyMs: 100, constrainedLeg1Ms: 80, constrainedLeg2Ms: 60, totalPrefilterMs: 140 });
     expect(isFreshPositiveAuditedExecutionSignal(raw())).toBe(false);
     expect(isFreshPositiveAuditedExecutionSignal(value.route!)).toBe(true);
   });
-  it.each(['TOKEN_2022', 'REJECTED'] as const)('never calls leg2 after %s policy classification', async (status) => {
+  it.each(['TOKEN_2022', 'REJECTED'] as const)('never promotes speculative quotes after %s policy classification', async (status) => {
     const quoted = vi.fn(async (...args: Parameters<typeof quote>) => quote(...args));
     const value = await buildExecutableCandidateFromRaw(raw(), costs, { policy: async () => ({ status, rentLamports: 0 }), quote: quoted });
     expect(value.status).toBe(status === 'TOKEN_2022' ? 'DISCOVERY_ONLY_TOKEN_2022' : 'TOKEN_POLICY_REJECTED');
-    expect(quoted).toHaveBeenCalledTimes(1);
+    expect(quoted).toHaveBeenCalledTimes(2);
+    expect(value.route).toBeUndefined();
   });
   it('separates stale raw evidence, stale constrained quotes and rate limits', async () => {
     const old = raw(); old.buyQuote.responseTimestamp -= CONFIG.maxQuoteAgeMs + 1;

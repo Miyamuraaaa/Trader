@@ -8,13 +8,17 @@ import type { PersistentExecutionJournal } from './execution-journal.js';
 import { assertLiveSubmissionAllowed, type LiveSubmissionGuardConfig } from './live-guard.js';
 import type { PersistentRiskManager } from './risk-manager.js';
 import { executionQuoteAgeLimit } from './quote-freshness.js';
+import { randomUUID } from 'node:crypto';
+import { EXECUTABLE_POLICY_HASH } from './executable-route-policy.js';
 
 export interface SubmissionTransport {
+  readonly kind?: 'rpc'|'jito';
   submitExactSignedBytes(bytes: Uint8Array): Promise<string>;
 }
 
 /** The only production RPC call capable of submitting bytes. No retry exists. */
 export class SolanaRpcSubmissionTransport implements SubmissionTransport {
+  readonly kind='rpc' as const;
   constructor(private readonly connection: Connection) {}
 
   submitExactSignedBytes(bytes: Uint8Array): Promise<string> {
@@ -83,9 +87,14 @@ export class OneShotBroadcaster {
     }
     const competing = this.journal.unresolved().filter((item) => item.id !== approved.executionId);
     if (competing.length > 0) throw new Error('Broadcast blocked: another unresolved execution requires reconciliation');
+    if(this.journal.all().some(item=>item.id!==approved.executionId&&item.signature===approved.transactionSignature))throw new Error('Broadcast blocked: deterministic signature already journaled');
 
     this.risk.assertCanExecute(approved.executionId);
+    if(!Number.isSafeInteger(approved.unsignedSimulation.lastValidBlockHeight)||approved.unsignedSimulation.lastValidBlockHeight!<=0
+      ||approved.transaction.message.recentBlockhash!==approved.unsignedSimulation.blockhash)throw new Error('Broadcast blocked: recovery blockhash metadata unavailable or mismatched');
     const bytes = approved.transaction.serialize();
+    // Claim this instance before the first await, including persistence failures.
+    this.attempted = true;
     // Persist the deterministic signature and exact byte hash before invoking
     // the RPC. A crash or network ambiguity therefore blocks all new sends.
     await this.journal.transition(approved.executionId, 'SUBMITTING', {
@@ -96,19 +105,21 @@ export class OneShotBroadcaster {
       baseMint: approved.plan.inputMint,
       intermediateMint: approved.plan.intermediateMint,
       inputAmount: approved.plan.inputAmount.toString(),
+      recentBlockhash:approved.transaction.message.recentBlockhash,
+      lastValidBlockHeight:approved.unsignedSimulation.lastValidBlockHeight,
+      recoveryVersion:1,transportKind:this.transport.kind??'rpc',sendAttemptId:randomUUID(),sendBoundaryAt:now,policyHash:EXECUTABLE_POLICY_HASH,
     });
     await this.risk.recordSubmissionAttempt(approved.executionId);
-    this.attempted = true;
 
     let returnedSignature: string;
     try {
       returnedSignature = await this.transport.submitExactSignedBytes(bytes);
     } catch (error) {
-      // Intentionally leave SUBMITTING unresolved. The deterministic local
-      // signature is enough to reconcile without a dangerous resubmission.
+      await this.journal.transition(approved.executionId,'SUBMISSION_UNKNOWN',{reason:'Transport outcome unknown; original signature only; no retry'});
       throw new AmbiguousSubmissionError(approved.transactionSignature, error);
     }
     if (returnedSignature !== approved.transactionSignature) {
+      await this.journal.transition(approved.executionId,'SUBMISSION_UNKNOWN',{reason:'Transport signature mismatch; original signature only; no retry'});
       throw new AmbiguousSubmissionError(
         approved.transactionSignature,
         new Error(`RPC returned unexpected signature ${returnedSignature}`),

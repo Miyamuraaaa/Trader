@@ -7,6 +7,9 @@ const gapIndex = allSamples.findIndex((sample) => { const gap = sample.elapsedMs
 const samples = gapIndex < 0 ? allSamples : allSamples.slice(0, gapIndex);
 const last = gapIndex < 0 ? report.snapshot ?? samples.at(-1) : samples.at(-1);
 if (!last) throw new Error('No diagnostic samples');
+const counts=report.submissionCounts??last.submissionCounts;
+const nonzero=counts&&Object.values(counts).some(n=>typeof n==='number'&&n>0);
+const verdict=nonzero?'FAIL':!report.zeroBroadcastVerified||gapIndex>=0||report.validProductionSoak!==true?'INVALID':!(last.funnel?.session?.EXECUTOR_RECEIVED>0)?'INSUFFICIENT_DATA':'VALID_NO_BROADCAST_OBSERVATION';
 const range = (values) => {
   values = values.filter(Number.isFinite);
   return { windows: values.length, min: values.length ? Math.min(...values) : null,
@@ -26,7 +29,7 @@ const sizes = last.sizes.map((size) => ({ ...size,
   maxObservedRollingCounts: Object.fromEntries([...new Set(samples.flatMap((s)=>Object.keys(s.sizes.find((x)=>x.size===size.size)?.counts??{})))].map((event)=>[
     event, Math.max(0,...samples.map((s)=>s.sizes.find((x)=>x.size===size.size)?.counts[event]??0))])),
 }));
-console.log(JSON.stringify({ partial: report.partial === true || gapIndex >= 0, durationMs: report.durationMs ?? report.elapsedMs,
+console.log(JSON.stringify({ verdict,submissionCounts:counts,zeroBroadcastVerified:report.zeroBroadcastVerified??false,executorRecovery:last.executorHealth,partial: report.partial === true || gapIndex >= 0, durationMs: report.durationMs ?? report.elapsedMs,
   continuousPrefixMs:last.elapsedMs, measurementGapDetected:gapIndex >= 0,
   samples: samples.length, executorReady: last.executorReady, executorExit: last.executorExit, scannerFailed:last.scannerFailed,
   throughputRolling60s: Object.fromEntries(['totalRouteEvals60s','aggregatorFastLaneEvals60s','directLaneEvals60s','mixedLaneEvals60s'].map((key)=>[key,range(samples.map((s)=>s.scanner[key]))])),

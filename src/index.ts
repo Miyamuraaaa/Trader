@@ -16,6 +16,7 @@ import {
   stopDynamicTokenDiscovery,
 } from './dynamic-token-universe.js';
 import { getExecutionReadiness } from './execution-readiness.js';
+import { setRecoveryReadiness,type RecoveryReadiness } from './execution/runtime-readiness.js';
 import { resolveLiveExecutorEntrypoint } from './live-executor-entrypoint.js';
 import { acquireScannerRuntimeLock, type ScannerRuntimeLock } from './scanner-runtime-lock.js';
 import { LiveApprovalBridge } from './live-approval-bridge.js';
@@ -40,6 +41,11 @@ async function startIsolatedLiveExecutor(): Promise<ChildProcess> {
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
     windowsHide: true,
   });
+  child.on('message',(message:unknown)=>{
+    const value=message as {type?:string;state?:string};
+    if(value?.type==='LIVE_EXECUTOR_HEALTH'&&['READY_FOR_SIGNER','READY_FOR_NEW_SUBMISSIONS','RECONCILIATION_ONLY','LEGACY_UNRESOLVED_BLOCKED','NOT_READY','NO_BROADCAST'].includes(value.state??''))setRecoveryReadiness(value.state as RecoveryReadiness);
+  });
+  child.on('exit',()=>setRecoveryReadiness('NOT_READY'));
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       // A timed-out child is not allowed to linger with access to the signer.
@@ -61,7 +67,8 @@ async function startIsolatedLiveExecutor(): Promise<ChildProcess> {
     };
     const onMessage = (message: unknown): void => {
       if (typeof message === 'object' && message !== null
-        && (message as { type?: string }).type === 'LIVE_EXECUTOR_READY') {
+        && ((message as { type?: string }).type === 'LIVE_EXECUTOR_READY'
+          || (message as {type?:string}).type==='LIVE_EXECUTOR_HEALTH')) {
         cleanup();
         resolve();
       }

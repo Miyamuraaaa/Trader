@@ -1,6 +1,7 @@
 import { CONFIG } from './config.js';
 import { getProviderCapabilities } from './aggregators/index.js';
 import { EXECUTION_IMPLEMENTATION_READY } from './execution/readiness-manifest.js';
+import { recoveryReadiness } from './execution/runtime-readiness.js';
 
 export type ReadinessGateState = 'PASS' | 'FAIL' | 'NOT_IMPLEMENTED';
 
@@ -15,6 +16,7 @@ export interface ReadinessGate {
  * never that a configured environment may bypass the final live guards.
  */
 export function getExecutionReadiness() {
+  const recovery=recoveryReadiness();
   const providerCapabilities = getProviderCapabilities();
   const gates: ReadinessGate[] = [
     { id: 'wallet-and-mainnet-preflight', state: 'PASS', detail: 'Dedicated wallet identity, funded mainnet balances, classic USDC ATA, and SOL reserve passed the real non-broadcast validation command.' },
@@ -24,7 +26,7 @@ export function getExecutionReadiness() {
     { id: 'spl-token-security-chain', state: 'PASS', detail: 'The executor no longer imports @solana/spl-token; account/mint validation uses RPC jsonParsed responses and Token-2022 execution is fail-closed.' },
     { id: 'scanner-dependency-isolation', state: 'PASS', detail: 'Execution-critical modules do not import scanner provider implementations, @solana/spl-token, or bigint-buffer. The reviewed aggregator executor has independent minimal HTTP clients and accepts only a strict instruction-free handoff DTO.' },
     { id: 'confirmation-and-realized-accounting', state: 'PASS', detail: 'Read-only confirmation detects failure, retrieves on-chain balances/fee, calculates realized P&L and dust, and persists accounting in the execution journal.' },
-    { id: 'execution-journal-and-restart-safety', state: 'PASS', detail: 'Fail-closed legal state transitions are atomically persisted. Any unresolved SUBMITTING/SUBMITTED/CONFIRMING record must be reconciled before a new submission.' },
+    { id: 'execution-journal-and-restart-safety', state: recovery.readyForNewSubmissions?'PASS':'FAIL', detail: `Runtime recovery gate: ${recovery.state}; journal v2 / risk v2 / reconciler v1. Process health is not submission readiness.` },
     { id: 'final-opportunity-revalidation', state: 'PASS', detail: 'The Orca handoff validator treats DTO economics as untrusted, fetches fresh state, rebuilds/re-inspects/re-simulates, enforces conservative minimum-output profit/ROI and blockhash validity, then stops at APPROVED_FOR_SUBMISSION.' },
     { id: 'scanner-orca-handoff-source', state: 'PASS', detail: 'Distinct Orca Whirlpool combinations are screened and exact-quoted at 0.01/0.02/0.05 USDC. Core and eligible HOT/WARM classic-SPL intermediate mints may produce the strict DTO; the executor independently rechecks mint policy and economics.' },
     { id: 'aggregator-atomic-composition', state: 'PASS', detail: 'Raptor/Jupiter and Jupiter-or-Raptor with direct Orca raw instructions are independently rebuilt for constrained complete cycles. Dynamic classic-SPL intermediates must pass mint/freeze policy; ALTs and compiled messages are independently verified.' },
@@ -37,7 +39,8 @@ export function getExecutionReadiness() {
     verdict: EXECUTION_IMPLEMENTATION_READY && blockers.length === 0 ? 'READY' as const : 'NOT READY' as const,
     executionMode: CONFIG.executionMode,
     liveTradingEnabled: CONFIG.liveTradingEnabled,
-    liveSubmissionExposed: true,
+    liveSubmissionExposed: recovery.readyForNewSubmissions&&CONFIG.executionMode==='live'&&CONFIG.liveTradingEnabled,
+    recovery,
     providerCapabilities,
     gates,
     blockers,

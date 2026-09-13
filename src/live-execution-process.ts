@@ -2,6 +2,12 @@ import { startLiveExecutionWorker, type LiveExecutionWorker } from './live-execu
 import { log } from './logger.js';
 import { loadDedicatedSigner } from './execution/signer.js';
 import type { ManualApprovalResponse } from './execution/manual-approval.js';
+import { bootstrapExecutor } from './execution/executor-bootstrap.js';
+import { createExecutionConnection,executionRpcEndpointLabel } from './execution/execution-connection.js';
+import { SubmissionReconciler,chainRecoveryObserver } from './execution/submission-reconciler.js';
+import { CONFIG,DECIMALS } from './config.js';
+import { toAtomic } from './math.js';
+import { submissionCounters } from './execution/submission-capability.js';
 
 let worker: LiveExecutionWorker | null = null;
 
@@ -10,6 +16,20 @@ async function main(): Promise<void> {
   // its co-located compiled equivalent). Direct invocation can never start a
   // live worker.
   if (!process.send) throw new Error('Isolated live executor has no IPC channel');
+  const noBroadcast=process.env.TRADER_PRODUCTION_SOAK==='1';
+  let bootstrap=await bootstrapExecutor(noBroadcast);
+  const recoveryConnection=createExecutionConnection();
+  const reconciler=new SubmissionReconciler({journal:bootstrap.journal,risk:bootstrap.risk,observe:chainRecoveryObserver(recoveryConnection,CONFIG.executionConfirmationCommitment),height:()=>recoveryConnection.getBlockHeight(CONFIG.executionConfirmationCommitment),pollMs:CONFIG.liveExecutionPollMs,maxObservationAgeMs:2000,endpoint:executionRpcEndpointLabel(),commitment:CONFIG.executionConfirmationCommitment,solPriceAtomic:BigInt(toAtomic(CONFIG.executionSolPriceCeilingUsdc,DECIMALS.USDC))});
+  while(bootstrap.state!=='READY_FOR_SIGNER'){
+    process.send?.({type:'LIVE_EXECUTOR_HEALTH',state:bootstrap.state,reconciliation:reconciler.snapshot()});
+    if(bootstrap.state==='RECONCILIATION_ONLY'){
+      try{await reconciler.tick();bootstrap=await bootstrapExecutor(noBroadcast,bootstrap.journal,bootstrap.risk);}
+      catch{
+        process.send?.({type:'LIVE_EXECUTOR_HEALTH',state:'RECONCILIATION_ONLY',reason:'RECOVERY_RPC_OR_PERSISTENCE_UNAVAILABLE',reconciliation:reconciler.snapshot()});
+      }
+    }
+    if(bootstrap.state!=='READY_FOR_SIGNER')await new Promise(resolve=>setTimeout(resolve,CONFIG.liveExecutionPollMs));
+  }
   log.info('Isolated live executor signer initialization started');
   const signerStartedAt = Date.now();
   log.info('Isolated live executor reading dedicated signer file');
@@ -22,11 +42,13 @@ async function main(): Promise<void> {
   const workerStartedAt = Date.now();
   log.info('Isolated live executor worker initialization started');
   worker = await startLiveExecutionWorker(signer, {
-    noBroadcast: process.env.TRADER_PRODUCTION_SOAK === '1',
+    noBroadcast,bootstrap,
     onManualApprovalUpdate: (view) => process.send?.({ type: 'LIVE_APPROVAL_UPDATE', view }),
   });
   log.info('Isolated live executor worker created', { elapsedMs: Date.now() - workerStartedAt });
   process.send({ type: 'LIVE_EXECUTOR_READY' });
+  process.send({type:'LIVE_EXECUTOR_HEALTH',state:noBroadcast?'NO_BROADCAST':'READY_FOR_NEW_SUBMISSIONS'});
+  setInterval(()=>process.send?.({type:'SUBMISSION_COUNTERS',counters:submissionCounters()}),1000).unref();
   log.info('Isolated live executor IPC ready sent');
 }
 
@@ -46,6 +68,9 @@ process.on('message', async (message: unknown) => {
     type?: string; requestId?: string; executionId?: string; messageHash?: string; approvalToken?: string;
     candidate?: unknown; mints?: unknown;
   };
+  if(value.type==='SUBMISSION_COUNTERS_REQUEST'){
+    process.send({type:'SUBMISSION_COUNTERS',counters:submissionCounters(),final:true});return;
+  }
   if (value.type === 'LIVE_EXECUTOR_PREWARM') {
     if (Array.isArray(value.mints)) {
       worker?.prewarmMints(value.mints.filter((mint): mint is string => typeof mint === 'string').slice(0, 32));

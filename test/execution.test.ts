@@ -10,7 +10,7 @@ import {
   getTwoHopSwapV2Instruction,
 } from '@orca-so/whirlpools-client';
 import { ComputeBudgetProgram, Keypair, PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { kitInstructionToWeb3 } from '../src/execution/instruction-adapter.js';
 import { calculateConfirmedCycleAccounting, confirmAndAccountForCycle } from '../src/execution/confirmation-accounting.js';
 import { PersistentExecutionLock } from '../src/execution/execution-lock.js';
@@ -30,6 +30,7 @@ import {
   type ApprovedSignedExecution,
 } from '../src/execution/approved-transaction.js';
 import { AmbiguousSubmissionError, OneShotBroadcaster, type SubmissionTransport } from '../src/execution/broadcaster.js';
+import { createSubmissionCapability,createSubmissionBroadcaster,submissionCounters } from '../src/execution/submission-capability.js';
 import { handoffIdentity, parseOrcaAtomicHandoff } from '../src/execution/handoff-dto.js';
 import {
   aggregatorHandoffIdentity,
@@ -501,6 +502,43 @@ describe('one-shot broadcaster', () => {
     return { approved, journal, journalPath, risk };
   }
 
+  it.each(['journal-boundary','risk-boundary','before-transport'] as const)('crash at %s cannot cause a duplicate send after restart',async boundary=>{
+    const s=await setup(`fault-${boundary}`),mock=setupTransport(()=>s.approved.transactionSignature);
+    if(boundary==='journal-boundary'){
+      const original=s.journal.transition.bind(s.journal);
+      vi.spyOn(s.journal,'transition').mockImplementation(async(...args)=>{const result=await original(...args);if(args[1]==='SUBMITTING')throw new Error('injected crash');return result;});
+    }else{
+      const original=s.risk.recordSubmissionAttempt.bind(s.risk);
+      vi.spyOn(s.risk,'recordSubmissionAttempt').mockImplementation(async id=>{await original(id);throw new Error('injected crash');});
+    }
+    const broadcaster=new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard});
+    await expect(broadcaster.submit(s.approved)).rejects.toThrow('injected');expect(mock.calls).toHaveLength(0);
+    const restarted=new PersistentExecutionJournal(s.journalPath);await restarted.load();
+    await expect(new OneShotBroadcaster(mock.transport,restarted,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved)).rejects.toThrow();
+    expect(mock.calls).toHaveLength(0);vi.restoreAllMocks();
+  });
+  it.each(['rpc','jito'] as const)('ambiguous %s sends once and never replaces its deterministic signature',async kind=>{
+    const s=await setup(`unknown-${kind}`),mock=setupTransport(()=>s.approved.transactionSignature,new Error('ambiguous'));
+    const transport={...mock.transport,kind};const broadcaster=new OneShotBroadcaster(transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard});
+    await expect(broadcaster.submit(s.approved)).rejects.toBeInstanceOf(AmbiguousSubmissionError);
+    await expect(new OneShotBroadcaster(transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved)).rejects.toThrow();
+    expect(mock.calls).toHaveLength(1);expect(s.journal.get(s.approved.executionId)).toMatchObject({state:'SUBMISSION_UNKNOWN',signature:s.approved.transactionSignature,transportKind:kind,lastValidBlockHeight:999});
+  });
+  it('blocks an already journaled signature even under a different execution ID',async()=>{
+    const s=await setup('original-signature'),mock=setupTransport(()=>s.approved.transactionSignature);
+    await new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved);
+    await s.journal.transition(s.approved.executionId,'CONFIRMING');await s.journal.transition(s.approved.executionId,'CONFIRMED');
+    const duplicate=approveSignedExecutionForSubmission('different-id',s.approved,s.approved.unsignedSimulation,s.approved.signedSimulation);
+    await seedApprovedJournal(s.journal,duplicate);
+    await expect(new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(duplicate)).rejects.toThrow('deterministic signature already journaled');expect(mock.calls).toHaveLength(1);
+  });
+  it('preserves automatic guarded-factory submission with a mock transport and no user-click event',async()=>{
+    const s=await setup('automatic-capability'),mock=setupTransport(()=>s.approved.transactionSignature),before=submissionCounters();
+    const capability=createSubmissionCapability(false,liveGuard,true);
+    await createSubmissionBroadcaster(capability,()=>mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved);
+    const after=submissionCounters();for(const key of Object.keys(before) as Array<keyof typeof before>)expect(after[key]-before[key]).toBe(1);expect(mock.calls).toHaveLength(1);
+  });
+
   it('submits only exact approved bytes and persists SUBMITTED', async () => {
     const state = await setup('approved-send');
     const mock = setupTransport(() => state.approved.transactionSignature);
@@ -554,13 +592,13 @@ describe('one-shot broadcaster', () => {
     await expect(broadcaster.submit(state.approved)).rejects.toThrow('already attempted');
     expect(mock.calls).toHaveLength(1);
     expect(state.journal.get(state.approved.executionId)).toMatchObject({
-      state: 'SUBMITTING', signature: state.approved.transactionSignature,
+      state: 'SUBMISSION_UNKNOWN', signature: state.approved.transactionSignature,
     });
     const restarted = new PersistentExecutionJournal(state.journalPath);
     await restarted.load();
     expect(restarted.unresolved()).toMatchObject([{
       id: state.approved.executionId,
-      state: 'SUBMITTING',
+      state: 'SUBMISSION_UNKNOWN',
       signature: state.approved.transactionSignature,
     }]);
   });
@@ -1034,8 +1072,8 @@ describe('confirmed-balance accounting', () => {
     await journal.transition('confirmation', 'APPROVED');
     await journal.transition('confirmation', 'SIGNING');
     await journal.transition('confirmation', 'SIGNED');
-    await journal.transition('confirmation', 'SUBMITTING');
-    await journal.transition('confirmation', 'SUBMITTED', { signature: 'fixture-signature' });
+    await journal.transition('confirmation', 'SUBMITTING', { signature: 'fixture-signature' });
+    await journal.transition('confirmation', 'SUBMITTED');
     const connection = {
       getSignatureStatuses: async () => ({ value: [{ err: null, confirmationStatus: 'confirmed' }] }),
       getTransaction: async () => ({

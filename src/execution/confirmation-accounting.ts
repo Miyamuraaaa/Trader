@@ -14,6 +14,7 @@ export interface ConfirmationRequest {
   executionId?: string;
   /** Durable risk debit must precede terminal journal state (replay is idempotent). */
   onConfirmed?: (accounting: ConfirmedCycleAccounting, failed: boolean) => Promise<void>;
+  returnFailedAccounting?: boolean;
 }
 
 export class ConfirmedTransactionFailure extends Error {}
@@ -35,6 +36,8 @@ export interface ConfirmedTransactionBalanceData {
 }
 
 export interface ConfirmedCycleAccounting {
+  observedCommitment?: 'confirmed' | 'finalized';
+  failed?: boolean;
   signature: string;
   actualFeeLamports: bigint;
   before: ExecutionBalanceSnapshot;
@@ -112,10 +115,12 @@ export async function confirmAndAccountForCycle(
   }
   const deadline = Date.now() + timeoutMs;
   let confirmed = false;
+  let observedCommitment: 'confirmed'|'finalized'=requiredCommitment;
   while (Date.now() < deadline) {
     const status = (await connection.getSignatureStatuses([request.signature], { searchTransactionHistory: true })).value[0];
     if (status?.confirmationStatus === requiredCommitment || (requiredCommitment === 'confirmed' && status?.confirmationStatus === 'finalized')) {
       confirmed = true;
+      observedCommitment=status.confirmationStatus as 'confirmed'|'finalized';
       break;
     }
     await wait(pollIntervalMs);
@@ -153,9 +158,10 @@ export async function confirmAndAccountForCycle(
       },
     );
     const failed = transaction.meta.err != null;
+    accounting.observedCommitment=observedCommitment;accounting.failed=failed;
     await request.onConfirmed?.(accounting, failed);
     if (request.journal && request.executionId) await request.journal.recordAccounting(request.executionId, accounting, failed);
-    if (failed) throw new ConfirmedTransactionFailure(`Confirmed transaction failed: ${JSON.stringify(transaction.meta.err)}`);
+    if (failed&&!request.returnFailedAccounting) throw new ConfirmedTransactionFailure(`Confirmed transaction failed: ${JSON.stringify(transaction.meta.err)}`);
     return accounting;
   } catch (error) {
     // Missing details / failed persistence remain CONFIRMING for reconciliation.

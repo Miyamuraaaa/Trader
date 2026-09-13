@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { parseTokenAllowlist } from './tokens.js';
+import { validateLiveCriticalConfig } from './execution/live-config-validation.js';
 
 function scannerRpcInt(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name];
@@ -32,7 +33,7 @@ function num(name: string, fallback: number, maxLimit?: number): number {
   if (raw !== undefined && raw !== '') {
     n = Number(raw);
     if (!Number.isFinite(n)) {
-      throw new Error(`Env var ${name} must be a number, got: ${raw}`);
+      throw new Error(`Env var ${name} must be a finite number`);
     }
   }
   if (maxLimit !== undefined && n > maxLimit) {
@@ -55,7 +56,7 @@ function bool(name: string, fallback: boolean): boolean {
   if (raw === undefined || raw === '') return fallback;
   if (raw.toLowerCase() === 'true') return true;
   if (raw.toLowerCase() === 'false') return false;
-  throw new Error(`Env var ${name} must be true or false, got: ${raw}`);
+  throw new Error(`Env var ${name} must be true or false`);
 }
 
 function choice<T extends string>(name: string, fallback: T, allowed: readonly T[]): T {
@@ -309,6 +310,7 @@ export const CONFIG = {
   paperStartingBalanceUsdc: num('PAPER_STARTING_BALANCE_USDC', 100),
   paperMaxDailyLossUsdc: num('PAPER_MAX_DAILY_LOSS_USDC', 2),
 } as const;
+validateLiveCriticalConfig(CONFIG);
 
 export { MINTS, DECIMALS } from './tokens.js';
 

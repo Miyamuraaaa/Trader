@@ -1,11 +1,14 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { CONFIG, DECIMALS, MINTS } from './config.js';
-import { OneShotBroadcaster, SolanaRpcSubmissionTransport } from './execution/broadcaster.js';
+import { SolanaRpcSubmissionTransport } from './execution/broadcaster.js';
+import { createSubmissionBroadcaster } from './execution/submission-capability.js';
+import { bootstrapExecutor } from './execution/executor-bootstrap.js';
+import { SubmissionReconciler,chainRecoveryObserver } from './execution/submission-reconciler.js';
 import { AggregatorHandoffInbox } from './execution/aggregator-handoff-inbox.js';
 import { aggregatorHandoffIdentity, parseAggregatorAtomicHandoff, type AggregatorAtomicHandoff } from './execution/aggregator-handoff-dto.js';
 import { validateAggregatorHandoffForApproval } from './execution/aggregator-handoff-validator.js';
 import { confirmAndAccountForCycle, ConfirmedTransactionFailure, type ConfirmedCycleAccounting } from './execution/confirmation-accounting.js';
-import { PersistentExecutionJournal, type ExecutionRecord } from './execution/execution-journal.js';
+import { PersistentExecutionJournal, SUBMISSION_POSSIBLE_STATES, type ExecutionRecord } from './execution/execution-journal.js';
 import { PersistentExecutionLock } from './execution/execution-lock.js';
 import { handoffIdentity, parseOrcaAtomicHandoff, type OrcaAtomicHandoff } from './execution/handoff-dto.js';
 import { OrcaHandoffInbox } from './execution/handoff-inbox.js';
@@ -56,6 +59,7 @@ export interface LiveExecutionWorker {
 }
 
 export interface LiveExecutionWorkerOptions {
+  bootstrap?: Awaited<ReturnType<typeof bootstrapExecutor>>;
   /** Isolated diagnostic process only: manual acceptance is unavailable for its entire lifetime. */
   noBroadcast?: boolean;
   onManualApprovalUpdate?: (view: ManualApprovalView | null) => void;
@@ -88,7 +92,7 @@ function chargeConfirmedRisk(risk: PersistentRiskManager, id: string, accounting
   // Count fees even if a rent refund masks the SOL debit. Do not count SOL credits as USDC wins.
   return risk.recordConfirmed(id, confirmedRiskPnl(accounting.realizedBasePnlAtomic,
     debit > accounting.actualFeeLamports ? debit : accounting.actualFeeLamports,
-    BigInt(toAtomic(CONFIG.executionSolPriceCeilingUsdc, DECIMALS.USDC))), failed);
+    BigInt(toAtomic(CONFIG.executionSolPriceCeilingUsdc, DECIMALS.USDC))), failed, accounting.signature);
 }
 
 async function reconcile(connection: Connection, journal: PersistentExecutionJournal, record: ExecutionRecord, risk: PersistentRiskManager): Promise<void> {
@@ -263,8 +267,11 @@ export async function startLiveExecutionWorker(
   setOrcaExecutionSnapshotProvider(orcaLiveState);
   let stopped = false;
   let priorityFeeSampler: { stop(): void } | undefined;
-  const journal = new PersistentExecutionJournal();
-  const risk = riskManager();
+  const bootstrap=options.bootstrap??await bootstrapExecutor(noBroadcast);
+  if(bootstrap.state!=='READY_FOR_SIGNER')throw new Error('Executor bootstrap is not ready for candidate execution');
+  const journal = bootstrap.journal;
+  const risk = bootstrap.risk;
+  const reconciler=new SubmissionReconciler({journal,risk,observe:chainRecoveryObserver(connection,CONFIG.executionConfirmationCommitment),height:()=>connection.getBlockHeight(CONFIG.executionConfirmationCommitment),pollMs:CONFIG.liveExecutionPollMs,maxObservationAgeMs:2000,endpoint:executionRpcEndpointLabel(),commitment:CONFIG.executionConfirmationCommitment,solPriceAtomic:BigInt(toAtomic(CONFIG.executionSolPriceCeilingUsdc,DECIMALS.USDC))});
   const inbox = new OrcaHandoffInbox();
   const aggregatorInbox = new AggregatorHandoffInbox();
   log.info('Live executor journal load started');
@@ -623,17 +630,14 @@ export async function startLiveExecutionWorker(
         await captureAndValidateLiveBalances(connection, current.plan);
       }
       risk.assertCanExecute(current.identity, current.economics.conservativeNetAtomic);
-      const submissionTransport = CONFIG.executionSubmissionTransport === 'jito'
-        ? new JitoBlockEngineSubmissionTransport()
-        : new SolanaRpcSubmissionTransport(connection);
-      const broadcaster = new OneShotBroadcaster(
-        submissionTransport, journal, risk, { readinessReady: EXECUTION_IMPLEMENTATION_READY },
+      const broadcaster = createSubmissionBroadcaster(
+        bootstrap.capability,()=>CONFIG.executionSubmissionTransport === 'jito'?new JitoBlockEngineSubmissionTransport():new SolanaRpcSubmissionTransport(connection), journal, risk, { readinessReady: EXECUTION_IMPLEMENTATION_READY },
       );
       const signature = await broadcaster.submit(current.approved);
       logExecutionStage(current.identity, 'SUBMITTED', current.candidate.detectedAt, { signature });
       updatePending('SUBMITTED', { signature });
       log.warn('User-approved live transaction submitted; waiting for confirmation', { signature, identity: current.identity });
-      void confirmPending(current, signature);
+      // Journal-driven reconciliation owns confirmation; pending never gates it.
       return response(true, pending!.view);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -641,7 +645,7 @@ export async function startLiveExecutionWorker(
       if (currentState === 'APPROVED_BY_USER') {
         await journal.transition(current.identity, /stale|expired|age/i.test(reason) ? 'EXPIRED' : 'REJECTED', { reason });
       }
-      if (currentState === 'SUBMITTING') {
+      if (currentState && SUBMISSION_POSSIBLE_STATES.has(currentState)) {
         updatePending('SUBMISSION_UNKNOWN', { reason });
         // A possible network submission is reconciled from its deterministic signature; never release/retry.
         return response(false, pending!.view, 'SUBMISSION_UNKNOWN');
@@ -713,11 +717,8 @@ export async function startLiveExecutionWorker(
 
       risk.assertCanExecute(current.identity, current.economics.conservativeNetAtomic);
 
-      const submissionTransport = CONFIG.executionSubmissionTransport === 'jito'
-        ? new JitoBlockEngineSubmissionTransport()
-        : new SolanaRpcSubmissionTransport(connection);
-      const broadcaster = new OneShotBroadcaster(
-        submissionTransport, journal, risk, { readinessReady: EXECUTION_IMPLEMENTATION_READY },
+      const broadcaster = createSubmissionBroadcaster(
+        bootstrap.capability,()=>CONFIG.executionSubmissionTransport === 'jito'?new JitoBlockEngineSubmissionTransport():new SolanaRpcSubmissionTransport(connection), journal, risk, { readinessReady: EXECUTION_IMPLEMENTATION_READY },
       );
       const signature = await broadcaster.submit(current.approved);
       logExecutionStage(current.identity, 'SUBMITTED', current.candidate.detectedAt, { signature });
@@ -725,15 +726,14 @@ export async function startLiveExecutionWorker(
       log.warn('Auto-executed live transaction submitted; waiting for confirmation', {
         signature, identity: current.identity,
       });
-      // Kick off async confirmation — pending is released after it settles.
-      void confirmPending(current, signature);
+      // Journal-driven reconciliation owns confirmation; pending never gates it.
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       const currentState = journal.get(current.identity)?.state;
       if (currentState === 'APPROVED_BY_USER') {
         await journal.transition(current.identity, /stale|expired|age/i.test(reason) ? 'EXPIRED' : 'REJECTED', { reason });
       }
-      if (currentState === 'SUBMITTING') {
+      if (currentState && SUBMISSION_POSSIBLE_STATES.has(currentState)) {
         updatePending('SUBMISSION_UNKNOWN', { reason });
         log.error('Auto-execution submission ambiguous; requires reconciliation', { identity: current.identity, reason });
         // A possible network submission is reconciled from its deterministic signature; never release/retry.
@@ -763,11 +763,30 @@ export async function startLiveExecutionWorker(
   };
 
   const tick = async (): Promise<void> => {
-    if (tickInFlight || stopped || executionDisabledReason) return;
+    if (tickInFlight || stopped) return;
     tickInFlight = true;
     try {
-      // Auto-execution: if a broadcast is in-flight (confirming), skip this tick.
-      if (pending) return;
+      // Durable submission truth precedes transient pending and risk circuit breakers.
+      if(journal.unresolved().some(record=>SUBMISSION_POSSIBLE_STATES.has(record.state)))process.send?.({type:'LIVE_EXECUTOR_HEALTH',state:'RECONCILIATION_ONLY',reconciliation:reconciler.snapshot()});
+      const recoveryState=await reconciler.tick();
+      if(recoveryState==='RECONCILIATION_ONLY')return;
+      if(recoveryState==='SETTLED'){
+        if(pending){
+          const settled=journal.get(pending.identity);
+          if(settled?.state==='CONFIRMED'||settled?.state==='TRANSACTION_FAILED'){
+            updatePending(settled.state,{signature:settled.signature,actualNetworkFeeLamports:settled.accounting?.actualFeeLamports,realizedUsdcPnl:settled.accounting?fromAtomic(settled.accounting.usdcDelta,DECIMALS.USDC).toFixed():undefined,intermediateDustAtomic:settled.accounting?.intermediateDust});
+            logExecutionStage(pending.identity,settled.state,pending.candidate.detectedAt,{signature:settled.signature});
+          }else updatePending('APPROVAL_EXPIRED',{reason:'EXPIRED_UNLANDED: original signature absent after qualifying block heights'});
+          await releasePending(false);
+        }
+        return;
+      }
+      if(pending){
+        const state=journal.get(pending.identity)?.state;
+        if(state==='CONFIRMED'||state==='TRANSACTION_FAILED'||state==='EXPIRED_UNLANDED')await releasePending(false);
+        else return;
+      }
+      if(executionDisabledReason)return;
       const unresolved = journal.unresolved();
       if (unresolved.length > 0) {
         const recovery = await journal.recoverInterruptedPreSubmission(
@@ -787,6 +806,7 @@ export async function startLiveExecutionWorker(
         return;
       }
       risk.assertCanExecute('scheduler-preflight');
+      process.send?.({type:'LIVE_EXECUTOR_HEALTH',state:noBroadcast?'NO_BROADCAST':'READY_FOR_NEW_SUBMISSIONS',reconciliation:reconciler.snapshot()});
       const selectCandidate = (items: Array<OrcaAtomicHandoff | AggregatorAtomicHandoff>) => items
         .sort((a, b) => b.detectedAt - a.detectedAt)
         .find((item) => {
@@ -843,6 +863,7 @@ export async function startLiveExecutionWorker(
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      process.send?.({type:'LIVE_EXECUTOR_HEALTH',state:'NOT_READY',reconciliation:reconciler.snapshot()});
       if (/MAX_TRADES_PER_SESSION|MAX_CONSECUTIVE_FAILURES|MAX_SESSION_LOSS_USDC/.test(reason)) {
         executionDisabledReason = reason;
         log.warn('Live submission disabled by persistent risk circuit breaker; market scanning continues', { reason });

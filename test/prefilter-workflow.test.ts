@@ -37,7 +37,7 @@ describe('dependent constrained workflow admission', () => {
     const source = await readFile('src/live-execution-worker.ts', 'utf8');
     const approve = source.slice(source.indexOf('const approveManual ='));
     expect(approve.indexOf('if (noBroadcast) return')).toBeLessThan(approve.indexOf("'APPROVED_BY_USER'"));
-    expect(approve.indexOf('if (noBroadcast) return')).toBeLessThan(approve.indexOf('new OneShotBroadcaster'));
+    expect(approve.indexOf('if (noBroadcast) return')).toBeLessThan(approve.indexOf('createSubmissionBroadcaster'));
     expect(source).toContain('No-broadcast validation requires LIVE_TRADING_ENABLED=false');
   });
 });

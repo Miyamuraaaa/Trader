@@ -22,6 +22,7 @@ export function assertJitoEndpoint(value: string): URL {
  * executor's already-completed exact simulation remains mandatory.
  */
 export class JitoBlockEngineSubmissionTransport implements SubmissionTransport {
+  readonly kind='jito' as const;
   private readonly endpoint: URL;
 
   constructor(

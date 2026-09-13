@@ -6,12 +6,12 @@ import type { ConfirmedCycleAccounting } from './confirmation-accounting.js';
 export type ExecutionState =
   | 'DETECTED' | 'HANDOFF_RECEIVED' | 'REVALIDATING' | 'QUOTED' | 'BUILDING' | 'INSPECTING'
   | 'VALIDATING' | 'SIMULATING' | 'FINAL_REVALIDATION' | 'APPROVED' | 'SIGNING' | 'SIGNED' | 'SIGNED_SIMULATION' | 'APPROVED_FOR_SUBMISSION' | 'APPROVED_BY_USER'
-  | 'SUBMITTING' | 'SUBMITTED' | 'CONFIRMING' | 'CONFIRMED'
+  | 'SUBMITTING' | 'SUBMISSION_UNKNOWN' | 'SUBMITTED' | 'CONFIRMING' | 'CONFIRMED' | 'EXPIRED_UNLANDED'
   | 'EXPIRED' | 'REJECTED' | 'SIMULATION_FAILED' | 'SUBMISSION_FAILED'
   | 'TRANSACTION_FAILED' | 'ACCOUNTING_FAILED';
 
 const terminal = new Set<ExecutionState>([
-  'CONFIRMED', 'EXPIRED', 'REJECTED', 'SIMULATION_FAILED', 'SUBMISSION_FAILED', 'TRANSACTION_FAILED', 'ACCOUNTING_FAILED',
+  'CONFIRMED', 'EXPIRED_UNLANDED', 'EXPIRED', 'REJECTED', 'SIMULATION_FAILED', 'SUBMISSION_FAILED', 'TRANSACTION_FAILED', 'ACCOUNTING_FAILED',
 ]);
 
 const transitions: Readonly<Record<ExecutionState, readonly ExecutionState[]>> = {
@@ -32,9 +32,11 @@ const transitions: Readonly<Record<ExecutionState, readonly ExecutionState[]>> =
   // One user-approved refresh may rebuild the same route with fresh market
   // evidence and a new blockhash before the broadcaster sees it.
   APPROVED_BY_USER: ['REVALIDATING', 'SUBMITTING', 'REJECTED', 'EXPIRED'],
-  SUBMITTING: ['SUBMITTED', 'SUBMISSION_FAILED', 'CONFIRMING'],
-  SUBMITTED: ['CONFIRMING', 'TRANSACTION_FAILED', 'ACCOUNTING_FAILED'],
-  CONFIRMING: ['CONFIRMED', 'TRANSACTION_FAILED', 'ACCOUNTING_FAILED'],
+  SUBMITTING: ['SUBMITTED', 'SUBMISSION_UNKNOWN', 'CONFIRMING', 'CONFIRMED', 'TRANSACTION_FAILED', 'EXPIRED_UNLANDED'],
+  SUBMISSION_UNKNOWN: ['CONFIRMING', 'CONFIRMED', 'TRANSACTION_FAILED', 'EXPIRED_UNLANDED'],
+  SUBMITTED: ['CONFIRMING', 'CONFIRMED', 'TRANSACTION_FAILED', 'EXPIRED_UNLANDED'],
+  CONFIRMING: ['CONFIRMED', 'TRANSACTION_FAILED', 'EXPIRED_UNLANDED'],
+  EXPIRED_UNLANDED: [],
   CONFIRMED: [], EXPIRED: [], REJECTED: [], SIMULATION_FAILED: [], SUBMISSION_FAILED: [], TRANSACTION_FAILED: [], ACCOUNTING_FAILED: [],
 };
 
@@ -60,20 +62,38 @@ export interface ExecutionRecord {
   baseMint?: string;
   intermediateMint?: string;
   inputAmount?: string;
+  recoveryVersion?: number;
+  recentBlockhash?: string;
+  lastValidBlockHeight?: number;
+  transportKind?: 'rpc' | 'jito';
+  sendAttemptId?: string;
+  sendBoundaryAt?: number;
+  policyHash?: string;
+  recoveryBlockedReason?: string;
+  observedLanded?: boolean;
+  observedCommitment?: 'confirmed' | 'finalized';
+  recoveryEvidence?: { endpoint: string; commitment: string; height: number; observedMono: number; latencyMs: number;firstHeight?:number;firstObservedMono?:number;finalLookupMono?:number;pollMs?:number };
   createdAt: number;
   updatedAt: number;
   reason?: string;
   accounting?: PersistedAccounting;
 }
 
-interface JournalData { records: ExecutionRecord[]; }
+export const EXECUTION_JOURNAL_VERSION = 2;
+interface JournalData { version?: number; records: ExecutionRecord[]; }
+export function hasRecoveryMetadata(record: ExecutionRecord): boolean {
+  return record.recoveryVersion === 1 && ['signature','serializedTransactionHash','recentBlockhash','wallet','baseMint','intermediateMint','sendAttemptId'].every(k=>typeof record[k as keyof ExecutionRecord]==='string' && String(record[k as keyof ExecutionRecord]).length>0)
+    && typeof record.inputAmount==='string' && /^\d+$/.test(record.inputAmount) && BigInt(record.inputAmount)>0n
+    && Number.isSafeInteger(record.lastValidBlockHeight) && record.lastValidBlockHeight!>0
+    && Number.isFinite(record.sendBoundaryAt) && (record.transportKind==='rpc'||record.transportKind==='jito');
+}
 
 export function assertExecutionTransition(from: ExecutionState, to: ExecutionState): void {
   if (!transitions[from].includes(to)) throw new Error(`Illegal execution state transition: ${from} -> ${to}`);
 }
 
 export const SUBMISSION_POSSIBLE_STATES: ReadonlySet<ExecutionState> = new Set([
-  'SUBMITTING', 'SUBMITTED', 'CONFIRMING',
+  'SUBMITTING', 'SUBMISSION_UNKNOWN', 'SUBMITTED', 'CONFIRMING',
 ]);
 
 export interface JournalRecoveryResult {
@@ -90,6 +110,9 @@ function toPersistedAccounting(value: ConfirmedCycleAccounting): PersistedAccoun
     intermediateDust: value.intermediateDustAtomic.toString(),
   };
 }
+export function terminalAccountingMatches(record:ExecutionRecord,value:ConfirmedCycleAccounting,failed:boolean):boolean{
+  return record.state===(failed?'TRANSACTION_FAILED':'CONFIRMED')&&record.signature===value.signature&&JSON.stringify(record.accounting)===JSON.stringify(toPersistedAccounting(value));
+}
 
 /** Atomic disk journal. Any unresolved submission blocks new execution on restart. */
 export class PersistentExecutionJournal {
@@ -103,30 +126,42 @@ export class PersistentExecutionJournal {
   constructor(private readonly journalPath = path.resolve('data/execution-journal.json')) {}
 
   async load(): Promise<void> {
+    this.assertHealthy();
     try {
       const data = JSON.parse(await readFile(this.journalPath, 'utf8')) as Partial<JournalData>;
       if (!Array.isArray(data.records)) throw new Error('Malformed execution journal');
+      if (data.version !== undefined && data.version !== EXECUTION_JOURNAL_VERSION) throw new Error('Unsupported execution journal schema');
+      const loaded = new Map<string,ExecutionRecord>();
       for (const record of data.records) {
-        if (!record || typeof record.id !== 'string' || !(record.state in transitions) || !Number.isFinite(record.updatedAt)) {
+        if (!record || typeof record.id !== 'string' || !record.id || !Object.hasOwn(transitions,record.state) || !Number.isFinite(record.createdAt) || !Number.isFinite(record.updatedAt)) {
           throw new Error('Malformed execution journal record');
         }
-        this.records.set(record.id, record);
+        if (loaded.has(record.id)) throw new Error('Duplicate execution journal identity');
+        if (SUBMISSION_POSSIBLE_STATES.has(record.state) && !hasRecoveryMetadata(record)) record.recoveryBlockedReason='INSUFFICIENT_LEGACY_METADATA';
+        loaded.set(record.id, record);
       }
+      this.records=loaded;
+      // Readers (including the dashboard process) must never overwrite a newer
+      // executor write with a migration snapshot. The owning bootstrap performs
+      // migration via checkpoint() before signer initialization.
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
 
-  get(id: string): ExecutionRecord | undefined { this.assertHealthy(); return this.records.get(id); }
+  get(id: string): ExecutionRecord | undefined { this.assertHealthy(); const record=this.records.get(id);return record?structuredClone(record):undefined; }
 
   all(): ExecutionRecord[] {
-    return [...this.records.values()].map((record) => ({ ...record }));
+    this.assertHealthy();return structuredClone([...this.records.values()]);
   }
 
   unresolved(): ExecutionRecord[] {
     this.assertHealthy();
-    return [...this.records.values()].filter((record) => !terminal.has(record.state));
+    return structuredClone([...this.records.values()].filter((record) => !terminal.has(record.state)));
   }
+
+  /** Validates writable atomic persistence before a signer is loaded. */
+  async checkpoint():Promise<void>{await this.persist();}
 
   /**
    * A process restart cannot make a pre-submission attempt real. Those records
@@ -163,16 +198,21 @@ export class PersistentExecutionJournal {
   async transition(
     id: string,
     state: ExecutionState,
-    update: Pick<ExecutionRecord, 'messageHash' | 'serializedTransactionHash' | 'signature' | 'wallet' | 'baseMint' | 'intermediateMint' | 'inputAmount' | 'reason'> = {},
+    update: Partial<Omit<ExecutionRecord,'id'|'state'|'createdAt'|'updatedAt'|'accounting'>> = {},
     options: { persist?: boolean } = {},
   ): Promise<ExecutionRecord> {
     this.assertHealthy();
     const current = this.records.get(id);
     if (!current) throw new Error('Execution journal record does not exist');
     assertExecutionTransition(current.state, state);
+    if (SUBMISSION_POSSIBLE_STATES.has(current.state)) {
+      for (const key of ['signature','serializedTransactionHash','recentBlockhash','lastValidBlockHeight','wallet','baseMint','intermediateMint','inputAmount','transportKind','sendAttemptId','sendBoundaryAt','policyHash','recoveryVersion'] as const) {
+        if (update[key] !== undefined && update[key] !== current[key]) throw new Error('Immutable submission metadata changed');
+      }
+    }
     const next = { ...current, ...update, state, updatedAt: Date.now() };
     this.records.set(id, next);
-    if (options.persist !== false) await this.persist();
+    if (options.persist !== false || SUBMISSION_POSSIBLE_STATES.has(state) || terminal.has(state)) await this.persist();
     return next;
   }
 
@@ -181,16 +221,32 @@ export class PersistentExecutionJournal {
     const current = this.records.get(id);
     if (!current) throw new Error('Execution journal record does not exist');
     const state = failed ? 'TRANSACTION_FAILED' as const : 'CONFIRMED' as const;
+    if (current.signature && current.signature!==accounting.signature) throw new Error('Accounting signature mismatch');
+    if (current.state===state && JSON.stringify(current.accounting)===JSON.stringify(toPersistedAccounting(accounting))) return current;
     assertExecutionTransition(current.state, state);
-    const next = { ...current, state, updatedAt: Date.now(), accounting: toPersistedAccounting(accounting) };
+    const next = { ...current, state, updatedAt: Date.now(), accounting: toPersistedAccounting(accounting), observedCommitment: accounting.observedCommitment };
     this.records.set(id, next);
     await this.persist();
     return next;
   }
 
+  async observeRecovery(id: string, update: Pick<ExecutionRecord,'observedLanded'|'observedCommitment'|'recoveryEvidence'>): Promise<void> {
+    this.assertHealthy();const current=this.records.get(id);if(!current||!SUBMISSION_POSSIBLE_STATES.has(current.state))throw new Error('Invalid recovery record');
+    this.records.set(id,{...current,...update,observedLanded:current.observedLanded||update.observedLanded});await this.persist();
+  }
+
+  async recordUnlanded(id:string,evidence:NonNullable<ExecutionRecord['recoveryEvidence']>):Promise<void>{
+    this.assertHealthy();const current=this.records.get(id);if(current?.state==='EXPIRED_UNLANDED')return;
+    if(!current||!hasRecoveryMetadata(current)||current.observedLanded||evidence.height<=current.lastValidBlockHeight!
+      ||evidence.firstHeight===undefined||evidence.firstHeight<=current.lastValidBlockHeight!||evidence.firstHeight>evidence.height
+      ||evidence.firstObservedMono===undefined||!evidence.pollMs||evidence.observedMono-evidence.firstObservedMono<evidence.pollMs
+      ||evidence.finalLookupMono===undefined||evidence.finalLookupMono<evidence.observedMono)throw new Error('Unlanded settlement lacks recovery evidence');
+    await this.transition(id,'EXPIRED_UNLANDED',{recoveryEvidence:evidence,reason:'Two qualifying block heights and final absent signature/transaction; no resend, no fee'});
+  }
+
   private async persist(): Promise<void> {
     this.assertHealthy();
-    try { await writeAtomicJson(this.journalPath, { records: [...this.records.values()] }); }
+    try { await writeAtomicJson(this.journalPath, { version: EXECUTION_JOURNAL_VERSION, records: [...this.records.values()] }); }
     catch (error) { this.persistenceFailed = true; throw error; }
   }
 }

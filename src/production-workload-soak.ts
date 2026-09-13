@@ -55,9 +55,15 @@ const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx'), f
   { cwd: sandbox, env: process.env, stdio: ['ignore','ignore','ignore','ipc'], windowsHide: true });
 let executorReady = false, executorExit: number | null = null, p0Deliveries = 0;
 let executorExited=false;
+let submissionCounts:Record<string,number>|undefined;
+let countersAt=0;
+let executorHealth:unknown;
+let finalCounterAck:(()=>void)|undefined;
 child.on('message', (message: unknown) => {
   if (!message || typeof message !== 'object') return;
-  const value = message as { type?: string; event?: unknown };
+  const value = message as { type?: string; event?: unknown; counters?:Record<string,number>; state?:string; reconciliation?:unknown; final?:boolean };
+  if(value.type==='SUBMISSION_COUNTERS'&&value.counters){submissionCounts=value.counters;countersAt=performance.now();if(value.final)finalCounterAck?.();}
+  if(value.type==='LIVE_EXECUTOR_HEALTH')executorHealth={state:value.state,reconciliation:value.reconciliation};
   if (value.type === 'LIVE_EXECUTOR_READY') executorReady = true;
   if (value.type === 'EXECUTION_FUNNEL_EVENT') { const event = FunnelTelemetry.safeParse(value.event); if (event.success) executionFunnel.record(event.data); }
   // LIVE_APPROVAL_UPDATE is intentionally ignored. No acceptance can be sent.
@@ -82,6 +88,7 @@ void scanner.scanLoop().catch(() => { scannerFailed = true; });
 const samples: Array<ReturnType<typeof snapshot>> = [];
 const rpcTraceCursor=new Map<string,number>();
 const snapshot = () => ({ elapsedMs: performance.now() - start,wallElapsedMs:Date.now()-wallStart, executorReady, executorExit,executorExited, scannerFailed, p0Deliveries,
+  submissionCounts,submissionCounterAgeMs:countersAt?performance.now()-countersAt:null,executorHealth,
   rpcTransport:scannerRpcTransportSnapshot(rpcTraceCursor),coverage:executableCoverage.snapshot(),
   scanner: scanner.scannerOperationalMetrics(), stages: scannerStageProfile(), funnel: executionFunnel.snapshot(), workflows: workflowProjectionSnapshot(),
   jupiter: { work: jupiterWorkMetrics.snapshot(), admission: jupiterAdmission.snapshot() }, raptor: { work: raptorWorkMetrics.snapshot(), admission: raptorAdmission.snapshot() },
@@ -94,22 +101,29 @@ let checkpointFailures = 0;
 const finish = async () => {
   if (stopping) return; stopping = true; clearInterval(timer);
   scanner.stopScanner(); dynamic.stopDynamicTokenDiscovery(); stream?.stop(); unsubscribe();
+  let finalCountersReceived=false;
+  await new Promise<void>(resolve=>{
+    const timeout=setTimeout(resolve,2000);
+    finalCounterAck=()=>{finalCountersReceived=true;clearTimeout(timeout);resolve();};
+    if(child.connected)child.send({type:'SUBMISSION_COUNTERS_REQUEST'});
+  });
+  const zeroBroadcastVerified=finalCountersReceived&&submissionCounts!==undefined&&['broadcasterFactory','transportConstruction','broadcasterSubmit','transportSend','submittedSignatures'].every(k=>submissionCounts![k]===0);
   child.kill('SIGTERM');
   const report = { kind: 'PRODUCTION_SCANNER_ISOLATED_EXECUTOR_NO_BROADCAST', requestedDurationMs: durationMs, durationMs: performance.now() - start,
-    manualApprovalAvailable: false, approvals:0,submissions:0,submittedSignatures:[],broadcasts: 0, checkpointFailures,
+    manualApprovalAvailable: false, approvals:0,submissions:submissionCounts?.broadcasterSubmit??null,submittedSignatures:submissionCounts?.submittedSignatures??null,broadcasts:submissionCounts?.transportSend??null,submissionCounts,zeroBroadcastVerified,finalCountersReceived,checkpointFailures,
     earlyStop,constrainedEvidence,safetyStart,safetyEnd:fingerprint(),safetyUnchanged:safetyStart===fingerprint(),
     healthySamples:samples.length>0&&samples.every(s=>s.executorReady&&!s.scannerFailed&&!s.executorExited),
     wallClockDriftMaxMs:Math.max(0,...samples.map(s=>Math.abs(s.wallElapsedMs-s.elapsedMs))),
     continuity: soakContinuity(samples.map((sample) => sample.elapsedMs), durationMs), snapshot: snapshot(), samples };
   const rpcSummary=summarizeRpcTraces([...samples,report.snapshot].flatMap(s=>s.rpcTransport.endpoints.flatMap(e=>e.traces)),report.durationMs);
-  const validProductionSoak=validLongSoak({continuity:report.continuity.validProductionSoak,healthySamples:report.healthySamples,safetyUnchanged:report.safetyUnchanged,checkpointFailures,wallClockDriftMaxMs:report.wallClockDriftMaxMs,executorReady,executorExited,scannerFailed});
+  const validProductionSoak=zeroBroadcastVerified&&validLongSoak({continuity:report.continuity.validProductionSoak,healthySamples:report.healthySamples,safetyUnchanged:report.safetyUnchanged,checkpointFailures,wallClockDriftMaxMs:report.wallClockDriftMaxMs,executorReady,executorExited,scannerFailed});
   await writeFile(outputPath, safeJson({...report,validProductionSoak,rpcSummary}), { flag: 'wx' });
   // Evidence must be durable before potentially hanging WebSocket unsubscribe.
   void direct.stopDirectMarketStream().catch(() => {});
   try { db.close(); } catch { /* independent asynchronous scanner drain */ }
   await lock.release();
-  const earlyStopValid=earlyStop&&!!constrainedEvidence&&p0Deliveries===0&&report.safetyUnchanged;
-  process.stdout.write(JSON.stringify({ finished: true, outputPath, durationMs: report.durationMs,executorReady,executorExit,scannerFailed,validProductionSoak,earlyStopValid,safetyUnchanged:report.safetyUnchanged,broadcasts:0 })+'\n');
+  const earlyStopValid=zeroBroadcastVerified&&earlyStop&&!!constrainedEvidence&&p0Deliveries===0&&report.safetyUnchanged;
+  process.stdout.write(JSON.stringify({ finished: true, outputPath, durationMs: report.durationMs,executorReady,executorExit,scannerFailed,validProductionSoak,earlyStopValid,safetyUnchanged:report.safetyUnchanged,zeroBroadcastVerified,submissionCounts,broadcasts:report.broadcasts })+'\n');
   process.exit((validProductionSoak||earlyStopValid)&&report.safetyUnchanged&&!scannerFailed ? 0 : 2);
 };
 const timer = setInterval(() => {

@@ -19,7 +19,7 @@ interface RiskStateJson {
   dateKeyUTC: string;
   dailyPnlAtomic: string;
   failedTransactionCostAtomic: string;
-  settled: Record<string, { pnl: string; failed: boolean }>;
+  settled: Record<string, { pnl: string; failed: boolean; signature?:string; outcome?:'LANDED'|'UNLANDED'; evidenceHash?:string }>;
   haltReason?: string;
   executedIds: string[];
   tradeCount: number;
@@ -34,7 +34,7 @@ const legacySchema = z.object({ executedIds: z.array(z.string().min(1)), tradeCo
   failedTransactions: count.default(0), consecutiveFailures: count, realizedPnlAtomic: atomic }).strict();
 const riskSchema = legacySchema.extend({ version: z.literal(2), sessionId: z.string().min(1), sessionStartedAt: count,
   dateKeyUTC: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), dailyPnlAtomic: atomic, failedTransactionCostAtomic: atomic,
-  settled: z.record(z.object({ pnl: atomic, failed: z.boolean() }).strict()), haltReason: z.string().optional() }).strict();
+  settled: z.record(z.object({ pnl: atomic, failed: z.boolean(),signature:z.string().min(1).optional(),outcome:z.enum(['LANDED','UNLANDED']).optional(),evidenceHash:z.string().optional() }).strict()), haltReason: z.string().optional() }).strict();
 
 export function confirmedRiskPnl(baseDelta: bigint, solDebitLamports: bigint, solPriceUsdcAtomic: bigint): bigint {
   if (solPriceUsdcAtomic <= 0n) throw new Error('Invalid SOL risk price ceiling');
@@ -128,11 +128,12 @@ export class PersistentRiskManager {
   }
 
   /** Idempotent reconciliation, persisted BEFORE terminal journal accounting. */
-  async recordConfirmed(opportunityId: string, realizedPnlAtomic: bigint, failed: boolean): Promise<void> {
+  async recordConfirmed(opportunityId: string, realizedPnlAtomic: bigint, failed: boolean, signature?:string, outcome:'LANDED'|'UNLANDED'='LANDED',evidenceHash?:string): Promise<void> {
     if (this.persistenceFailed) throw new Error('Risk persistence failed');
+    if(signature&&Object.entries(this.state.settled).some(([id,value])=>id!==opportunityId&&value.signature===signature))throw new Error('Conflicting settlement identity for deterministic signature');
     const previous = Object.hasOwn(this.state.settled, opportunityId) ? this.state.settled[opportunityId] : undefined;
     if (previous) {
-      if (previous.pnl !== realizedPnlAtomic.toString() || previous.failed !== failed) throw new Error('Conflicting confirmed accounting');
+      if (previous.pnl !== realizedPnlAtomic.toString() || previous.failed !== failed || (signature!==undefined&&previous.signature!==signature) || (previous.outcome!==undefined&&previous.outcome!==outcome) || (evidenceHash!==undefined&&previous.evidenceHash!==evidenceHash)) throw new Error('Conflicting confirmed accounting');
       return;
     }
     this.rollDay();
@@ -141,12 +142,12 @@ export class PersistentRiskManager {
       this.state.executedIds.push(opportunityId); this.state.tradeCount++;
     }
     if (failed) { this.state.failedTransactions++; this.state.consecutiveFailures++; }
-    else this.state.consecutiveFailures = 0;
+    else if(outcome==='LANDED') this.state.consecutiveFailures = 0;
     this.state.realizedPnlAtomic = (BigInt(this.state.realizedPnlAtomic) + realizedPnlAtomic).toString();
     this.state.dailyPnlAtomic = (BigInt(this.state.dailyPnlAtomic) + realizedPnlAtomic).toString();
     if (failed && realizedPnlAtomic < 0n) this.state.failedTransactionCostAtomic = (BigInt(this.state.failedTransactionCostAtomic) - realizedPnlAtomic).toString();
     if (this.limits.maxSingleTradeLossAtomic !== undefined && -realizedPnlAtomic > this.limits.maxSingleTradeLossAtomic) this.state.haltReason = 'MAX_SINGLE_TRADE_LOSS_USDC exceeded; operator review required';
-    this.state.settled[opportunityId] = { pnl: realizedPnlAtomic.toString(), failed };
+    this.state.settled[opportunityId] = { pnl: realizedPnlAtomic.toString(), failed, ...(signature?{signature,outcome}:{}),...(evidenceHash?{evidenceHash}:{}) };
     await this.persist();
   }
 
