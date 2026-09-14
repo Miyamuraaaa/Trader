@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { performance } from 'node:perf_hooks';
 import { retryAfterMs } from './http.js';
+import { opportunityQuality, sourceLaneContext } from './economics/opportunity-quality.js';
 import { dispatchDrift } from './dispatch-diagnostics.js';
 import { QuoteAdmission, semanticQuoteKey, type QuoteDeadline } from './quote-admission.js';
 import { ScannerFairService } from './scanner-service-policy.js';
@@ -101,6 +102,7 @@ dayResetInterval.unref();
 interface QueuedRequest {
   deadline: QuoteDeadline;
   queuedAt: number;
+  sourceLane?: import('./execution/source-lane.js').SourceLane;
   params: QuoteParams;
   cacheKey: string;
   resolve: (q: Quote) => void;
@@ -276,12 +278,14 @@ async function processQueue() {
       
       try {
         const quote = await jupiterAdmission.dispatch(req.deadline, () => {
+          if (req.sourceLane) opportunityQuality.count(req.sourceLane, 'jupiter', 'legalSends');
           finish = jupiterWorkMetrics.start(req.queuedAt);
           return executeQuoteWithRetry({ ...req.params, scheduling: { deadlineMono: req.deadline.deadlineMono, traceId: req.deadline.traceId } });
         });
         finish?.(true);
         req.resolve(quote);
       } catch (err) {
+        if (req.sourceLane) opportunityQuality.count(req.sourceLane, 'jupiter', err instanceof Error && 'status' in err && err.status === 429 ? 'http429' : /DEADLINE/.test(String(err)) ? 'deadlineDrops' : 'dispatchFailures');
         finish?.(false, /429/.test(String(err)));
         req.reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -321,13 +325,14 @@ async function executeQuoteWithRetry(params: QuoteParams): Promise<Quote> {
 const shortCache = new Map<string, { quote: Quote, expires: number }>();
 
 export async function getQuote(params: QuoteParams): Promise<Quote> {
+  const sourceLane = sourceLaneContext.getStore();
   params = structuredClone(params);
   const cacheKey = semanticQuoteKey('jupiter', params);
   const cached = shortCache.get(cacheKey);
   jupiterStats.cacheMisses++;
   return jupiterAdmission.request(params, (deadline) => new Promise<Quote>((resolve, reject) => {
     if (queue.length >= 128) { reject(new Error('Jupiter scanner quote queue capacity exceeded')); return; }
-    queue.push({ params, deadline, cacheKey, resolve, reject, queuedAt: Date.now() });
+    queue.push({ params, deadline, cacheKey, resolve, reject, queuedAt: Date.now(), sourceLane });
     const cancel = () => { const index = queue.findIndex((q) => q.deadline === deadline); if (index >= 0) queue.splice(index, 1); reject(new Error('DISCOVERY_QUEUE_CANCELLED')); };
     deadline.signal?.addEventListener('abort', cancel, { once: true });
     if (deadline.signal?.aborted) { cancel(); return; }

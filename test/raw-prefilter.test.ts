@@ -4,7 +4,7 @@ import { CONFIG, MINTS } from '../src/config.js';
 import type { Quote, QuoteProviderName } from '../src/aggregators/types.js';
 import type { RoundTripResult } from '../src/routes.js';
 import { calculateEstimatedRoundTripProfit } from '../src/profit.js';
-import { buildExecutableCandidateFromRaw } from '../src/execution/scanner-executable-prefilter.js';
+import { buildExecutableCandidateFromRaw, buildExecutableFastLane } from '../src/execution/scanner-executable-prefilter.js';
 import { PrefilterCoalescer, type PrefilterTrace } from '../src/execution/prefilter-trace.js';
 import { RawPrefilterLedger } from '../src/execution/raw-prefilter-ledger.js';
 import { scannerLifecycleDisplay } from '../src/execution/scanner-display-eligibility.js';
@@ -31,6 +31,21 @@ const costs = { referenceSolPriceUsdc: 150, estimatedNetworkCostsUsdc: { baseNet
 const supported = async () => ({ status: 'SUPPORTED' as const, rentLamports: 0 });
 
 describe('TEST DATA ONLY: raw-positive constrained prefilter', () => {
+  it('fast lane uses one min-propagated quote and attributes nonpositive economics directly', async () => {
+    const buy = quote('jupiter', MINTS.USDC, MINTS.SOL, '50000');
+    const sell = vi.fn(async (provider: QuoteProviderName, input: string, output: string, amount: string) => ({ ...quote(provider,input,output,amount),outAmount:'49000',otherAmountThreshold:'48000' }));
+    const result = await buildExecutableFastLane(buy,'raptor',costs,{policy:supported,quote:sell});
+    expect(result.status).toBe('EXEC_SURFACE_EXPECTED_NONPOSITIVE');
+    expect(result.economicBreakdown?.economicOutcome).toBe('EXEC_SURFACE_EXPECTED_NONPOSITIVE');
+    expect(sell).toHaveBeenCalledTimes(1);expect(sell.mock.calls[0]?.[3]).toBe(buy.otherAmountThreshold);
+  });
+  it('fast lane still returns the same executable candidate after a genuine conservative pass',async()=>{
+    const buy=quote('jupiter',MINTS.USDC,MINTS.SOL,'50000');
+    const sell=vi.fn(async(provider:QuoteProviderName,input:string,output:string,amount:string)=>quote(provider,input,output,amount));
+    const result=await buildExecutableFastLane(buy,'raptor',costs,{policy:supported,quote:sell});
+    expect(result.status).toBe('EXECUTABLE_CANDIDATE');expect(sell).toHaveBeenCalledTimes(1);
+    expect(isFreshPositiveAuditedExecutionSignal(result.route!)).toBe(true);
+  });
   it('never spends policy or provider capacity on above-cap raw positives', async () => {
     const candidate = raw(); candidate.buyQuote.inAmount = '1000000000000';
     const policy = vi.fn(supported); const quoted = vi.fn(async (...args: Parameters<typeof quote>) => quote(...args));

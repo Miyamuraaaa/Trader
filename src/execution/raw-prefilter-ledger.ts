@@ -1,4 +1,5 @@
 import type { PrefilterTrace } from './prefilter-trace.js';
+import { ECONOMIC_OUTCOMES } from '../economics/economic-breakdown.js';
 
 /** Raw-stage windows are detection cohorts, not unrelated completion-time event buckets. */
 export class RawPrefilterLedger {
@@ -8,6 +9,7 @@ export class RawPrefilterLedger {
   private records = new Map<string, { trace: PrefilterTrace; result: string; sourceResult?: string }>();
   private session: Record<string, number> = { RAW_POSITIVE: 0, PENDING: 0 };
   constructor(private readonly now: () => number = Date.now) {}
+  has(id: string): boolean { return this.records.has(id); }
   register(id: string, trace: PrefilterTrace): void {
     if (this.records.has(id)) return;
     this.records.set(id, { trace, result: 'PENDING' }); this.session.RAW_POSITIVE!++; this.session.PENDING!++;
@@ -21,7 +23,7 @@ export class RawPrefilterLedger {
     record.result = ({ EXECUTABLE_CANDIDATE: 'EXECUTOR_CONSTRAINED_POSITIVE', DISCOVERY_ONLY_TOKEN_2022: 'TOKEN_2022_DISCOVERY_ONLY',
       RAW_SIGNAL_ENDED: 'PREFILTER_QUEUE_DEADLINE_EXCEEDED', RAW_STALE_BEFORE_PREFILTER: 'PREFILTER_STALE',
       COALESCED: 'QUOTE_FAILED', OBSERVATION_ONLY: 'QUOTE_FAILED', TELEMETRY_CAPACITY: 'QUOTE_FAILED', RAW_NOT_POSITIVE: 'ECONOMICS_DIVERGED' } as Record<string, string>)[result] ?? result;
-    if (!['ABOVE_LIVE_CAP','UNSUPPORTED_PROVIDER_PAIR','TOKEN_2022_DISCOVERY_ONLY','TOKEN_POLICY_REJECTED','ROUTE_POLICY_REJECTED','ECONOMICS_DIVERGED','PREFILTER_QUEUE_DEADLINE_EXCEEDED','PREFILTER_RATE_LIMITED','QUOTE_FAILED','PREFILTER_STALE','EXECUTOR_CONSTRAINED_POSITIVE'].includes(record.result)) {
+    if (![...ECONOMIC_OUTCOMES,'ABOVE_LIVE_CAP','UNSUPPORTED_PROVIDER_PAIR','TOKEN_2022_DISCOVERY_ONLY','TOKEN_POLICY_REJECTED','ROUTE_POLICY_REJECTED','ECONOMICS_DIVERGED','PREFILTER_QUEUE_DEADLINE_EXCEEDED','PREFILTER_RATE_LIMITED','QUOTE_FAILED','PREFILTER_STALE','EXECUTOR_CONSTRAINED_POSITIVE'].includes(record.result)) {
       this.missingTerminals++;
       this.violations.push({ id, lastStage: 'UNKNOWN_TERMINAL_OUTCOME' }); this.violations = this.violations.slice(-100);
       record.result = 'QUOTE_FAILED';

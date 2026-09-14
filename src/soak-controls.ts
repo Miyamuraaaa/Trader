@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 export function parseSoakArguments(args:readonly string[]){
+  const comparison = args.includes('--opportunity-quality-comparison');
   const minutes=args.find(a=>a.startsWith('--duration-minutes='));const ms=args.find(a=>a.startsWith('--duration-ms='));
   if(minutes&&ms)throw new Error('Specify only one duration');
   const durationMs=minutes?Number(minutes.split('=')[1])*60000:ms?Number(ms.split('=')[1]):5400000;
-  if(!Number.isInteger(durationMs)||durationMs<3600000||durationMs>7200000)throw new Error('Production soak duration must be 60..120 minutes');
-  return {durationMs,earlyStop:args.includes('--stop-after-constrained-economics')};
+  if(!Number.isInteger(durationMs)||durationMs<(comparison?900000:3600000)||durationMs>(comparison?3600000:7200000))throw new Error(comparison?'Quality comparison duration must be 15..60 minutes':'Production soak duration must be 60..120 minutes');
+  if(comparison&&args.includes('--stop-after-constrained-economics'))throw new Error('Quality comparison requires its full requested duration');
+  return {durationMs,earlyStop:args.includes('--stop-after-constrained-economics'),comparison};
 }
 export function safetyFingerprint(config:object){
   // Values are hashed, never printed. Exclude identity/endpoint/signer/auth material entirely.

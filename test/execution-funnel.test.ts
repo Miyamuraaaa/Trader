@@ -16,9 +16,10 @@ describe('TEST DATA: execution funnel semantics', () => {
   });
   it('explains zero READY using actual elimination counts', () => {
     const funnel = new ExecutionFunnel(() => 1000);
-    expect(funnel.snapshot().explanation).toContain('No raw positive');
+    expect(funnel.snapshot().explanation).toContain('0 completed broad positives');
     for (const stage of ['RAW_POSITIVE', 'ECONOMICS_DIVERGED', 'EXECUTION_ROUTE_CHANGED']) funnel.record({ identity: 'TEST', stage, at: 1000, detectedAt: 1000 });
-    expect(funnel.snapshot().explanation).toContain('1 raw positives -> 0 executable');
+    expect(funnel.snapshot().explanation).toContain('1 completed broad positives');
+    expect(funnel.snapshot().explanation).toContain('0 executable-surface attempts');
     expect(funnel.snapshot().last15m.EXECUTION_ROUTE_CHANGED).toBe(1);
   });
   it('derives executor stage percentiles only from matching evidence', () => {

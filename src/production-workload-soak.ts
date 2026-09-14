@@ -11,7 +11,7 @@ import { summarizeRpcTraces } from './rpc-soak-report.js';
 // Actual scanner + isolated executor, no HTTP server and no approval bridge.
 console.log = console.warn = console.error = () => {};
 const workspace = fileURLToPath(new URL('../', import.meta.url));
-const {durationMs,earlyStop}=parseSoakArguments(process.argv.slice(2));
+const {durationMs,earlyStop,comparison}=parseSoakArguments(process.argv.slice(2));
 const { config } = await import('dotenv');
 config({ path: join(workspace, '.env') }); // Normal runtime loading; contents never printed or copied.
 process.env.EXECUTION_MODE = 'live';
@@ -49,6 +49,8 @@ const { getScanCycles } = await import('./token-universe.js');
 const { toAtomic } = await import('./math.js');
 const { db } = await import('./db.js');
 const { scannerHistoryBuffer } = await import('./scanner-history-buffer.js');
+const { economicDiagnosticBuffer } = await import('./diagnostics/economic-diagnostics.js');
+const { telemetryRun } = await import('./execution/source-lane.js');
 const { executablePairCoordinator } = await import('./executable-pair-coordinator.js');
 const { writeAtomicJson } = await import('./persistence/atomic-json-file.js');
 const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx'), fileURLToPath(new URL('./production-soak-child.ts', import.meta.url))],
@@ -109,7 +111,8 @@ const finish = async () => {
   });
   const zeroBroadcastVerified=finalCountersReceived&&submissionCounts!==undefined&&['broadcasterFactory','transportConstruction','broadcasterSubmit','transportSend','submittedSignatures'].every(k=>submissionCounts![k]===0);
   child.kill('SIGTERM');
-  const report = { kind: 'PRODUCTION_SCANNER_ISOLATED_EXECUTOR_NO_BROADCAST', requestedDurationMs: durationMs, durationMs: performance.now() - start,
+  await economicDiagnosticBuffer.flush();
+  const report = { ...telemetryRun, comparison, diagnosticDirectory:join(sandbox,'data',`economic-diagnostics-${telemetryRun.runId}`), kind: 'PRODUCTION_SCANNER_ISOLATED_EXECUTOR_NO_BROADCAST', requestedDurationMs: durationMs, durationMs: performance.now() - start,
     manualApprovalAvailable: false, approvals:0,submissions:submissionCounts?.broadcasterSubmit??null,submittedSignatures:submissionCounts?.submittedSignatures??null,broadcasts:submissionCounts?.transportSend??null,submissionCounts,zeroBroadcastVerified,finalCountersReceived,checkpointFailures,
     earlyStop,constrainedEvidence,safetyStart,safetyEnd:fingerprint(),safetyUnchanged:safetyStart===fingerprint(),
     healthySamples:samples.length>0&&samples.every(s=>s.executorReady&&!s.scannerFailed&&!s.executorExited),

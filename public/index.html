@@ -635,7 +635,7 @@
                             const f = p.executionFunnel;
                             document.getElementById('execution-funnel-summary').textContent = f.explanation;
                             const counts = document.getElementById('execution-funnel-counts'); counts.replaceChildren();
-                            for (const stage of ['RAW_POSITIVE','EXECUTOR_CONSTRAINED_POSITIVE','P0_HANDOFF','EXECUTOR_RECEIVED','ROUTE_ALIGNED','SIMULATION_PASSED','FINAL_PROFITABILITY_PASSED','READY_TO_EXECUTE','USER_APPROVED','SUBMITTED','CONFIRMED']) {
+                            for (const stage of ['BROAD_ROUND_TRIP_POSITIVE','EXEC_SURFACE_OBSERVATION_STARTED','EXEC_SURFACE_OBSERVATION_COMPLETED','EXEC_SURFACE_POSITIVE','P0_HANDOFF','EXECUTOR_RECEIVED','ROUTE_ALIGNED','SIMULATION_PASSED','FINAL_PROFITABILITY_PASSED','READY_TO_EXECUTE','USER_APPROVED','SUBMITTED','CONFIRMED']) {
                                 const line = document.createElement('div');
                                 line.textContent = `${stage}: ${f.session[stage] || 0} session / ${f.last5m[stage] || 0} 5m / ${f.last15m[stage] || 0} 15m`; counts.append(line);
                             }
@@ -664,10 +664,14 @@
                                 const row = document.createElement('div'); row.textContent = `${stage}: p50/p90 ${metric.requestLatencyP50 ?? '-'}/${metric.requestLatencyP90 ?? '-'}ms (${metric.requests60s} samples/60s)`; counts.append(row);
                             }
                             const signals = document.getElementById('positive-signal-diagnostics'); signals.replaceChildren();
-                            if (!f.lastPositiveSignals.length) signals.textContent = 'No positive signals this session.';
+                            const schema = document.createElement('div'); schema.textContent = `Telemetry v${f.telemetrySchemaVersion ?? 'legacy'} | run ${f.runId ?? 'unknown'} | older RAW_POSITIVE cohorts include unproven attempts.`; counts.append(schema);
+                            for (const blocker of f.quality?.blockers ?? []) {
+                                const row = document.createElement('div'); row.textContent = `Economic classification: ${blocker.outcome}: ${blocker.count}${blocker.percent === null ? ' (small sample)' : ` (${blocker.percent.toFixed(1)}%)`}`; counts.append(row);
+                            }
+                            if (!f.lastPositiveSignals.length) signals.textContent = 'No positive signals or executable observations this session.';
                             for (const s of f.lastPositiveSignals) {
                                 const card = document.createElement('div');
-                                card.textContent = `${new Date(s.detectedAt).toLocaleTimeString()} ${s.providers} | mint ${s.intermediateMint} | input ${s.inputAmount} raw USDC | raw ${s.rawNet} / worst ${s.rawWorstCase} | constrained ${s.constrainedNet ?? 'unavailable'} / worst ${s.constrainedWorstCase ?? 'unavailable'} | network ${s.networkFee ?? '?'} priority ${s.priorityFee ?? '?'} ATA ${s.ataRent ?? '?'} USDC | pools ${s.pools.flat().join(' -> ')} | prefilter ${s.prefilterResult ?? 'pending'} | P0 ${s.p0Handoff ? 'yes' : 'no'} | executor ${s.executorResult ?? 'not received'} | alignment ${s.routeAlignment ?? 'not evaluated'} | final conservative ${s.finalConservativeNet ?? 'unavailable'} | latency ms ${JSON.stringify(s.latencyByStage ?? {})}`;
+                                card.textContent = `${new Date(s.detectedAt).toLocaleTimeString()} ${s.sourceLane ?? 'BROAD_MATRIX'} ${s.providers} | mint ${s.intermediateMint} | input ${s.inputAmount} atomic USDC | broad ${s.rawNet ?? 'not observed'} / worst ${s.rawWorstCase ?? 'not observed'} | constrained ${s.constrainedNet ?? 'unavailable'} / worst ${s.constrainedWorstCase ?? 'unavailable'} | network ${s.networkFee ?? '?'} priority ${s.priorityFee ?? '?'} ATA ${s.ataRent ?? '?'} USDC | pools ${s.pools.flat().join(' -> ')} | prefilter ${s.prefilterResult ?? 'pending'} | P0 ${s.p0Handoff ? 'yes' : 'no'} | executor ${s.executorResult ?? 'not received'} | alignment ${s.routeAlignment ?? 'not evaluated'} | final conservative ${s.finalConservativeNet ?? 'unavailable'} | latency ms ${JSON.stringify(s.latencyByStage ?? {})}`;
                                 signals.append(card);
                                 if (s.prefilterTrace) {
                                     const t = s.prefilterTrace; const trace = document.createElement('div');

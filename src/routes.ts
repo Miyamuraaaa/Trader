@@ -27,6 +27,8 @@ export type OpportunityScope =
   | 'DISCOVERY_ONLY_TOKEN_2022';
 
 export interface RoundTripResult {
+  sourceLane?: import('./execution/source-lane.js').SourceLane;
+  advisoryBreakdown?: import('./economics/economic-breakdown.js').EconomicBreakdownV1;
   previousSignalId?: string;
   refreshIdentity?: string;
   diagnosticSignalId?: string;

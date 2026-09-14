@@ -30,6 +30,8 @@ const sizes = last.sizes.map((size) => ({ ...size,
     event, Math.max(0,...samples.map((s)=>s.sizes.find((x)=>x.size===size.size)?.counts[event]??0))])),
 }));
 console.log(JSON.stringify({ verdict,submissionCounts:counts,zeroBroadcastVerified:report.zeroBroadcastVerified??false,executorRecovery:last.executorHealth,partial: report.partial === true || gapIndex >= 0, durationMs: report.durationMs ?? report.elapsedMs,
+  telemetrySchemaVersion: report.telemetrySchemaVersion ?? 1,
+  telemetryWarning: report.telemetrySchemaVersion === 2 ? undefined : 'LEGACY_RAW_POSITIVE_COHORT_CONTAINS_UNPROVEN_FAST_LANE_ATTEMPTS',
   continuousPrefixMs:last.elapsedMs, measurementGapDetected:gapIndex >= 0,
   samples: samples.length, executorReady: last.executorReady, executorExit: last.executorExit, scannerFailed:last.scannerFailed,
   throughputRolling60s: Object.fromEntries(['totalRouteEvals60s','aggregatorFastLaneEvals60s','directLaneEvals60s','mixedLaneEvals60s'].map((key)=>[key,range(samples.map((s)=>s.scanner[key]))])),

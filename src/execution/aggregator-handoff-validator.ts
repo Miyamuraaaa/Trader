@@ -1,4 +1,5 @@
 import { Connection } from '@solana/web3.js';
+import { observeExecutorEconomics } from '../economics/executor-breakdown.js';
 import { CONFIG, DECIMALS, MINTS } from '../config.js';
 import { toAtomic } from '../math.js';
 import {
@@ -220,6 +221,7 @@ export async function validateAggregatorHandoffForApproval(
       executorToSimulationMs: unsignedSimulation.timing.simulationResponseAt - plan.quoteReceivedAt,
     });
     const economics = calculateExecutorEconomics(plan, unsignedSimulation);
+    observeExecutorEconomics(plan, economics, identity, candidate.detectedAt);
     logExecutionStage(identity, 'FINAL_CHECK', candidate.detectedAt, {
       freshnessEvidenceAt: plan.quoteReceivedAt,
       quoteAgeMs: Date.now() - plan.quoteReceivedAt,

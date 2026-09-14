@@ -1,4 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
+import { observeExecutorEconomics } from '../economics/executor-breakdown.js';
 import { CONFIG, DECIMALS, MINTS } from '../config.js';
 import { toAtomic } from '../math.js';
 import {
@@ -290,6 +291,7 @@ export async function validateOrcaHandoffForApproval(
       unitsConsumed: unsignedSimulation.unitsConsumed,
     });
     const economics = calculateExecutorEconomics(finalPlan, unsignedSimulation);
+    observeExecutorEconomics(finalPlan, economics, identity, candidate.detectedAt);
     await transition('FINAL_REVALIDATION');
     assertFinalHandoffPolicy(finalPlan, unsignedSimulation, economics);
     logExecutionStage(identity, 'FINAL_PROFITABILITY_PASS', candidate.detectedAt, {

@@ -12,6 +12,7 @@ export function raptorLegalSendSnapshot(){return {counts:{...legalCounts},events
 import { z } from 'zod';
 import { CONFIG } from './config.js';
 import { getJson, HttpError } from './http.js';
+import { opportunityQuality, sourceLaneContext } from './economics/opportunity-quality.js';
 import { log } from './logger.js';
 import {
   assertAtomicAmount,
@@ -69,6 +70,7 @@ export const raptorStats = {
 interface QueuedRaptorRequest<T> {
   deadline: QuoteDeadline;
   queuedAt: number;
+  sourceLane?: import('./execution/source-lane.js').SourceLane;
   task: () => Promise<T>;
   priority: QuoteParams['priority'];
   resolve: (value: T) => void;
@@ -111,7 +113,7 @@ async function paceRequest(): Promise<{pacingThisTurnMs:number;cooldownThisTurnM
 function enqueue(task: () => Promise<Quote>, priority: QuoteParams['priority'], deadline: QuoteDeadline): Promise<Quote> {
   return new Promise<Quote>((resolve, reject) => {
     if (queue.length >= 128) { reject(new Error('Raptor scanner quote queue capacity exceeded')); return; }
-    queue.push({ task, priority, deadline, resolve, reject, queuedAt: Date.now() });
+    queue.push({ task, priority, deadline, resolve, reject, queuedAt: Date.now(), sourceLane: sourceLaneContext.getStore() });
     const cancel = () => { const index = queue.findIndex((q) => q.deadline === deadline); if (index >= 0) queue.splice(index, 1); reject(new Error('DISCOVERY_QUEUE_CANCELLED')); };
     deadline.signal?.addEventListener('abort', cancel, { once: true });
     if (deadline.signal?.aborted) { cancel(); return; }
@@ -139,11 +141,12 @@ async function processQueue(): Promise<void> {
       const cls=request.priority==='EXEC_PREFILTER_HIGH'?'P0':request.priority==='HIGH'||request.priority==='DISCOVERY_HIGH'?'P1':'P2';
       const event:Record<string,unknown>={...waits,class:cls,candidateId:request.deadline.traceId,reservationId:request.deadline.entitlement?.reservationId,queueAndPacingMs:Date.now()-request.queuedAt,queueDepth:queue.length,capacity:request.deadline.entitlement?'protected':'native',nextLegalSendAt:raptorStats.lastRequestTime+CONFIG.raptorSafetyIntervalMs,cooldownRemainingMs:Math.max(0,backoffUntil-Date.now())};
       try {
-        request.resolve(await raptorAdmission.dispatch(request.deadline, () => { event.httpStartMono=performance.now();legalCounts[cls]=(legalCounts[cls]??0)+1;finish = raptorWorkMetrics.start(request.queuedAt); return request.task(); }));
+        request.resolve(await raptorAdmission.dispatch(request.deadline, () => { if (request.sourceLane) opportunityQuality.count(request.sourceLane, 'raptor', 'legalSends'); event.httpStartMono=performance.now();legalCounts[cls]=(legalCounts[cls]??0)+1;finish = raptorWorkMetrics.start(request.queuedAt); return request.task(); }));
         event.result='SUCCESS';
         finish?.(true);
       } catch (error) {
         event.result=providerFailureReason(error);event.httpStatus=error instanceof HttpError?error.status:undefined;
+        if (request.sourceLane) opportunityQuality.count(request.sourceLane, 'raptor', error instanceof HttpError && error.status === 429 ? 'http429' : /DEADLINE/.test(String(error)) ? 'deadlineDrops' : 'dispatchFailures');
         finish?.(false, /429/.test(String(error)));
         request.reject(error);
       }finally{event.finishedMono=performance.now();legalEvent(event);}

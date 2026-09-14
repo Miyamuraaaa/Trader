@@ -1,18 +1,26 @@
 import { z } from 'zod';
 import { RawPrefilterLedger } from './raw-prefilter-ledger.js';
 import type { PrefilterTrace } from './prefilter-trace.js';
+import { telemetryRun, LEGACY_COHORT_WARNING, type SourceLane } from './source-lane.js';
+import type { EconomicBreakdownV1 } from '../economics/economic-breakdown.js';
+import { EconomicTelemetry, economicComparison } from '../economics/economic-telemetry.js';
+import { opportunityQuality } from '../economics/opportunity-quality.js';
 
 export const FunnelTelemetry = z.object({ identity: z.string().max(200), stage: z.string().max(80),
+  economicBreakdown: EconomicTelemetry.optional(),
   monotonicAt: z.number().finite().optional(),
   at: z.number().finite(), detectedAt: z.number().finite(), reason: z.string().max(100).optional(), conservativeNetAtomic: z.string().regex(/^-?\d+$/).optional() }).strict();
 export type FunnelEvent = z.infer<typeof FunnelTelemetry>;
 export interface PositiveSignal {
+  sourceLane?: SourceLane;
+  economicBreakdown?: EconomicBreakdownV1;
+  executorComparison?: ReturnType<typeof economicComparison>;
   previousSignalId?: string;
   prefilterReason?: string;
   prefilterTrace?: PrefilterTrace;
   liveEligibility?: string;
   id: string; detectedAt: number; providers: string; intermediateMint: string; inputAmount: string;
-  rawNet: string; rawWorstCase: string; constrainedNet?: string; constrainedWorstCase?: string;
+  rawNet?: string; rawWorstCase?: string; constrainedNet?: string; constrainedWorstCase?: string;
   networkFee?: string; priorityFee?: string; ataRent?: string; pools: string[][];
   prefilterResult?: string; executionId?: string; p0Handoff?: boolean; executorResult?: string;
   routeAlignment?: string; finalConservativeNet?: string; latencyByStage?: Record<string, number>;
@@ -25,13 +33,24 @@ const stages: Record<string, string> = { EXECUTABLE_CANDIDATE: 'EXECUTOR_CONSTRA
 
 export class ExecutionFunnel {
   readonly raw: RawPrefilterLedger;
+  readonly executable: RawPrefilterLedger;
   private events: FunnelEvent[] = [];
   private seen = new Map<string, number>();
   private totals: Record<string, number> = {};
   private signals: PositiveSignal[] = [];
   private readonly startedAt: number;
-  constructor(private readonly now: () => number = Date.now) { this.startedAt = now(); this.raw = new RawPrefilterLedger(now); }
+  constructor(private readonly now: () => number = Date.now) { this.startedAt = now(); this.raw = new RawPrefilterLedger(now); this.executable = new RawPrefilterLedger(now); }
+  startExecutableObservation(id: string, trace: PrefilterTrace): void {
+    this.executable.register(id, trace);
+    this.record({ identity: id, stage: 'EXEC_SURFACE_OBSERVATION_STARTED', at: this.now(), detectedAt: trace.rawPositiveDetectedAt });
+  }
+  finishExecutableObservation(id: string, result: string, trace?: PrefilterTrace): void {
+    this.executable.finish(id, result, trace);
+    this.record({ identity: id, stage: 'EXEC_SURFACE_OBSERVATION_COMPLETED', at: this.now(), detectedAt: trace?.rawPositiveDetectedAt ?? this.now() });
+    if (result === 'EXECUTABLE_CANDIDATE') this.record({ identity: id, stage: 'EXECUTABLE_CANDIDATE', at: this.now(), detectedAt: trace?.rawPositiveDetectedAt ?? this.now() });
+  }
   record(event: FunnelEvent): void {
+    if (event.stage === 'RAW_POSITIVE') this.record({ ...event, stage: 'BROAD_ROUND_TRIP_POSITIVE' });
     event = { ...event, monotonicAt: event.monotonicAt ?? Number(process.hrtime.bigint() / 1000000n) };
     if (event.stage === 'REJECTED' && event.reason) {
       const reason = ({ NOT_PROFITABLE: 'BELOW_FINAL_PROFIT_THRESHOLD', STALE: 'EXPIRED', TOKEN_POLICY: 'TOKEN_POLICY_REJECTED', ROUTE_DIVERGED: 'EXECUTION_ROUTE_CHANGED' } as Record<string, string>)[event.reason] ?? event.reason;
@@ -41,10 +60,13 @@ export class ExecutionFunnel {
     const key = `${event.identity}:${stage}`;
     this.prune();
     if (!this.seen.has(key)) {
+      if (event.economicBreakdown) opportunityQuality.executor(event.identity, event.economicBreakdown);
+      opportunityQuality.stage(event.identity, stage);
       this.seen.set(key, event.at); this.events.push({ ...event, stage }); this.totals[stage] = (this.totals[stage] ?? 0) + 1;
     }
     const signal = this.signals.find((s) => s.executionId === event.identity);
     if (signal) {
+      if (event.economicBreakdown && signal.economicBreakdown) signal.executorComparison = economicComparison(signal.economicBreakdown, event.economicBreakdown);
       if (event.conservativeNetAtomic !== undefined) signal.finalConservativeNet = `${Number(event.conservativeNetAtomic) / 1_000_000}`;
       signal.executorResult = event.reason ?? stage;
       if (stage === 'ROUTE_ALIGNED' || stage === 'EXECUTION_ROUTE_CHANGED') signal.routeAlignment = stage;
@@ -86,6 +108,7 @@ export class ExecutionFunnel {
     }));
     const counts = (ms: number) => {
       const all = this.events.filter((e) => e.at >= this.now() - ms).reduce<Record<string, number>>((all, e) => { all[e.stage] = (all[e.stage] ?? 0) + 1; return all; }, {});
+      const executablePositive = all.EXECUTOR_CONSTRAINED_POSITIVE;
       const cohort = this.raw.snapshot(ms);
       if (cohort.session.RAW_POSITIVE) {
         all.MARKET_SIGNAL_ENDED_BEFORE_PREFILTER = 0;
@@ -93,18 +116,24 @@ export class ExecutionFunnel {
         for (const [key, value] of Object.entries(cohort.buckets)) all[stages[key] ?? key] = value;
         all.RAW_POSITIVE = cohort.rawPositive; all.PREFILTER_STARTED = cohort.started; all.PREFILTER_COMPLETED = cohort.completed;
       }
+      if (executablePositive !== undefined) all.EXECUTOR_CONSTRAINED_POSITIVE = executablePositive;
+      if (all.EXECUTOR_CONSTRAINED_POSITIVE !== undefined) all.EXEC_SURFACE_POSITIVE = all.EXECUTOR_CONSTRAINED_POSITIVE;
       return all;
     };
     const last15m = counts(900_000);
     const rawPrefilter = { last60s: this.raw.snapshot(60_000), last5m: this.raw.snapshot(300_000), last15m: this.raw.snapshot(900_000) };
-    const explanation = !(last15m.RAW_POSITIVE ?? 0)
-      ? 'No raw positive spreads survived conservative market costs in the last 15m.'
-      : `Last 15m: ${last15m.RAW_POSITIVE ?? 0} raw positives -> ${last15m.EXECUTOR_CONSTRAINED_POSITIVE ?? 0} executable -> ${last15m.READY_TO_EXECUTE ?? 0} READY; ${rawPrefilter.last15m.rawPositive ? Object.entries(rawPrefilter.last15m.buckets).map(([key, count]) => `${key}: ${count}`).join(', ') : `economics diverged ${last15m.ECONOMICS_DIVERGED ?? 0}, Token-2022 ${last15m.TOKEN_2022_DISCOVERY_ONLY ?? 0}, route policy ${last15m.ROUTE_POLICY_REJECTED ?? 0}, above cap ${last15m.ABOVE_LIVE_CAP ?? 0}`}.`;
+    const explanation = `Last 15m: ${last15m.BROAD_ROUND_TRIP_POSITIVE ?? 0} completed broad positives; ${last15m.EXEC_SURFACE_OBSERVATION_STARTED ?? 0} executable-surface attempts; ${last15m.EXEC_SURFACE_POSITIVE ?? 0} constrained positives; ${last15m.READY_TO_EXECUTE ?? 0} READY. Attempts are not positive signals.`;
     const session = { ...this.totals };
     if (rawPrefilter.last15m.session.RAW_POSITIVE) {
       for (const [key, value] of Object.entries(rawPrefilter.last15m.session)) session[stages[key] ?? key] = value;
     }
-    return { startedAt: this.startedAt, session, last60s: counts(60_000), last5m: counts(300_000), last15m,
+    const executableObservations = this.executable.snapshot();
+    const { rawPositive: observationCount, session: observationSession, ...observationDetail } = executableObservations;
+    const { RAW_POSITIVE: startedObservations, ...terminalSession } = observationSession;
+    session.EXECUTOR_CONSTRAINED_POSITIVE = this.totals.EXECUTOR_CONSTRAINED_POSITIVE ?? 0;
+    session.EXEC_SURFACE_POSITIVE = session.EXECUTOR_CONSTRAINED_POSITIVE;
+    return { ...telemetryRun, legacyWarning: LEGACY_COHORT_WARNING, startedAt: this.startedAt, session, last60s: counts(60_000), last5m: counts(300_000), last15m,
+      quality: opportunityQuality.snapshot(), executableObservations: { ...observationDetail, observations: observationCount, session: { ...terminalSession, EXEC_SURFACE_OBSERVATION_STARTED: startedObservations } },
       explanation, timings, adjacentStageLatency, rawPrefilter, lastPositiveSignals: structuredClone(this.signals), windowEventCapacity: 100_000 };
   }
 }
@@ -116,4 +145,13 @@ export function emitFunnelExecutionStage(identity: string, stage: string, detect
   if (process.send && process.connected) {
     queueMicrotask(() => { if (process.connected) process.send?.({ type: 'EXECUTION_FUNNEL_EVENT', event }, () => undefined); });
   } else executionFunnel.record(event);
+}
+
+/** Post-computation observation only; malformed diagnostics never change approval. */
+export function emitExecutorEconomicBreakdown(identity: string, detectedAt: number, breakdown: EconomicBreakdownV1): void {
+  const parsed = EconomicTelemetry.safeParse(breakdown);
+  if (!parsed.success) return;
+  const event: FunnelEvent = { identity, stage: 'EXECUTOR_ECONOMICS_COMPUTED', at: Date.now(), detectedAt, economicBreakdown: parsed.data };
+  if (process.send && process.connected) queueMicrotask(() => { if (process.connected) process.send?.({ type: 'EXECUTION_FUNNEL_EVENT', event }, () => undefined); });
+  else executionFunnel.record(event);
 }

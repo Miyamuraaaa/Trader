@@ -1,5 +1,8 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { performance } from 'node:perf_hooks';
+import { scannerBreakdown } from '../economics/scanner-breakdown.js';
+import { measuredProviderCall } from '../economics/opportunity-quality.js';
+import type { EconomicBreakdownV1, EconomicOutcome } from '../economics/economic-breakdown.js';
 import { providerFailureReason } from '../provider-failure.js';
 import { jupiterAdmission } from '../jupiter.js';
 import { raptorAdmission } from '../raptor.js';
@@ -7,7 +10,7 @@ import { workflowParentDeadline, projectWorkflow, recordWorkflowProjection } fro
 import { getProviderQuote } from '../aggregators/index.js';
 import { isFullFillQuote, type Quote, type QuoteProviderName, type QuoteParams } from '../aggregators/types.js';
 import { CONFIG, DECIMALS, LAMPORTS_PER_SOL, MINTS } from '../config.js';
-import { fromAtomic, toAtomic } from '../math.js';
+import { exact, fromAtomic, toAtomic } from '../math.js';
 import { calculateEstimatedRoundTripProfit, type EstimatedCostInput } from '../profit.js';
 import { runScannerRpc,scannerRpcContext } from '../scanner-rpc-limiter.js';
 import { scannerConnection } from '../scanner-rpc-transport.js';
@@ -35,6 +38,7 @@ import type { PrefilterTrace } from './prefilter-trace.js';
 const SHADOW_CAP_DIAGNOSTIC = Symbol('NON_AUTHORIZING_SHADOW_CAP_DIAGNOSTIC');
 
 export type ExecutablePrefilterStatus =
+  | EconomicOutcome
   | 'EXECUTABLE_CANDIDATE'
   | 'RAW_NOT_POSITIVE'
   | 'UNSUPPORTED_PROVIDER_PAIR'
@@ -48,12 +52,17 @@ export type ExecutablePrefilterStatus =
 export interface ScannerExecutableCostSnapshot {
   referenceSolPriceUsdc: number;
   estimatedNetworkCostsUsdc: {
+    diagnosticSource?: EstimatedCostInput['diagnosticSource'];
     baseNetworkFeeUsdc: number;
     priorityFeeUsdc: number;
   };
 }
 
 export interface ExecutablePrefilterResult {
+  comparison?: { earlierPositiveBreakdownId: string; constrainedBreakdownId: string; underlyingOutcome: EconomicOutcome;
+    routeShapeChanged: boolean | null; poolSetChanged: boolean; marketMovementComparable: boolean;
+    rawToExecutableExpectedDeltaAtomic: string | null; evidenceAgeDeltaMs: number | null };
+  economicBreakdown?: EconomicBreakdownV1;
   costs?: EstimatedCostInput;
   trace?: PrefilterTrace;
   estimatedAtaRentUsdc?: number;
@@ -90,6 +99,9 @@ function scannerExecutionCosts(
   const ataRentUsdc = refundableWsolRent ? 0
     : missingIntermediateAtaRentLamports / LAMPORTS_PER_SOL * snapshot.referenceSolPriceUsdc;
   return {
+    diagnosticSource: snapshot.estimatedNetworkCostsUsdc.diagnosticSource ? { ...snapshot.estimatedNetworkCostsUsdc.diagnosticSource,
+      priorityFeeLamports: exact(snapshot.estimatedNetworkCostsUsdc.diagnosticSource.priorityFeeLamports).mul(priorityScale).toFixed(),
+      ataRentLamports: String(refundableWsolRent ? 0 : missingIntermediateAtaRentLamports) } : undefined,
     baseNetworkFeeUsdc: snapshot.estimatedNetworkCostsUsdc.baseNetworkFeeUsdc,
     priorityFeeUsdc: snapshot.estimatedNetworkCostsUsdc.priorityFeeUsdc * priorityScale,
     ataRentUsdc,
@@ -223,7 +235,8 @@ export async function buildExecutableCandidateFromRaw(
   if (!isExecutableProviderPair(buyProvider, sellProvider)) {
     return { status: 'UNSUPPORTED_PROVIDER_PAIR' };
   }
-  const quote = options.quote ?? ((provider, input, output, amount, scheduling) => constrainedQuote(provider, input, output, amount, scheduling, options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC));
+  const quoteWork = options.quote ?? ((provider, input, output, amount, scheduling) => constrainedQuote(provider, input, output, amount, scheduling, options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC));
+  const quote: typeof quoteWork = (provider, input, output, amount, scheduling) => measuredProviderCall(options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC ? 'ABOVE_CAP_SHADOW' : raw.sourceLane ?? 'BROAD_MATRIX', provider, () => quoteWork(provider, input, output, amount, scheduling));
   const windowMs = [buyProvider, sellProvider].includes('raptor') ? CONFIG.raptorExecutionQuoteAgeMs : CONFIG.maxExecutionQuoteAgeMs;
   let parentDeadline: number;
   try { parentDeadline = workflowParentDeadline(performance.now(), now(), trace.rawQuoteEvidenceAt, windowMs); }
@@ -332,12 +345,21 @@ export async function buildExecutableCandidateFromRaw(
       validationTier,
       opportunityScope: 'EXECUTABLE_CANDIDATE',
     };
+    const economicBreakdown = scannerBreakdown(route, scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC ? 'ABOVE_CAP_SHADOW' : raw.sourceLane ?? 'BROAD_MATRIX', options.traceId);
     if (validationTier !== 'CONSERVATIVE_CANDIDATE'
       || !profit.estimatedNetProfitUsdc.gt(0)
       || !profit.worstCaseNetProfitUsdc.gt(0)) {
-      return { status: 'ECONOMICS_DIVERGED', route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc), reason: 'Executor-constrained route is not conservatively profitable' };
+      const earlier = raw.advisoryBreakdown ?? scannerBreakdown(raw, costs.estimatedNetworkCostsUsdc, raw.sourceLane ?? 'BROAD_MATRIX', raw.diagnosticSignalId, false);
+      const shapeKnown = earlier.routeShapeEvidenceComplete && economicBreakdown.routeShapeEvidenceComplete;
+      const samePools = earlier.poolSetHash === economicBreakdown.poolSetHash;
+      const comparison = { earlierPositiveBreakdownId: earlier.breakdownId, constrainedBreakdownId: economicBreakdown.breakdownId, underlyingOutcome: economicBreakdown.economicOutcome,
+        routeShapeChanged: shapeKnown ? earlier.routeShapeHash !== economicBreakdown.routeShapeHash : null,
+        poolSetChanged: !samePools, marketMovementComparable: !!shapeKnown && samePools && earlier.routeShapeHash === economicBreakdown.routeShapeHash,
+        rawToExecutableExpectedDeltaAtomic: earlier.postCostExpectedNetAtomic !== undefined && economicBreakdown.postCostExpectedNetAtomic !== undefined ? (BigInt(economicBreakdown.postCostExpectedNetAtomic) - BigInt(earlier.postCostExpectedNetAtomic)).toString() : null,
+        evidenceAgeDeltaMs: economicBreakdown.leg1EvidenceAgeMs === undefined || earlier.leg1EvidenceAgeMs === undefined ? null : economicBreakdown.leg1EvidenceAgeMs - earlier.leg1EvidenceAgeMs };
+      return { status: 'ECONOMICS_DIVERGED', economicBreakdown, comparison, route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc), reason: 'Executor-constrained route is not conservatively profitable' };
     }
-    return { status: 'EXECUTABLE_CANDIDATE', route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc) };
+    return { status: 'EXECUTABLE_CANDIDATE', economicBreakdown, route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc) };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);
@@ -351,6 +373,7 @@ export async function buildExecutableCandidateFromRaw(
 export async function evaluateAboveCapShadow(raw: RoundTripResult, costs: ScannerExecutableCostSnapshot) {
   const result = await buildExecutableCandidateFromRaw(raw, costs, { diagnosticCapability: SHADOW_CAP_DIAGNOSTIC });
   return { status: result.status === 'EXECUTABLE_CANDIDATE' ? 'SHADOW_CONSTRAINED_POSITIVE' : result.status,
+    economicBreakdown: result.economicBreakdown,
     expectedNet: result.route?.profit.estimatedNetProfitUsdc.toFixed(6), conservativeNet: result.route?.profit.worstCaseNetProfitUsdc.toFixed(6), costs: result.costs,
     authoritative: false as const, p0Allowed: false as const };
 }
@@ -363,7 +386,10 @@ export async function buildExecutableFastLane(
   const now = options.now ?? Date.now;
   const mono = options.monotonicNow ?? options.now ?? (() => performance.now());
   const startedMono = mono();
-  const trace: PrefilterTrace = { rawPositiveDetectedAt: buy.responseTimestamp, rawQuoteEvidenceAt: buy.responseTimestamp, rawQuoteAgeAtDetectionMs: 0, executablePrefilterQueuedAt: now(), executablePrefilterStartedAt: now(), rawAgeAtPrefilterStartMs: Math.max(0, now() - buy.responseTimestamp), prefilterQueueMs: 0 };
+  // Legacy trace field names remain wire-compatible; this is an observation start,
+  // not a positive. The deadline below still derives from the original buy evidence.
+  const observedAt = now();
+  const trace: PrefilterTrace = { rawPositiveDetectedAt: observedAt, rawQuoteEvidenceAt: buy.responseTimestamp, rawQuoteAgeAtDetectionMs: Math.max(0, observedAt - buy.responseTimestamp), executablePrefilterQueuedAt: observedAt, executablePrefilterStartedAt: observedAt, rawAgeAtPrefilterStartMs: Math.max(0, observedAt - buy.responseTimestamp), prefilterQueueMs: 0 };
   
   const timed = async <T>(stage: 'tokenPolicy' | 'constrainedLeg1' | 'constrainedLeg2', work: () => Promise<T>): Promise<T> => {
     trace[`${stage}StartedAt`] = now();
@@ -412,7 +438,7 @@ export async function buildExecutableFastLane(
     (async () => {
        scheduling.deadlineMono = parentDeadline - (options.quote ? 0 : localReserveMs);
        scheduling.entitlement = downstreamClaim;
-       return timed('constrainedLeg2', () => quote(sellProvider, buy.outputMint, MINTS.USDC, buy.otherAmountThreshold, scheduling));
+       return timed('constrainedLeg2', () => measuredProviderCall('EXECUTABLE_FAST_LANE', sellProvider, () => quote(sellProvider, buy.outputMint, MINTS.USDC, buy.otherAmountThreshold, scheduling)));
     })()
   ]).finally(() => releaseDownstream?.());
 
@@ -443,11 +469,12 @@ export async function buildExecutableFastLane(
     const category = categorizeProfit(profit);
     const validationTier = classifyValidationTier(category, stale, liquidityOverlap, profit);
     const route: RoundTripResult = { buyQuote: buy, sellQuote: sell, classification: classifyRoute(buy, sell), liquidityOverlap, quoteSkewMs, stale, profit, category, validationTier, opportunityScope: 'EXECUTABLE_CANDIDATE' };
+    const economicBreakdown = scannerBreakdown(route, scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), 'EXECUTABLE_FAST_LANE', options.traceId);
     
     if (validationTier !== 'CONSERVATIVE_CANDIDATE' || !profit.estimatedNetProfitUsdc.gt(0) || !profit.worstCaseNetProfitUsdc.gt(0)) {
-      return finish({ status: 'ECONOMICS_DIVERGED', route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc), reason: 'Executor-constrained route is not conservatively profitable' });
+      return finish({ status: economicBreakdown.economicOutcome === 'EXEC_SURFACE_POSITIVE' ? 'UNATTRIBUTED_ECONOMICS' : economicBreakdown.economicOutcome, economicBreakdown, route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc), reason: 'Executor-constrained route is not conservatively profitable' });
     }
-    return finish({ status: 'EXECUTABLE_CANDIDATE', route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc) });
+    return finish({ status: 'EXECUTABLE_CANDIDATE', economicBreakdown, route, costs: scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint), estimatedAtaRentUsdc: Number(scannerExecutionCosts(costs, tokenPolicy.rentLamports, buy.outputMint).ataRentUsdc) });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const policy = /escaped the audited|partial executable|same pool|propagation|exactly one auditable pool/i.test(reason);

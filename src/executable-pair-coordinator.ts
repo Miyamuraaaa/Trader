@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
+import { measuredProviderCall } from './economics/opportunity-quality.js';
 import { CONFIG, DECIMALS, MINTS } from './config.js';
 import { fromAtomic, toAtomic } from './math.js';
 import { getProviderQuote } from './aggregators/index.js';
@@ -27,8 +28,8 @@ export class ExecutablePairCoordinator {
     this.count('REFRESH_STARTED');
     try{
       if((await classifyIntermediate(raw.buyQuote.outputMint)).status!=='SUPPORTED'){this.count('TOKEN_POLICY_REJECTED');return;}
-      const quote=async(q:Quote,amount:string,retainedEvidenceAt?:number)=>getProviderQuote(q.provider,{inputMint:q.inputMint,outputMint:q.outputMint,amountAtomic:amount,slippageBps:CONFIG.slippageBps,
-        priority:'DISCOVERY_HIGH',...executableQuoteConstraints(q.provider),scheduling:{deadlineMono:performance.now()+CONFIG.raptorExecutionQuoteAgeMs-(retainedEvidenceAt===undefined?0:Math.max(0,Date.now()-retainedEvidenceAt)),traceId:'refresh:'+raw.diagnosticSignalId}});
+      const quote=async(q:Quote,amount:string,retainedEvidenceAt?:number)=>measuredProviderCall('PAIR_REFRESH',q.provider,()=>getProviderQuote(q.provider,{inputMint:q.inputMint,outputMint:q.outputMint,amountAtomic:amount,slippageBps:CONFIG.slippageBps,
+        priority:'DISCOVERY_HIGH',...executableQuoteConstraints(q.provider),scheduling:{deadlineMono:performance.now()+CONFIG.raptorExecutionQuoteAgeMs-(retainedEvidenceAt===undefined?0:Math.max(0,Date.now()-retainedEvidenceAt)),traceId:'refresh:'+raw.diagnosticSignalId}}));
       // Refresh buy first whenever it is older; retaining sell requires identical exact input.
       let buy=raw.buyQuote,sell=raw.sellQuote;
       if(buy.responseTimestamp<=sell.responseTimestamp||Date.now()-buy.responseTimestamp>CONFIG.raptorExecutionQuoteAgeMs/2){
@@ -49,7 +50,7 @@ export class ExecutablePairCoordinator {
       const category=categorizeProfit(profit);this.count('FRESH_POSITIVE_PAIR');
       return {...raw,buyQuote:buy,sellQuote:sell,profit,category,stale:false,quoteSkewMs:skew,
         validationTier:classifyValidationTier(category,false,raw.liquidityOverlap,profit),opportunityScope:'RAW_MARKET_OPPORTUNITY',
-        diagnosticSignalId:undefined,previousSignalId:raw.diagnosticSignalId,refreshIdentity:randomUUID()};
+        sourceLane:'PAIR_REFRESH',advisoryBreakdown:undefined,diagnosticSignalId:undefined,previousSignalId:raw.diagnosticSignalId,refreshIdentity:randomUUID()};
     }catch{this.count('REFRESH_FAILED');return;}finally{this.active=false;}
   }
 }

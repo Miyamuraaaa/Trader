@@ -19,6 +19,7 @@ export interface EstimatedRoundTripProfit {
 }
 
 export interface EstimatedCostInput {
+  diagnosticSource?: Readonly<{ baseFeeLamports: string; priorityFeeLamports: string; ataRentLamports?: string; solPriceMicrounits: string; capturedAtWallMs: number }>;
   baseNetworkFeeUsdc: string | number;
   priorityFeeUsdc: string | number;
   ataRentUsdc?: string | number;
