@@ -363,6 +363,8 @@ export async function startLiveExecutionWorker(
     });
   }, CONFIG.providerHealthIntervalMs);
   stateMetricsTimer.unref();
+  // Activated only by the no-broadcast comparison bootstrap, never production.
+  comparisonBarrier.onStop(()=>{stopped=true;if(timer)clearTimeout(timer);clearInterval(stateMetricsTimer);priorityFeeSampler?.stop();});
   const attemptedCandidates = new Set<string>();
   const latestAttemptedByRoute = new Map<string, number>();
   const directCandidates: Array<OrcaAtomicHandoff | AggregatorAtomicHandoff> = [];
@@ -764,11 +766,13 @@ export async function startLiveExecutionWorker(
 
   const tick = async (): Promise<void> => {
     if (tickInFlight || stopped) return;
+    const endComparison=comparisonBarrier.begin({id:pending?.identity??'executor-tick',sourceLane:null,stage:'EXECUTOR_TICK'});
     tickInFlight = true;
     try {
       // Durable submission truth precedes transient pending and risk circuit breakers.
       if(journal.unresolved().some(record=>SUBMISSION_POSSIBLE_STATES.has(record.state)))process.send?.({type:'LIVE_EXECUTOR_HEALTH',state:'RECONCILIATION_ONLY',reconciliation:reconciler.snapshot()});
       const recoveryState=await reconciler.tick();
+      if(comparisonBarrier.stopped)return;
       if(recoveryState==='RECONCILIATION_ONLY')return;
       if(recoveryState==='SETTLED'){
         if(pending){
@@ -874,6 +878,7 @@ export async function startLiveExecutionWorker(
       });
     } finally {
       tickInFlight = false;
+      endComparison();
     }
   };
   const schedule = (): void => {
@@ -926,3 +931,4 @@ export async function startLiveExecutionWorker(
     },
   };
 }
+import { comparisonBarrier } from './comparison-drain.js';

@@ -10,6 +10,7 @@ export class RawPrefilterLedger {
   private session: Record<string, number> = { RAW_POSITIVE: 0, PENDING: 0 };
   constructor(private readonly now: () => number = Date.now) {}
   has(id: string): boolean { return this.records.has(id); }
+  pendingObservations(){return [...this.records].filter(([,r])=>r.result==='PENDING').map(([id,r])=>({id,sourceLane:null,stage:r.trace.constrainedLeg2StartedAt!==undefined?'CONSTRAINED_LEG2':r.trace.constrainedLeg1StartedAt!==undefined?'CONSTRAINED_LEG1':'PREFILTER_PENDING'}));}
   register(id: string, trace: PrefilterTrace): void {
     if (this.records.has(id)) return;
     this.records.set(id, { trace, result: 'PENDING' }); this.session.RAW_POSITIVE!++; this.session.PENDING!++;

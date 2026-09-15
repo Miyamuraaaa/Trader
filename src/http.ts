@@ -56,6 +56,7 @@ export async function getJson<T = unknown>(
   const provider = options.provider ?? 'HTTP provider';
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    comparisonBarrier.assertOpen();
     try {
       const res = await fetch(url, {
         method: 'GET',
@@ -71,6 +72,7 @@ export async function getJson<T = unknown>(
           : withJitter(Math.min(baseBackoffMs * 2 ** attempt, 8000));
         lastErr = new HttpError(`HTTP ${res.status} from ${short(url)}`, res.status, true, retryAfter);
         if (attempt < maxRetries) {
+          comparisonBarrier.assertOpen();
           log.warn(`${provider} HTTP ${res.status}; backing off`, {
             attempt: attempt + 1,
             backoffMs,
@@ -96,6 +98,7 @@ export async function getJson<T = unknown>(
         throw new HttpError(`Invalid JSON from ${short(url)}`, res.status, false);
       }
     } catch (err) {
+      comparisonBarrier.assertOpen();
       lastErr = err;
       const isAbort = err instanceof Error && err.name === 'TimeoutError';
       const isNet = err instanceof TypeError; // fetch network failure
@@ -133,3 +136,4 @@ async function safeText(res: Response): Promise<string> {
     return '<no body>';
   }
 }
+import { comparisonBarrier } from './comparison-drain.js';

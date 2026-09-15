@@ -7,6 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { soakContinuity } from './soak-continuity.js';
 import { parseSoakArguments,safetyFingerprint,constrainedStop,validLongSoak,type ConstrainedEvidence } from './soak-controls.js';
 import { summarizeRpcTraces } from './rpc-soak-report.js';
+import { comparisonBarrier, installComparisonFetchBarrier, collectCountersBeforeTermination, type PendingMeasurementWork } from './comparison-drain.js';
 
 // Actual scanner + isolated executor, no HTTP server and no approval bridge.
 console.log = console.warn = console.error = () => {};
@@ -17,6 +18,7 @@ config({ path: join(workspace, '.env') }); // Normal runtime loading; contents n
 process.env.EXECUTION_MODE = 'live';
 process.env.LIVE_TRADING_ENABLED = 'false';
 process.env.TRADER_PRODUCTION_SOAK = '1';
+if(comparison){comparisonBarrier.configure(process.env.LIVE_TRADING_ENABLED==='false');installComparisonFetchBarrier();}
 const { acquireScannerRuntimeLock } = await import('./scanner-runtime-lock.js');
 const lock = await acquireScannerRuntimeLock(join(workspace, 'data/scanner-runtime.lock'));
 const sandbox = await mkdtemp(join(tmpdir(), 'trader-production-soak-'));
@@ -53,7 +55,7 @@ const { economicDiagnosticBuffer } = await import('./diagnostics/economic-diagno
 const { telemetryRun } = await import('./execution/source-lane.js');
 const { executablePairCoordinator } = await import('./executable-pair-coordinator.js');
 const { writeAtomicJson } = await import('./persistence/atomic-json-file.js');
-const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx'), fileURLToPath(new URL('./production-soak-child.ts', import.meta.url))],
+const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx'), fileURLToPath(new URL('./production-soak-child.ts', import.meta.url)),...(comparison?['--opportunity-quality-comparison']:[])],
   { cwd: sandbox, env: process.env, stdio: ['ignore','ignore','ignore','ipc'], windowsHide: true });
 let executorReady = false, executorExit: number | null = null, p0Deliveries = 0;
 let executorExited=false;
@@ -61,9 +63,19 @@ let submissionCounts:Record<string,number>|undefined;
 let countersAt=0;
 let executorHealth:unknown;
 let finalCounterAck:(()=>void)|undefined;
+let childDrainDone:(()=>void)|undefined;
+let childDrainPending:PendingMeasurementWork[]=[];
+let childSchedulingStoppedAt:number|null=null;
 child.on('message', (message: unknown) => {
   if (!message || typeof message !== 'object') return;
   const value = message as { type?: string; event?: unknown; counters?:Record<string,number>; state?:string; reconciliation?:unknown; final?:boolean };
+  if(comparison&&(value.type==='COMPARISON_STOPPED'||value.type==='COMPARISON_DRAINED')){
+    const pending=(message as {pending?:PendingMeasurementWork[]}).pending;
+    if(Array.isArray(pending))childDrainPending=pending;
+    childSchedulingStoppedAt??=performance.now();
+    if(value.type==='COMPARISON_DRAINED')childDrainDone?.();
+    return;
+  }
   if(value.type==='SUBMISSION_COUNTERS'&&value.counters){submissionCounts=value.counters;countersAt=performance.now();if(value.final)finalCounterAck?.();}
   if(value.type==='LIVE_EXECUTOR_HEALTH')executorHealth={state:value.state,reconciliation:value.reconciliation};
   if (value.type === 'LIVE_EXECUTOR_READY') executorReady = true;
@@ -102,24 +114,40 @@ let checkpointPending = false;
 let checkpointFailures = 0;
 const finish = async () => {
   if (stopping) return; stopping = true; clearInterval(timer);
-  scanner.stopScanner(); dynamic.stopDynamicTokenDiscovery(); stream?.stop(); unsubscribe();
+  let drain:Awaited<ReturnType<typeof comparisonBarrier.drain>>|undefined;
+  if(comparison){
+    childDrainDone=comparisonBarrier.begin({id:'isolated-executor',sourceLane:null,stage:'EXECUTOR_DRAIN_ACK'});
+    drain=await comparisonBarrier.drain(()=>{
+      scanner.stopComparisonScheduling();dynamic.stopDynamicTokenDiscovery();stream?.stop();unsubscribe();
+      // Existing no-broadcast hook suppresses P0 without editing its publication function.
+      constrainedStop.configure(true,async()=>{});
+      if(child.connected)child.send({type:'COMPARISON_STOP'});
+    },()=>economicDiagnosticBuffer.flush());
+    if(drain.drainTimedOut)drain.pendingAtDrainTimeout.push(...childDrainPending,...executionFunnel.pendingObservations());
+  }else{
+    scanner.stopScanner();dynamic.stopDynamicTokenDiscovery();stream?.stop();unsubscribe();
+    await economicDiagnosticBuffer.flush();
+  }
   let finalCountersReceived=false;
-  await new Promise<void>(resolve=>{
+  let finalCountersCollectedAt:number|null=null;
+  await collectCountersBeforeTermination(()=>new Promise<void>(resolve=>{
     const timeout=setTimeout(resolve,2000);
-    finalCounterAck=()=>{finalCountersReceived=true;clearTimeout(timeout);resolve();};
+    finalCounterAck=()=>{finalCountersReceived=true;finalCountersCollectedAt=performance.now();clearTimeout(timeout);resolve();};
     if(child.connected)child.send({type:'SUBMISSION_COUNTERS_REQUEST'});
-  });
+  }),()=>{child.kill('SIGTERM');});
   const zeroBroadcastVerified=finalCountersReceived&&submissionCounts!==undefined&&['broadcasterFactory','transportConstruction','broadcasterSubmit','transportSend','submittedSignatures'].every(k=>submissionCounts![k]===0);
-  child.kill('SIGTERM');
-  await economicDiagnosticBuffer.flush();
+  const executorTerminatedAt=performance.now();
   const report = { ...telemetryRun, comparison, diagnosticDirectory:join(sandbox,'data',`economic-diagnostics-${telemetryRun.runId}`), kind: 'PRODUCTION_SCANNER_ISOLATED_EXECUTOR_NO_BROADCAST', requestedDurationMs: durationMs, durationMs: performance.now() - start,
+    diagnosticIntegrity:economicDiagnosticBuffer.snapshot(true),
+    drain:drain?{...drain,scannerSchedulingStoppedAt:drain.measurementSchedulingStoppedAt,measurementSchedulingStoppedAt:childSchedulingStoppedAt===null?null:Math.max(drain.measurementSchedulingStoppedAt,childSchedulingStoppedAt)}:undefined,
+    finalCountersCollectedAt,executorTerminatedAt,
     manualApprovalAvailable: false, approvals:0,submissions:submissionCounts?.broadcasterSubmit??null,submittedSignatures:submissionCounts?.submittedSignatures??null,broadcasts:submissionCounts?.transportSend??null,submissionCounts,zeroBroadcastVerified,finalCountersReceived,checkpointFailures,
     earlyStop,constrainedEvidence,safetyStart,safetyEnd:fingerprint(),safetyUnchanged:safetyStart===fingerprint(),
     healthySamples:samples.length>0&&samples.every(s=>s.executorReady&&!s.scannerFailed&&!s.executorExited),
     wallClockDriftMaxMs:Math.max(0,...samples.map(s=>Math.abs(s.wallElapsedMs-s.elapsedMs))),
     continuity: soakContinuity(samples.map((sample) => sample.elapsedMs), durationMs), snapshot: snapshot(), samples };
   const rpcSummary=summarizeRpcTraces([...samples,report.snapshot].flatMap(s=>s.rpcTransport.endpoints.flatMap(e=>e.traces)),report.durationMs);
-  const validProductionSoak=zeroBroadcastVerified&&validLongSoak({continuity:report.continuity.validProductionSoak,healthySamples:report.healthySamples,safetyUnchanged:report.safetyUnchanged,checkpointFailures,wallClockDriftMaxMs:report.wallClockDriftMaxMs,executorReady,executorExited,scannerFailed});
+  const validProductionSoak=zeroBroadcastVerified&&(!comparison||!!drain?.drainCompletedCleanly&&childSchedulingStoppedAt!==null&&report.diagnosticIntegrity.diagnosticEvidenceValid)&&validLongSoak({continuity:report.continuity.validProductionSoak,healthySamples:report.healthySamples,safetyUnchanged:report.safetyUnchanged,checkpointFailures,wallClockDriftMaxMs:report.wallClockDriftMaxMs,executorReady,executorExited,scannerFailed});
   await writeFile(outputPath, safeJson({...report,validProductionSoak,rpcSummary}), { flag: 'wx' });
   // Evidence must be durable before potentially hanging WebSocket unsubscribe.
   void direct.stopDirectMarketStream().catch(() => {});

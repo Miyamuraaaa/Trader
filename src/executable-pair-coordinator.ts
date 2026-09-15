@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
+import { comparisonBarrier } from './comparison-drain.js';
 import { measuredProviderCall } from './economics/opportunity-quality.js';
 import { CONFIG, DECIMALS, MINTS } from './config.js';
 import { fromAtomic, toAtomic } from './math.js';
@@ -19,6 +20,7 @@ export class ExecutablePairCoordinator {
   private count(name:string){this.counters[name]=(this.counters[name]??0)+1;}
   snapshot(){return {...this.counters,active:this.active,keys:this.last.size};}
   async refresh(raw:RoundTripResult,costs:ScannerExecutableCostSnapshot):Promise<RoundTripResult|undefined>{
+    if(comparisonBarrier.stopped)return;
     const providers=[raw.buyQuote.provider,raw.sellQuote.provider];
     if(raw.previousSignalId||providers.some((p)=>p!=='jupiter'&&p!=='raptor')||providers[0]===providers[1]
       ||BigInt(raw.buyQuote.inAmount)>BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc,DECIMALS.USDC)))return;
@@ -26,6 +28,7 @@ export class ExecutablePairCoordinator {
     if(this.active||performance.now()-(this.last.get(key)??-Infinity)<5000){this.count('REFRESH_COALESCED_OR_COOLDOWN');return;}
     this.active=true;this.last.set(key,performance.now());while(this.last.size>64)this.last.delete(this.last.keys().next().value!);
     this.count('REFRESH_STARTED');
+    const endComparison=comparisonBarrier.begin({id:raw.diagnosticSignalId??'pair-refresh',sourceLane:'PAIR_REFRESH',stage:'PAIR_REFRESH'});
     try{
       if((await classifyIntermediate(raw.buyQuote.outputMint)).status!=='SUPPORTED'){this.count('TOKEN_POLICY_REJECTED');return;}
       const quote=async(q:Quote,amount:string,retainedEvidenceAt?:number)=>measuredProviderCall('PAIR_REFRESH',q.provider,()=>getProviderQuote(q.provider,{inputMint:q.inputMint,outputMint:q.outputMint,amountAtomic:amount,slippageBps:CONFIG.slippageBps,
@@ -51,7 +54,7 @@ export class ExecutablePairCoordinator {
       return {...raw,buyQuote:buy,sellQuote:sell,profit,category,stale:false,quoteSkewMs:skew,
         validationTier:classifyValidationTier(category,false,raw.liquidityOverlap,profit),opportunityScope:'RAW_MARKET_OPPORTUNITY',
         sourceLane:'PAIR_REFRESH',advisoryBreakdown:undefined,diagnosticSignalId:undefined,previousSignalId:raw.diagnosticSignalId,refreshIdentity:randomUUID()};
-    }catch{this.count('REFRESH_FAILED');return;}finally{this.active=false;}
+    }catch{this.count('REFRESH_FAILED');return;}finally{this.active=false;endComparison();}
   }
 }
 export const executablePairCoordinator=new ExecutablePairCoordinator();

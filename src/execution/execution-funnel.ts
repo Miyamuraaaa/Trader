@@ -44,6 +44,7 @@ export class ExecutionFunnel {
     this.executable.register(id, trace);
     this.record({ identity: id, stage: 'EXEC_SURFACE_OBSERVATION_STARTED', at: this.now(), detectedAt: trace.rawPositiveDetectedAt });
   }
+  pendingObservations(){return [...this.raw.pendingObservations(),...this.executable.pendingObservations()].map(row=>({...row,sourceLane:this.signals.find(s=>s.id===row.id)?.sourceLane??null}));}
   finishExecutableObservation(id: string, result: string, trace?: PrefilterTrace): void {
     this.executable.finish(id, result, trace);
     this.record({ identity: id, stage: 'EXEC_SURFACE_OBSERVATION_COMPLETED', at: this.now(), detectedAt: trace?.rawPositiveDetectedAt ?? this.now() });

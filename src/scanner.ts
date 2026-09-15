@@ -3,6 +3,7 @@ import { executionFunnel } from './execution/execution-funnel.js';
 import { PrefilterCoalescer, type PrefilterTrace } from './execution/prefilter-trace.js';
 import { LiveSizeCadence } from './scanner-service-policy.js';
 import { scannerSizeDiagnostics } from './scanner-size-diagnostics.js';
+import { comparisonBarrier } from './comparison-drain.js';
 import { executableSurfaceProvider } from './scanner-executable-plane.js';
 import { opportunityQuality } from './economics/opportunity-quality.js';
 import type { SourceLane } from './execution/source-lane.js';
@@ -413,6 +414,9 @@ async function findExecutableCandidates(
   rawRoutes: RoundTripResult[],
   costs: ScannerExecutableCostSnapshot,
 ): Promise<RoundTripResult[]> {
+  if(comparisonBarrier.stopped)return [];
+  const endComparison=comparisonBarrier.begin({id:'prefilter-group',sourceLane:null,stage:'PREFILTER'});
+  try {
   const positive = rawRoutes.filter((route) =>
     route.profit.estimatedNetProfitUsdc.gt(0) && route.profit.worstCaseNetProfitUsdc.gt(0));
   const capAtomic = BigInt(toAtomic(CONFIG.firstLiveMaxInputUsdc, DECIMALS.USDC));
@@ -429,6 +433,7 @@ async function findExecutableCandidates(
       [raw.buyQuote, raw.sellQuote].map((quote) => quote.routePlan.map((step) => [step.swapInfo?.programId, step.swapInfo?.label]))]);
     const result: ExecutablePrefilterResult = eligibility ? { status: eligibility, trace }
       : await prefilterCoalescer.schedule(key, trace.rawQuoteEvidenceAt, () => {
+        if(comparisonBarrier.stopped)return Promise.resolve({status:'QUOTE_FAILED' as const,reason:'COMPARISON_SCHEDULING_STOPPED',trace});
         executionFunnel.startExecutableObservation(signalId, trace);
         event('PREFILTER_STARTED');
         scannerSizeDiagnostics.record(Number(fromAtomic(raw.buyQuote.inAmount, DECIMALS.USDC)), 'constrained_attempts');
@@ -438,11 +443,11 @@ async function findExecutableCandidates(
     if (executionFunnel.executable.has(signalId)) executionFunnel.finishExecutableObservation(signalId, result.economicBreakdown && result.status === 'ECONOMICS_DIVERGED' ? result.economicBreakdown.economicOutcome : result.status, result.trace);
     if (result.economicBreakdown) { opportunityQuality.record(result.economicBreakdown); executionFunnel.update(signalId, { economicBreakdown: result.economicBreakdown }); }
     opportunityQuality.terminal(signalId,result.status,result.reason,result.trace,result.comparison);
-    if(result.status==='PREFILTER_QUEUE_DEADLINE_EXCEEDED'&&!raw.previousSignalId){
+    if(!comparisonBarrier.stopped&&result.status==='PREFILTER_QUEUE_DEADLINE_EXCEEDED'&&!raw.previousSignalId){
       void executablePairCoordinator.refresh(raw,costs).then((fresh)=>fresh?findExecutableCandidates([fresh],costs):undefined).catch(()=>{});
     }
     // Above-cap diagnostics use P2 only, at most one attempt/minute and never return a handoff route.
-    if (result.status === 'ABOVE_LIVE_CAP' && !shadowBusy && performance.now() - lastShadowAt >= 60000
+    if (!comparisonBarrier.stopped && result.status === 'ABOVE_LIVE_CAP' && !shadowBusy && performance.now() - lastShadowAt >= 60000
       && prefilterCoalescer.activeRoutes === 0 && isExecutableProviderPair(raw.buyQuote.provider, raw.sellQuote.provider)
       && (raw.buyQuote.outputMint === MINTS.SOL || getDynamicTokens().some((token) => token.mint === raw.buyQuote.outputMint && token.executionPrecheck === 'PASS'))) {
       shadowBusy = true; lastShadowAt = performance.now();
@@ -515,6 +520,7 @@ async function findExecutableCandidates(
     return result.route;
   }));
   return results.filter((route): route is RoundTripResult => Boolean(route));
+  } finally {endComparison();}
 }
 
 function printEstimatedRoundTrip(
@@ -791,11 +797,12 @@ function triggerOrcaCrossPoolScan(estimatedNetworkCostsUsdc: {
   baseNetworkFeeUsdc: number;
   priorityFeeUsdc: number;
 }): void {
-  if (!CONFIG.enableOrcaCrossPool || orcaCrossPoolPending) return;
+  if (comparisonBarrier.stopped || !CONFIG.enableOrcaCrossPool || orcaCrossPoolPending) return;
   const now = Date.now();
   if (now - lastOrcaCrossPoolTriggeredAt < CONFIG.orcaCrossPoolScanIntervalMs) return;
   lastOrcaCrossPoolTriggeredAt = now;
   opportunityQuality.count('ORCA_CROSS_POOL', 'orca', 'plannedTurns');
+  const endComparison=comparisonBarrier.begin({id:'orca-cross-pool',sourceLane:'ORCA_CROSS_POOL',stage:'CROSS_POOL_SCAN'});
   orcaCrossPoolPending = (async () => {
     try {
       const slot = await checkRpc();
@@ -812,11 +819,12 @@ function triggerOrcaCrossPoolScan(estimatedNetworkCostsUsdc: {
       const candidates = diagnostics.flatMap((evaluation) => evaluation.dto ? [evaluation.dto] : []);
       opportunityQuality.count('ORCA_CROSS_POOL', 'orca', 'completedTurns');
       for (const evaluation of diagnostics) {
+        opportunityQuality.orca(evaluation);
         opportunityQuality.count('ORCA_CROSS_POOL', 'orca', 'completedCompatibleCycles');
         if (evaluation.projectedNetAmount > 0n && evaluation.conservativeNetAmount > 0n) opportunityQuality.count('ORCA_CROSS_POOL', 'orca', 'broadPositiveCycles');
         if (evaluation.executionEligible) opportunityQuality.count('ORCA_CROSS_POOL', 'orca', 'existingOrcaCandidates');
       }
-      await new OrcaHandoffInbox().publish(candidates);
+      if(!comparisonBarrier.stopped)await new OrcaHandoffInbox().publish(candidates);
       scannerStats.orcaCrossPoolEvaluations += diagnostics.length;
       scannerStats.orcaCrossPoolCandidates += candidates.length;
       recordRouteEvaluations(diagnostics.length);
@@ -834,7 +842,7 @@ function triggerOrcaCrossPoolScan(estimatedNetworkCostsUsdc: {
         reason: error instanceof Error ? error.message : String(error),
       });
     }
-  })().finally(() => { orcaCrossPoolPending = null; });
+  })().finally(() => { orcaCrossPoolPending = null; endComparison(); });
 }
 
 export async function scanOnce(
@@ -842,6 +850,7 @@ export async function scanOnce(
   scheduledTradeSizes: number[] = nextTradeSizes(),
   backgroundDirect = false,
 ): Promise<void> {
+  if(comparisonBarrier.stopped)return;
   const cycle = nextScanCycle(preferredCycle);
   if (!cycle) {
     log.warn('No trusted USDC round-trip cycles are available from SCAN_TOKENS');
@@ -883,6 +892,7 @@ export async function scanOnce(
   }
 
   const finishedScan = startScannerStage('totalScanCycle');
+  const endComparison=comparisonBarrier.begin({id:scanId,sourceLane:null,stage:'SCAN_CYCLE'});
   try {
     const { referenceSolPriceUsdc, estimatedNetworkCostsUsdc } = await profileScannerStage('costSnapshot', getScannerCostSnapshot);
     triggerOrcaCrossPoolScan(estimatedNetworkCostsUsdc);
@@ -893,6 +903,7 @@ export async function scanOnce(
       throw new Error('SCAN_AMOUNTS_USDC must contain at least one positive quote size');
     }
     for (const tradeSizeUsdc of tradeSizesThisScan) {
+      if(comparisonBarrier.stopped)break;
       scannerSizeDiagnostics.record(tradeSizeUsdc, 'discovery_attempts');
       scannerStats.currentTradeSizeUsdc = tradeSizeUsdc;
       scannerStats.currentPhase = 'FIRST_LEG_QUOTES';
@@ -969,6 +980,7 @@ export async function scanOnce(
         route.sourceLane ??= route.buyQuote.provider === 'jupiter' || route.buyQuote.provider === 'raptor' ? sourceLane === 'UNRESTRICTED_CONTROL' ? sourceLane : 'BROAD_MATRIX' : 'BROAD_MATRIX';
         route.advisoryBreakdown ??= scannerBreakdown(route, estimatedNetworkCostsUsdc, route.sourceLane, `${route.buyQuote.id}:${route.sellQuote.id}`, false);
         opportunityQuality.record(route.advisoryBreakdown);
+        if(comparisonBarrier.stopped){opportunityQuality.terminal(route.advisoryBreakdown.candidateId??route.advisoryBreakdown.breakdownId,'COMPARISON_OBSERVATION_ONLY','COMPARISON_SCHEDULING_STOPPED',undefined);return;}
         if (CONFIG.executionMode !== 'live' || !route.profit.estimatedNetProfitUsdc.gt(0) || !route.profit.worstCaseNetProfitUsdc.gt(0) || prefilterJobs.has(route)) return;
         const work = findExecutableCandidates([route], { referenceSolPriceUsdc, estimatedNetworkCostsUsdc }).catch(() => {
           const id = route.diagnosticSignalId!;
@@ -993,6 +1005,7 @@ export async function scanOnce(
                 aggregatorProviders
                   .filter(p => p.name !== buy.provider && isExecutableProviderPair(buy.provider, p.name))
                   .map(async sellProvider => {
+                    if(comparisonBarrier.stopped)return;
                     const signalId = crypto.randomUUID();
                     const observedAt = Date.now();
                     const trace: import('./execution/prefilter-trace.js').PrefilterTrace = { rawPositiveDetectedAt: observedAt, rawQuoteEvidenceAt: buy.responseTimestamp, rawQuoteAgeAtDetectionMs: Math.max(0, observedAt - buy.responseTimestamp), executablePrefilterQueuedAt: observedAt, executablePrefilterStartedAt: observedAt, rawAgeAtPrefilterStartMs: Math.max(0, observedAt - buy.responseTimestamp), prefilterQueueMs: 0 };
@@ -1230,7 +1243,7 @@ export async function scanOnce(
       };
       if (backgroundDirect && !CONFIG.directDexOnly) {
         // P0 publication and the NEXT aggregator cycle never await this RPC lane.
-        void completeDirectWork().catch((error: unknown) => {
+        void comparisonBarrier.track({id:scanId,sourceLane:'BROAD_MATRIX',stage:'DIRECT_MIXED_CONTINUATION'},completeDirectWork()).catch((error: unknown) => {
           log.warn('Direct/mixed scanner lane failed independently', { reason: error instanceof Error ? error.message : String(error) });
         }).finally(() => releaseDirect?.());
       } else await completeDirectWork();
@@ -1274,7 +1287,7 @@ export async function scanOnce(
         consecutiveFailures,
       });
     }
-  } finally { finishedScan(); }
+  } finally { finishedScan(); endComparison(); }
 }
 
 export const scannerStats: {
@@ -1519,6 +1532,7 @@ const lastMarketEventByCycle = new Map<string, number>();
 let marketWake: (() => void) | null = null;
 
 export function notifyMarketChange(inputMint: string, outputMint: string): void {
+  if(comparisonBarrier.stopped)return;
   const cycle = cycleForPair(inputMint, outputMint);
   if (!cycle) return;
   scannerStats.marketEventsReceived++;
@@ -1560,6 +1574,11 @@ export function stopScanner(): void {
   executionFunnel.raw.shutdown();
   executionFunnel.executable.shutdown();
 }
+/** Harness-only stop: pending outcomes are left intact while admitted work drains. */
+export function stopComparisonScheduling():void {
+  if(!comparisonBarrier.active)throw new Error('COMPARISON_NOT_CONFIGURED');
+  running=false;marketWake?.();
+}
 
 export async function scanLoop(): Promise<void> {
   log.info('Hybrid event-driven scanner loop started', {
@@ -1569,7 +1588,7 @@ export async function scanLoop(): Promise<void> {
   });
   void probeRaptorCircularRoute();
   let lastEventBatchAt = 0;
-  while (running) {
+  while (running && !comparisonBarrier.stopped) {
     const eventCycle = takePendingCycle();
     if (eventCycle) {
       const waitMs = Math.max(0, CONFIG.eventScanMinIntervalMs - (Date.now() - lastEventBatchAt));
@@ -1577,6 +1596,7 @@ export async function scanLoop(): Promise<void> {
       lastEventBatchAt = Date.now();
     }
     const cycles: ScanCycle[] = [];
+    if(comparisonBarrier.stopped)break;
     if (eventCycle) cycles.push(eventCycle);
     while (cycles.length < CONFIG.scannerConcurrentCycles) {
       const cycle = takePendingCycle() ?? nextScanCycle();

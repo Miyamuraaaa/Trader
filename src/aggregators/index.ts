@@ -81,6 +81,7 @@ export async function getProviderQuote(
   provider: QuoteProviderName,
   params: QuoteParams,
 ): Promise<Quote> {
+  comparisonBarrier.assertOpen();
   return getProvider(provider).getQuote(params);
 }
 
@@ -96,6 +97,7 @@ export async function getQuotesFromProviders(
   params: QuoteParams,
 ): Promise<ProviderQuoteResult[]> {
   const settled = await Promise.allSettled(providers.map(async (provider) => {
+    comparisonBarrier.assertOpen();
     // A provider already in cooldown cannot contribute a fresh discovery quote.
     // Skip it before pair discovery so one degraded direct provider cannot hold
     // the entire five-provider first-leg Promise.allSettled open.
@@ -134,3 +136,4 @@ export function getProviderCapabilities() {
     ...provider.capabilities,
   }));
 }
+import { comparisonBarrier } from '../comparison-drain.js';

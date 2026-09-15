@@ -80,6 +80,7 @@ export class QuoteProviderRuntime {
   ) { this.admission = new QuoteAdmission(provider, minIntervalMs); }
 
   run(key: string, task: () => Promise<Quote>, priority: QuotePriority = 'LOW', params?: QuoteParams, deadline?: QuoteDeadline): Promise<Quote> {
+    comparisonBarrier.assertOpen();
     if (params) {
       const semanticKey = semanticQuoteKey(this.provider, params);
       const cached = this.cache.get(semanticKey);
@@ -105,6 +106,7 @@ export class QuoteProviderRuntime {
 
     const queuedAt = Date.now();
     const promise = this.enqueue(async () => {
+      comparisonBarrier.assertOpen();
       if (deadline) {
         if (deadline.signal?.aborted) throw new QuoteAdmissionError('DISCOVERY_QUEUE_CANCELLED');
         this.admission.check(deadline);
@@ -236,3 +238,4 @@ export class QuoteProviderRuntime {
 export function quoteCacheKey(parts: Array<string | number | undefined>): string {
   return parts.map((part) => part ?? '').join('|');
 }
+import { comparisonBarrier } from './comparison-drain.js';

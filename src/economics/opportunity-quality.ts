@@ -3,6 +3,9 @@ import { SOURCE_LANES, telemetryRun, type SourceLane } from '../execution/source
 import type { EconomicBreakdownV1 } from './economic-breakdown.js';
 import { economicComparison, type EconomicTelemetryValue } from './economic-telemetry.js';
 import { economicDiagnosticBuffer } from '../diagnostics/economic-diagnostics.js';
+import { MeasurementCoverage } from './measurement-coverage.js';
+import { orcaObservation } from './orca-observation.js';
+import type { OrcaCrossPoolEvaluation } from '../orca-cross-pool.js';
 
 export const sourceLaneContext = new AsyncLocalStorage<SourceLane>();
 export class OpportunityQuality {
@@ -16,6 +19,13 @@ export class OpportunityQuality {
   private executorResults = new Map<string,string>();
   private comparisons: ReturnType<typeof economicComparison>[] = [];
   private latencies = new Map<string, number[]>();
+  private coverage = new MeasurementCoverage();
+  private orcaObservations: ReturnType<typeof orcaObservation>[] = [];
+  orca(e: OrcaCrossPoolEvaluation) {
+    const b=orcaObservation(e);this.orcaObservations.push(b);this.orcaObservations=this.orcaObservations.slice(-2000);
+    this.coverage.cycle({sourceLane:b.sourceLane,providerPair:b.providerPair,positive:b.observationPositive,outcome:b.economicOutcome,missingFields:b.missingFields});
+    this.persist(b,true);
+  }
   timing(lane: SourceLane, provider: string, ms: number) {
     const key=`${lane}:${provider}`, values=this.latencies.get(key)??[];
     values.push(ms);this.latencies.set(key,values.slice(-2000));
@@ -28,6 +38,8 @@ export class OpportunityQuality {
     const key = `${b.candidateId ?? b.breakdownId}:${b.modelVersion}`;
     if (this.seen.has(key)) return;
     this.seen.add(key); while (this.seen.size > 100000) this.seen.delete(this.seen.values().next().value!);
+    this.coverage.cycle({sourceLane:b.sourceLane,providerPair:b.providerPair,fresh:b.freshCompatible,policyCompatible:b.routePolicyCompatible,
+      positive:b.economicOutcome==='UNATTRIBUTED_ECONOMICS'?undefined:b.economicOutcome==='EXEC_SURFACE_POSITIVE'||b.economicOutcome==='BROAD_ROUND_TRIP_POSITIVE',outcome:b.economicOutcome,missingFields:b.missingFields});
     const shadow = b.sourceLane === 'ABOVE_CAP_SHADOW';
     const constrained = b.amountChainModel !== 'EXPECTED_OUTPUT' && !shadow;
     if (constrained) this.outcomes[b.economicOutcome] = (this.outcomes[b.economicOutcome] ?? 0) + 1;
@@ -70,11 +82,19 @@ export class OpportunityQuality {
     const lanes = SOURCE_LANES.map(lane => {
       const providers = Object.fromEntries([...this.counts].filter(([k]) => k.startsWith(lane + ':')).map(([k,v]) => [k.slice(lane.length+1), {...v}]));
       const sum = (name: string) => Object.values(providers).reduce((a,b) => a+(b[name] ?? 0),0);
-      const calls=sum('providerCalls'), sends=sum('legalSends'), cycles=sum('economicClassifications'), positives=sum('executablePositives'),freshCycles=sum('freshCompatibleCycles');
+      const calls=sum('providerCalls'), observedSends=sum('legalSends'), cycles=sum('economicClassifications'), positives=sum('executablePositives'),freshCycles=sum('freshCompatibleCycles');
+      const directCalls=Object.entries(providers).some(([provider,row])=>!['jupiter','raptor'].includes(provider)&&(row.providerCalls??0)>0);
+      const sends=calls>0&&!directCalls?observedSends:null;
       const samples=this.samples.filter(b=>b.sourceLane===lane);
       const stats=(values:number[])=>{const sorted=values.filter(Number.isFinite).sort((a,b)=>a-b);return {count:sorted.length,max:sorted.at(-1)??null,p50:sorted.length>=20?sorted[Math.ceil(sorted.length*.5)-1]:null,p90:sorted.length>=20?sorted[Math.ceil(sorted.length*.9)-1]:null,p99:sorted.length>=100?sorted[Math.ceil(sorted.length*.99)-1]:null};};
       const atomicStats=(values:Array<string|undefined>)=>{const sorted=values.filter((v):v is string=>v!==undefined&&/^-?\d+$/.test(v)).map(BigInt).sort((a,b)=>a<b?-1:a>b?1:0);return {count:sorted.length,max:sorted.at(-1)?.toString()??null,p50:sorted.length>=20?sorted[Math.ceil(sorted.length*.5)-1]!.toString():null,p90:sorted.length>=20?sorted[Math.ceil(sorted.length*.9)-1]!.toString():null,p99:sorted.length>=100?sorted[Math.ceil(sorted.length*.99)-1]!.toString():null};};
       return { lane, providers, providerCalls:calls, legalSends:sends, completedEconomicEvaluations:cycles, executablePositives:positives,
+        logicalCalls:calls>0?calls:null,networkDispatches:null,successfulResponses:calls>0?sum('quoteSuccesses'):null,
+        observedLabeledLegalSends:observedSends,
+        coverageState:calls>0||cycles>0||sum('completedTurns')>0?'PARTIAL':'NOT_OBSERVED',
+        dispatchCoverage:calls>0?'LOGICAL_PROVIDER_CALL_ONLY':cycles>0||sum('completedTurns')>0?'EVALUATION_ONLY':'UNAVAILABLE',
+        denominatorUsed:calls>0?'LOGICAL_PROVIDER_CALLS':null,comparisonEligible:false,
+        comparisonIneligibleReason:'SHARED_FIRST_LEG_AND_MIXED_WORK_ATTRIBUTION_INCOMPLETE',
         plannedTurns:sum('plannedTurns'),completedTurns:sum('completedTurns'),completedCompatibleCycles:sum('completedCompatibleCycles'),freshCompatibleCycles:freshCycles,policyCompatibleCycles:sum('policyCompatibleCycles'),
         deadlineDropsPer1000Calls:calls?1000*sum('deadlineDrops')/calls:null,http429Per1000Calls:calls?1000*sum('http429')/calls:null,
         p0PerExecutablePositive:positives?sum('P0_HANDOFF')/positives:null,
@@ -87,10 +107,11 @@ export class OpportunityQuality {
         freshCyclesPer1000Calls:calls?1000*freshCycles/calls:null, positivesPer1000Cycles:freshCycles?1000*positives/freshCycles:null };
     });
     return { ...telemetryRun, lanes, completedEconomics: total,
+      ...this.coverage.snapshot(),orcaObservations:[...this.orcaObservations],
       accountingCoverage: { providerCalls: 'logical quote calls through labeled scanner/prefilter/refresh wrappers; coalesced callers remain separate',
         legalSends: 'labeled Jupiter/Raptor quote dispatch only; direct RPC and unlabeled background calls are not included',
         providerTimeMs: 'logical call end-to-end, including queue residence; not HTTP service latency',
-        directEconomicDetail: 'Orca cross-pool currently exposes cycle counts only; no full per-cycle breakdown' },
+        directEconomicDetail: 'Direct/mixed cycles reuse existing scanner breakdowns; Orca cross-pool exposes partial existing evidence with explicit missing fields, not invented leg/fee details' },
       blockers: Object.entries(this.outcomes).map(([outcome,count]) => ({outcome,count,percent:total>=20?count*100/total:null})),
       nearest: [...this.samples].filter(b=>b.postCostConservativeNetAtomic!==undefined).sort((a,b)=>BigInt(a.postCostConservativeNetAtomic!)>BigInt(b.postCostConservativeNetAtomic!)?-1:1).slice(0,10),
       distributionRetention:'most recent 2000 economic observations, split by source; totals are cumulative', comparisons:[...this.comparisons], executorResults:Object.fromEntries(this.executorResults), diagnostics:economicDiagnosticBuffer.snapshot() };

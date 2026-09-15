@@ -32,7 +32,9 @@ const floor = (n: bigint, d: bigint) => n >= 0n ? n / d : -((-n + d - 1n) / d);
 /** Diagnostic only. No caller can use this object to authorize execution. */
 export function economicBreakdown(input: BreakdownInput) {
   const { routeShape, pools, ...fields } = input;
+  const missingFields = (['baseFeeLamports','priorityFeeLamports','ataRentLamports','solToUsdcPriceMicrounits','costSourceAgeMs','leg1EvidenceAgeMs','leg2EvidenceAgeMs','pairSkewMs'] as const).filter(key=>input[key]===undefined);
   const base = { ...fields, schemaVersion: 1 as const, breakdownId: randomUUID(), executablePolicyHash: EXECUTABLE_POLICY_HASH,
+    breakdownCompleteness: missingFields.length ? 'PARTIAL' as const : 'FULL' as const, missingFields:Object.freeze(missingFields),
     calculatedAtMonoMs: performance.now(), recordedAtWallMs: Date.now(), routeShapeHash: hash(routeShape), poolSetHash: hash(pools.map(p => [...new Set(p)].sort())) };
   try {
     const size = integer(input.sizeAtomic), expected = integer(input.leg2ExpectedOutAtomic), minimum = integer(input.leg2MinOutAtomic);

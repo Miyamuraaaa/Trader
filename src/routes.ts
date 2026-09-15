@@ -162,7 +162,7 @@ export async function buildRoundTripMatrix(
   );
   const supported = await Promise.allSettled(sellProviders.map(async (provider) => ({
     provider,
-    supported: provider.isRateLimited?.() ? false : typeof provider.supportsPair !== 'function'
+    supported: comparisonBarrier.stopped || provider.isRateLimited?.() ? false : typeof provider.supportsPair !== 'function'
       || await (scannerBudgetMs === undefined
         ? sharedPairSupport(provider, baseParams.intermediateMint, baseParams.startingMint)
         : scannerDeadline(sharedPairSupport(provider, baseParams.intermediateMint, baseParams.startingMint), scannerBudgetMs, false)),
@@ -175,6 +175,7 @@ export async function buildRoundTripMatrix(
     .map((sellProvider) => ({ buy, sellProvider })));
 
   const settled = await Promise.allSettled(jobs.map(async ({ buy, sellProvider }) => {
+    comparisonBarrier.assertOpen();
     if (deadlineAt !== undefined && Date.now() >= deadlineAt) throw new Error('SCANNER_SECOND_LEG_SOFT_DEADLINE');
     const work = sellProvider.getQuote({
       inputMint: baseParams.intermediateMint,
@@ -290,3 +291,4 @@ export function bestObservableRoute(routes: RoundTripResult[]): RoundTripResult 
     ?? routes.find((route) => route.liquidityOverlap !== true)
     ?? routes[0];
 }
+import { comparisonBarrier } from './comparison-drain.js';

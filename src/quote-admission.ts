@@ -115,6 +115,7 @@ export class QuoteAdmission {
     if (this.now() + queueMs + this.estimate(deadline.budgetMs) > deadline.deadlineMono) this.reject(deadline);
   }
   async dispatch(deadline: QuoteDeadline, work: () => Promise<Quote>): Promise<Quote> {
+    comparisonBarrier.assertOpen();
     const entry = [...this.entries.values()].find((e) => e.deadline === deadline);
     if (!entry || entry.waiters === 0) this.reject(deadline, 'CANCELLED');
     this.check(deadline);
@@ -135,6 +136,11 @@ export class QuoteAdmission {
     }
   }
   request(params: QuoteParams, enqueue: (deadline: QuoteDeadline) => Promise<Quote>, cached?: Quote): Promise<Quote> {
+    if(!comparisonBarrier.active)return this.requestInternal(params,enqueue,cached);
+    comparisonBarrier.assertOpen();
+    return comparisonBarrier.track({id:params.scheduling?.traceId??'quote',sourceLane:null,stage:`${this.provider}:QUOTE_REQUEST`},this.requestInternal(params,enqueue,cached));
+  }
+  private requestInternal(params: QuoteParams, enqueue: (deadline: QuoteDeadline) => Promise<Quote>, cached?: Quote): Promise<Quote> {
     const deadline = quoteDeadline(params, this.provider, this.now());
     if (deadline.deadlineMono <= this.now()) this.reject(deadline);
     const key = semanticQuoteKey(this.provider, params); this.count('coalescing_attempts');
@@ -195,3 +201,4 @@ export class QuoteAdmission {
       }), serviceEstimateMs: this.estimate(CONFIG.maxQuoteAgeMs) };
   }
 }
+import { comparisonBarrier } from './comparison-drain.js';

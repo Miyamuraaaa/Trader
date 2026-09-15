@@ -213,6 +213,7 @@ export async function scanOrcaCrossPoolCycles(options: {
   orcaCrossPoolStats.intermediatesTracked = orcaCrossPoolStats.intermediateMints.length;
   const all: OrcaCrossPoolEvaluation[] = [];
   for (const intermediateMint of intermediates) {
+    if(comparisonBarrier.stopped)break;
     const pools = await discoverOrcaPools(MINTS.USDC, intermediateMint);
     orcaCrossPoolStats.poolsTracked += pools.length;
     let available: Array<{ pool: PoolMetadata; snapshot: OrcaPoolSnapshot }> = [];
@@ -248,6 +249,7 @@ export async function scanOrcaCrossPoolCycles(options: {
       orcaCrossPoolStats.prefilterEvaluations++;
       if (!crossPoolMayClear(first, firstSnapshot, second, secondSnapshot, MINTS.USDC, intermediateMint)) continue;
       for (const amountUsdc of CONFIG.orcaCrossPoolAmountsUsdc) {
+        if(comparisonBarrier.stopped)break;
         const inputAmount = BigInt(toAtomic(amountUsdc, DECIMALS.USDC));
         let firstQuote;
         let secondQuote;
@@ -309,3 +311,4 @@ export async function scanOrcaCrossPoolCycles(options: {
   );
   return all;
 }
+import { comparisonBarrier } from './comparison-drain.js';

@@ -3,6 +3,7 @@ import { RollingWorkMetrics } from './work-metrics.js';
 import { SCANNER_RPC_CONFIG } from './config.js';
 import { performance } from 'node:perf_hooks';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { comparisonBarrier, ComparisonStoppedError } from './comparison-drain.js';
 
 export interface RpcTaskContext { label:string; priority:ScannerRpcPriority; deadlineMono?:number; traceId?:string; liveDependency?:boolean }
 export const scannerRpcContext=new AsyncLocalStorage<RpcTaskContext>();
@@ -120,6 +121,7 @@ export class ScannerRpcLimiter {
   }
 
   run<T>(label: string, task: () => Promise<T>, priority: ScannerRpcPriority = 'LOW', options:RpcAdmissionOptions={}): Promise<T> {
+    if(comparisonBarrier.stopped)return Promise.reject(new ComparisonStoppedError());
     const cooldownRemainingMs = this.cooldownRemainingMs();
     const usefulAfterCooldown=priority!=='LOW'&&priority!=='RPC_P2_BROAD_DISCOVERY'&&Number.isFinite(options.deadlineMono)&&performance.now()+cooldownRemainingMs+(options.serviceMs??0)<options.deadlineMono!;
     if (cooldownRemainingMs > 0&&!usefulAfterCooldown) {
@@ -229,7 +231,7 @@ export class ScannerRpcLimiter {
     this.active++;
     this.lastStartAt = now;
     Promise.resolve()
-      .then(next.task)
+      .then(()=>{comparisonBarrier.assertOpen();return next.task();})
       .then((value) => {
         finish(true);
         finishSource(true);

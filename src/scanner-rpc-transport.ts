@@ -31,6 +31,7 @@ export class ScannerRpcEndpoint {
   constructor(readonly endpointId:string,readonly limiter:ScannerRpcLimiter){}
   private count(name:string){this.counts[name]=(this.counts[name]??0)+1;}
   async read(payload:Envelope,adapter:string,work:(signal?:AbortSignal)=>Promise<Reply>,requirements:ReadRequirements={},context:RpcTaskContext=scannerRpcContext.getStore()??{label:'unattributed.scanner',priority:'LOW'}):Promise<Reply>{
+    comparisonBarrier.assertOpen();
     // Shared Orca primitives can be imported by the isolated executor. Never share scanner cache/admission there.
     if(typeof process.send==='function'&&CONFIG.executionMode==='live')return work();
     if(!/^get[A-Z]/.test(payload.method))throw new Error('SCANNER_NON_READ_RPC_BLOCKED');
@@ -38,6 +39,7 @@ export class ScannerRpcEndpoint {
     const params=payload.params;
     const key=hash({endpoint:this.endpointId,adapter,method:payload.method,params});
     const requestId=randomUUID(),priority=context.priority,cls=priority==='RPC_P0_EXECUTION_CRITICAL'?'P0':priority==='HIGH'||priority==='RPC_P1_EXECUTABLE_DISCOVERY_SUPPORT'?'P1':'P2';
+    const endComparison=comparisonBarrier.begin({id:context.traceId??requestId,sourceLane:null,stage:'SCANNER_RPC_READ'});
     const groupKey=[payload.method,cls,taskName(context.label)].join(':');
     if(!this.groups.has(groupKey)&&this.groups.size<128)this.groups.set(groupKey,{calls:0,sent:0,http429:0,cooldownMs:0,failures:0});
     const group=this.groups.get(groupKey);if(group)group.calls++;
@@ -93,7 +95,7 @@ export class ScannerRpcEndpoint {
         trace.result=trace.coalescing==='WAITER'?'COALESCED_SERVED':'SENT_SUCCESS';trace.sourceSlot=String(entry.value.result?.context?.slot??'unknown');return {...entry.value,id:payload.id};
       }finally{shared.waiters--;if(shared.waiters===0)shared.controller.abort();if(timer)clearTimeout(timer);if(abort)requirements.signal?.removeEventListener('abort',abort);}
     }catch(error){const message=error instanceof Error?error.message:'NETWORK_ERROR';trace.result=/backpressure/i.test(message)?'PROVIDER_COOLDOWN_DROP':/^[A-Z_0-9]+$/.test(message)?message:'NETWORK_ERROR';if(trace.result==='HTTP_429'||trace.result==='RPC_RATE_LIMIT_ERROR')trace.cooldownIssuedMs=Math.max(0,this.limiter.admissionState().cooldownUntilMono-performance.now());this.count(String(trace.result));if(group)group.failures++;throw error;}
-    finally{trace.deliveryMono=performance.now();trace.totalMs=performance.now()-created;this.traces.push(trace);this.traces=this.traces.slice(-2048);}
+    finally{trace.deliveryMono=performance.now();trace.totalMs=performance.now()-created;this.traces.push(trace);this.traces=this.traces.slice(-2048);endComparison();}
   }
   snapshot(){const gap=this.sends.slice(1).map((t,i)=>t-this.sends[i]!);return {endpointId:this.endpointId,counts:{...this.counts},groups:Object.fromEntries(this.groups),activeShared:this.shared.size,cacheEntries:this.cache.size,governor:this.limiter.snapshot(),interArrivalMs:percentile(gap),burstWindows:Object.fromEntries([100,1000,10000].map(window=>{let start=0,max=0;for(let i=0;i<this.sends.length;i++){while(this.sends[i]!-this.sends[start]!>=window)start++;max=Math.max(max,i-start+1);}return [window,max];})),traces:[...this.traces]};}
 }
@@ -111,3 +113,4 @@ export function scannerConnection(endpoint:string,options:ConnectionConfig={},ta
   return new Connection(endpoint,{...options,disableRetryOnRateLimit:true,fetch:fetcher});
 }
 export function scannerKitRpc(endpoint:string){const governor=scannerRpcEndpoint(endpoint),transport=createDefaultRpcTransport({url:mainnet(endpoint)});const wrapped:RpcTransport=async(config)=>governor.read(config.payload as Envelope,'kit',(signal)=>transport({...config,signal:signal??config.signal}),{signal:config.signal}) as never;return createSolanaRpcFromTransport(wrapped as typeof transport);}
+import { comparisonBarrier } from './comparison-drain.js';
