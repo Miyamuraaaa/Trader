@@ -23,7 +23,6 @@ import {
 } from './account-preflight.js';
 import { analyzeTokenMint, assertIntermediateTokenExecutionPolicy } from './token-analysis.js';
 import { buildOrcaSwapLeg } from './orca-swap-builder.js';
-import { buildRaydiumSwapLeg } from './raydium-swap-builder.js';
 import { buildMeteoraSwapLeg } from './meteora-swap-builder.js';
 import type { AtomicExecutionPlan, ExecutionRouteType, AggregatorExecutionProvider } from './types.js';
 import type { MixedCycleInput } from './mixed-cycle-builder.js';
@@ -119,18 +118,7 @@ async function buildSwapLeg(
       };
     }
     case 'raydium': {
-      const leg = await buildRaydiumSwapLeg({
-        connection, wallet, inputMint, outputMint, inputAmount, slippageBps,
-      });
-      return {
-        instructions: leg.instructions,
-        inputMint, outputMint, inputAmount,
-        expectedOutput: leg.expectedOutput,
-        minimumOutput: leg.minimumOutput,
-        quoteReceivedAt: leg.quoteReceivedAt,
-        pool: leg.pool,
-        addressLookupTableAddresses: leg.addressLookupTableAddresses,
-      };
+      throw new Error('Generic Raydium execution is quarantined; only the capability-bound Raptor -> CLMM builder is supported');
     }
     case 'meteora': {
       const leg = await buildMeteoraSwapLeg({

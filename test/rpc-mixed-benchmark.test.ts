@@ -1,4 +1,18 @@
-import { expect,it,vi } from 'vitest';
+import { afterEach,beforeEach,expect,it,vi } from 'vitest';
+const installEnvironment = vi.hoisted(() => {
+  const install = () => {
+    // Keep the mixed fixture on scanner admission even in an IPC test worker.
+    vi.stubEnv('EXECUTION_MODE', 'paper');
+    vi.stubEnv('LIVE_TRADING_ENABLED', 'false');
+    vi.stubEnv('MAX_QUOTE_AGE_MS', '5000');
+    vi.stubEnv('HTTP_TIMEOUT_MS', '5000');
+  };
+  install();
+  return install;
+});
+vi.mock('dotenv/config', () => ({}));
+beforeEach(installEnvironment);
+afterEach(() => vi.unstubAllEnvs());
 import { performance } from 'node:perf_hooks';
 import { ScannerRpcLimiter,type ScannerRpcPriority } from '../src/scanner-rpc-limiter.js';
 import { ScannerRpcEndpoint } from '../src/scanner-rpc-transport.js';

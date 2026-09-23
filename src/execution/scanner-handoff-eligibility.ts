@@ -34,15 +34,15 @@ export function isAuditedAggregatorHandoffRoute(route: RoundTripResult): boolean
 
 /**
  * Mixed route classes whose current executor uses independently constructed,
- * protocol-specific instructions. Raydium's Trade API wrapper and Meteora's
- * SDK Transaction are intentionally excluded until their setup/cleanup and
- * instruction data have equally strict protocol decoders.
+ * protocol-specific instructions. Raydium is only the capability-bound local
+ * CLMM builder, never the Trade API transaction wrapper. Meteora stays excluded.
  */
 const MIXED_PROVIDER_PAIRS: ReadonlySet<string> = new Set([
   // Jupiter <-> Orca
   'jupiter:orca', 'orca:jupiter',
   // Raptor <-> Orca
   'raptor:orca', 'orca:raptor',
+  'raptor:raydium',
 ]);
 
 /**

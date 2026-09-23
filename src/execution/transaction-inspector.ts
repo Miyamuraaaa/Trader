@@ -9,6 +9,40 @@ import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID } from './account-preflig
 import { JUPITER_V6_PROGRAM_ID, RAPTOR_PROGRAM_ID } from './aggregator-cycle-builder.js';
 import type { AtomicExecutionPlan, InspectionResult } from './types.js';
 import { web3InstructionToKit } from './instruction-adapter.js';
+import { inspectRaydiumInstruction } from './raydium-swap-builder.js';
+import { inspectRaptorClmmSwap } from './raptor-instruction-inspector.js';
+import { RAYDIUM_CLMM_PROGRAM } from './raydium-capability.js';
+
+function inspectRaptorRaydiumCycle(plan:AtomicExecutionPlan):InspectionResult {
+  const reasons=inspectComputeBudget(plan);
+  const programIds=[...new Set(plan.instructions.map(i=>i.programId.toBase58()))];
+  try {
+    const e=plan.raydiumEvidence, legs=plan.aggregatorEvidence?.legs;
+    if(!e||!legs||plan.instructions.length!==4||plan.aggregatorEvidence?.providers.join(':')!=='raptor:raydium'
+      ||!plan.instructions[0]!.programId.equals(ComputeBudgetProgram.programId)||!plan.instructions[1]!.programId.equals(ComputeBudgetProgram.programId)
+      ||plan.aggregatorEvidence.closesIntermediateAta||!plan.baseAta.exists||!plan.intermediateAta.exists
+      ||plan.inputMint!==plan.outputMint||plan.inputMint===plan.intermediateMint||plan.pools[0]===plan.pools[1]
+      ||plan.computeUnitLimit!==500000||plan.aggregatorEvidence.routeProgramIds.length!==1||plan.aggregatorEvidence.routeProgramIds[0]!==RAYDIUM_CLMM_PROGRAM
+      ||plan.baseToken.status!=='SUPPORTED'||plan.intermediateToken.status!=='SUPPORTED'
+      ||plan.baseToken.programId!==TOKEN_PROGRAM_ID.toBase58()||plan.intermediateToken.programId!==TOKEN_PROGRAM_ID.toBase58())throw new Error('RAYDIUM_PLAN_SHAPE');
+    const [first,second]=legs, ray=e.leg;
+    if(first.provider!=='raptor'||second.provider!=='raydium'||first.inputAmount!==plan.inputAmount
+      ||first.minimumOutputAmount!==second.inputAmount||second.inputAmount!==ray.inputAmount||plan.expectedIntermediateAmount!==ray.inputAmount
+      ||second.minimumOutputAmount!==ray.minimumOutput||plan.minimumOutputAmount!==ray.minimumOutput
+      ||second.expectedOutputAmount!==ray.expectedOutput||plan.expectedOutputAmount!==ray.expectedOutput
+      ||first.inputMint!==plan.inputMint||first.outputMint!==plan.intermediateMint||second.inputMint!==plan.intermediateMint||second.outputMint!==plan.outputMint
+      ||ray.inputMint!==plan.intermediateMint||ray.outputMint!==plan.outputMint||ray.wallet!==plan.wallet
+      ||ray.sourceAta!==plan.intermediateAta.ata||ray.destinationAta!==plan.baseAta.ata
+      ||first.pool!==plan.pools[0]||e.firstPool.address.toBase58()!==first.pool||second.pool!==plan.pools[1]||ray.pool!==second.pool
+      ||first.programId!==RAPTOR_PROGRAM_ID.toBase58()||first.downstreamProgramId!==RAYDIUM_CLMM_PROGRAM||second.programId!==RAYDIUM_CLMM_PROGRAM)throw new Error('RAYDIUM_EXACT_CHAIN_OR_POOL_MISMATCH');
+    inspectRaptorClmmSwap(plan.instructions[2]!,{wallet:plan.wallet,sourceAta:plan.baseAta.ata,destinationAta:plan.intermediateAta.ata,inputMint:plan.inputMint,outputMint:plan.intermediateMint,input:plan.inputAmount,expected:first.expectedOutputAmount,minimum:first.minimumOutputAmount});
+    inspectRaydiumInstruction(plan.instructions[3]!,ray);
+    for(const ix of plan.instructions.slice(2))for(const k of ix.keys){const a=k.pubkey.toBase58();if((k.isSigner&&a!==plan.wallet)||(k.isWritable&&!e.writableAccounts.includes(a))||(!e.writableAccounts.includes(a)&&!e.readonlyAccounts.includes(a)))throw new Error('RAYDIUM_UNMODELED_ACCOUNT_ROLE');}
+    const hashes=plan.instructions.slice(2).map(instructionHash);
+    if(hashes.length!==plan.aggregatorEvidence.sourceInstructionHashes.length||hashes.some((h,i)=>h!==plan.aggregatorEvidence!.sourceInstructionHashes[i]))throw new Error('RAYDIUM_SOURCE_HASH_MISMATCH');
+  }catch(error){reasons.push(error instanceof Error?error.message:'RAYDIUM_INSPECTION_FAILED');}
+  return {passed:!reasons.length,reasons,programIds,instructionCount:plan.instructions.length};
+}
 
 export const EXECUTION_PROGRAM_ALLOWLIST = new Set([
   ComputeBudgetProgram.programId.toBase58(),
@@ -237,6 +271,7 @@ function inspectAggregatorCycle(plan: AtomicExecutionPlan): InspectionResult {
 }
 
 export function inspectAtomicTransaction(plan: AtomicExecutionPlan): InspectionResult {
+  if(plan.type==='RAPTOR_RAYDIUM_CYCLE')return inspectRaptorRaydiumCycle(plan);
   if (plan.type !== 'ORCA_TWO_HOP_CYCLE') {
     return inspectAggregatorCycle(plan);
   }

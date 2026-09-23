@@ -1,5 +1,6 @@
 import {
   Connection,
+  PublicKey,
   MessageV0,
   TransactionMessage,
   VersionedTransaction,
@@ -10,6 +11,7 @@ import type { LocallySignedExecution } from './approved-transaction.js';
 import type { BlockhashWithExpiryBlockHeight } from '@solana/web3.js';
 import type { ExecutionNetworkProfiler } from './network-profiler.js';
 import { executionFeeEstimate } from './execution-fee-cache.js';
+import { prepareRaydiumSimulation, inspectRaydiumSimulationEffects } from './raydium-simulation-effects.js';
 
 export interface PreparedExecutionBlockhash {
   value: BlockhashWithExpiryBlockHeight;
@@ -46,7 +48,7 @@ export async function fetchExecutionBlockHeight(
 export async function simulateAtomicTransaction(
   connection: Connection,
   plan: AtomicExecutionPlan,
-  signer: SignerContext,
+  signer: Pick<SignerContext, 'publicKey'>,
   quoteSafety?: { quoteReceivedAt: number; maxAgeMs: number },
   profiler?: ExecutionNetworkProfiler,
   preparedBlockhash?: PreparedExecutionBlockhash,
@@ -62,7 +64,9 @@ export async function simulateAtomicTransaction(
   let transactionBytes: number;
   try {
     message = new TransactionMessage({
-      payerKey: signer.keypair.publicKey,
+      payerKey: plan.type === 'RAPTOR_RAYDIUM_CYCLE'
+        ? new PublicKey(signer.publicKey)
+        : (signer as SignerContext).keypair.publicKey,
       recentBlockhash: latest.blockhash,
       instructions: plan.instructions,
     }).compileToV0Message(plan.lookupTableAccounts ?? []);
@@ -81,6 +85,9 @@ export async function simulateAtomicTransaction(
   }
   const serializationMs = Number((performance.now() - serializationStart).toFixed(1));
   if (transactionBytes > 1232) throw new Error(`Transaction exceeds Solana packet limit: ${transactionBytes} bytes`);
+  const raydiumSnapshot=plan.type==='RAPTOR_RAYDIUM_CYCLE'?await prepareRaydiumSimulation(connection,plan,message):undefined;
+  const raydiumFee=raydiumSnapshot?(await connection.getFeeForMessage(message,'confirmed')).value:undefined;
+  if(raydiumSnapshot&&(!Number.isSafeInteger(raydiumFee)||raydiumFee===null||raydiumFee===undefined||raydiumFee<=0))throw new Error('RAYDIUM_SIMULATION_FEE_UNAVAILABLE');
   const quoteAgeBeforeSimulation = quoteSafety ? Date.now() - quoteSafety.quoteReceivedAt : undefined;
   if (quoteSafety && quoteAgeBeforeSimulation! > quoteSafety.maxAgeMs) {
     throw new Error(`Final transaction quote became stale before simulation (${quoteAgeBeforeSimulation} ms > ${quoteSafety.maxAgeMs} ms)`);
@@ -89,6 +96,7 @@ export async function simulateAtomicTransaction(
   const simulationStart = performance.now();
   const simulate = () => connection.simulateTransaction(transaction, {
     commitment: 'confirmed', sigVerify: false, innerInstructions: true,
+    ...(raydiumSnapshot?{minContextSlot:raydiumSnapshot.slot,accounts:{encoding:'base64' as const,addresses:raydiumSnapshot.addresses}}:{}),
   });
   const response = profiler
     ? await profiler.measure('rpc.simulateTransaction.sigVerifyFalse', 'rpc', simulate)
@@ -98,7 +106,8 @@ export async function simulateAtomicTransaction(
   // Base/priority fee metadata is stable for a message shape and is preloaded
   // before candidates enter the critical path. A deliberately conservative
   // local floor applies if warmup failed; fee discovery can never hold READY.
-  const estimatedFeeLamports = executionFeeEstimate(message, plan);
+  const estimatedFeeLamports = Math.max(executionFeeEstimate(message, plan),raydiumFee??0);
+  if(raydiumSnapshot)inspectRaydiumSimulationEffects(plan,message,raydiumSnapshot,response.value,response.context.slot,raydiumFee!);
   const loadedAccountsDataSize = 'loadedAccountsDataSize' in response.value
     && typeof response.value.loadedAccountsDataSize === 'number'
     ? response.value.loadedAccountsDataSize

@@ -10,6 +10,7 @@ import {
   type QuoteProvider,
 } from './aggregators/types.js';
 import { watchDirectMarketAccounts } from './direct-market-stream.js';
+import { raydiumClmmHint } from './execution/raydium-capability.js';
 
 const AtomicString = z.string().regex(/^(0|[1-9]\d*)$/);
 const NumericValue = z.union([z.number(), z.string()]).transform(String);
@@ -104,7 +105,8 @@ export function normalizeRaydiumQuote(
     feeMint: feeMints.size === 1 ? [...feeMints][0] : undefined,
     routePlan: q.routePlan.map((step) => ({
       swapInfo: {
-        label: 'Raydium',
+        label: raydiumClmmHint(step.poolId)?'Raydium CLMM':'Raydium',
+        programId: raydiumClmmHint(step.poolId),
         ammKey: step.poolId,
         inputMint: step.inputMint,
         outputMint: step.outputMint,

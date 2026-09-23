@@ -1,4 +1,15 @@
-import { afterEach,expect,it,vi } from 'vitest';
+import { afterEach,beforeEach,expect,it,vi } from 'vitest';
+const installEnvironment = vi.hoisted(() => {
+  const install = () => {
+    vi.stubEnv('EXECUTION_MODE', 'paper');
+    vi.stubEnv('LIVE_TRADING_ENABLED', 'false');
+  };
+  install(); // Bootstrap tests must not inherit the operator's live configuration.
+  return install;
+});
+vi.mock('dotenv/config', () => ({}));
+beforeEach(installEnvironment);
+afterEach(() => vi.unstubAllEnvs());
 import { readFile,mkdtemp,writeFile,rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';

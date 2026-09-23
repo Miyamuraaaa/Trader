@@ -1,5 +1,6 @@
 import { getRouteLabels, type Quote, type QuoteParams, type QuoteProviderName } from '../aggregators/types.js';
 import { createHash } from 'node:crypto';
+import { RAYDIUM_ADAPTER_ID, RAYDIUM_CAPABILITY, RAYDIUM_CLMM_PROGRAM } from './raydium-capability.js';
 
 /**
  * One source of truth for the route surface audited by the live builders.
@@ -23,17 +24,20 @@ export const EXECUTABLE_PROVIDER_PAIRS = new Set<string>([
   'orca:jupiter',
   'raptor:orca',
   'orca:raptor',
+  'raptor:raydium',
 ]);
 
-export const EXECUTABLE_POLICY_VERSION = 2;
+export const EXECUTABLE_POLICY_VERSION = 3;
 export const EXECUTABLE_POLICY_HASH = createHash('sha256').update(JSON.stringify({
   version: EXECUTABLE_POLICY_VERSION, pairs: [...EXECUTABLE_PROVIDER_PAIRS].sort(),
   jupiterDexes: EXECUTION_JUPITER_DEXES, raptorDexes: EXECUTION_RAPTOR_DEXES,
   maxHops: EXECUTION_AGGREGATOR_MAX_HOPS, maxAccounts: EXECUTION_JUPITER_MAX_ACCOUNTS,
   orcaProgram: EXECUTION_ORCA_PROGRAM_ID, raptorPrograms: [...EXECUTION_RAPTOR_DOWNSTREAM_PROGRAMS].sort(),
   tokenPolicy: 'classic-spl-only', amountPolicy: 'exact-in-enforceable-min-chain',
+  raydiumCapability: RAYDIUM_CAPABILITY,
 })).digest('hex');
 export function executionAdapterIdentity(provider: string, program: string): string {
+  if(provider==='raydium'&&program===RAYDIUM_CLMM_PROGRAM)return RAYDIUM_ADAPTER_ID;
   return `${provider}:single-pool-exact-in:${program}`;
 }
 
@@ -65,6 +69,9 @@ function normalized(value: string): string {
 
 /** Fail closed when a constrained provider response escapes its audited DEX surface. */
 export function quoteMatchesExecutableProviderPolicy(quote: Quote): boolean {
+  if(quote.provider==='raydium')return quote.executionCapabilityId===RAYDIUM_ADAPTER_ID&&quote.swapMode==='ExactIn'&&!quote.isPartialFill
+    &&quote.poolIds.length===1&&quote.routePlan.length===1&&quote.routePlan[0]!.swapInfo.ammKey===quote.poolIds[0]
+    &&quote.routePlan[0]!.swapInfo.programId===RAYDIUM_CLMM_PROGRAM;
   const labels = getRouteLabels(quote);
   if (quote.provider === 'orca') {
     return labels.length > 0 && quote.routePlan.every((step) =>

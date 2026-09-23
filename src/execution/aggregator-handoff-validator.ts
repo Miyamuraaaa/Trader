@@ -44,6 +44,7 @@ import { ExecutionNetworkProfiler } from './network-profiler.js';
 import { executionQuoteAgeLimit } from './quote-freshness.js';
 import { compareExecutionRouteAlignment } from './execution-route-alignment.js';
 import { EXECUTABLE_POLICY_HASH, EXECUTABLE_POLICY_VERSION } from './executable-route-policy.js';
+import { buildRaptorRaydiumCycle } from './raptor-raydium-cycle-builder.js';
 
 export interface AggregatorHandoffValidationResult {
   candidate: AggregatorAtomicHandoff;
@@ -141,6 +142,7 @@ export async function validateAggregatorHandoffForApproval(
       'orca:jupiter': buildOrcaJupiterCycle,
       'raptor:orca': buildRaptorOrcaCycle,
       'orca:raptor': buildOrcaRaptorCycle,
+      'raptor:raydium': buildRaptorRaydiumCycle,
     };
     const buildCycle = cycleBuilders[candidate.providers.join(':')];
     if (!buildCycle) throw new Error(`No executor for provider combination: ${candidate.providers.join(' -> ')}`);
@@ -166,6 +168,7 @@ export async function validateAggregatorHandoffForApproval(
       slippageBps: CONFIG.slippageBps, computeUnitLimit: 500_000,
       intermediateMint: candidate.intermediateMint,
       profiler,
+      raydiumPoolHints: candidate.providers[1]==='raydium'?candidate.scannerPools[1]:undefined,
       orcaPoolHints: candidate.providers[0] === 'orca'
         ? candidate.scannerPools[0]
         : candidate.providers[1] === 'orca' ? candidate.scannerPools[1] : undefined,

@@ -26,13 +26,15 @@ it('recursively excludes scanner-only SDKs and quarantined builders from runtime
     for (const specifier of imports) {
       expect(specifier).not.toMatch(/@meteora-ag\/dlmm|@solana\/spl-token|bigint-buffer|@coral-xyz\/anchor/);
       if (specifier.startsWith('.')) {
-        expect(specifier).not.toMatch(/(?:^|\/)(?:scanner|meteora|raydium|jupiter|raptor|generic-cycle-builder|raydium-swap-builder|meteora-swap-builder)\.js$/);
+        expect(specifier).not.toMatch(/(?:^|\/)(?:scanner|meteora|raydium|jupiter|raptor|generic-cycle-builder|meteora-swap-builder)\.js$/);
         await visit(path.resolve(path.dirname(file), specifier.replace(/\.js$/, '.ts')));
       }
     }
   }
   await visit('src/live-execution-process.ts');
   expect(visited.size).toBeGreaterThan(20);
+  const clmm=await readFile('src/execution/raydium-swap-builder.ts','utf8');
+  expect(clmm).not.toMatch(/VersionedTransaction\.deserialize|swap-base-in|swapTransaction|\.sendTransaction\(|\.execute\(/);
 }, 15_000);
 
 it('keeps the installed Web3/Jayson request-ID path off vulnerable UUID and stream filter APIs', async () => {

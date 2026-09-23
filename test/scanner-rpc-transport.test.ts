@@ -1,4 +1,19 @@
 import { afterEach,beforeEach,describe,expect,it,vi } from 'vitest';
+const installEnvironment = vi.hoisted(() => {
+  const install = () => {
+    // Vitest forks expose process.send too. Exercise scanner admission, not the
+    // production isolated-executor bypass (live mode + IPC).
+    vi.stubEnv('EXECUTION_MODE', 'paper');
+    vi.stubEnv('LIVE_TRADING_ENABLED', 'false');
+    vi.stubEnv('MAX_QUOTE_AGE_MS', '5000');
+    vi.stubEnv('HTTP_TIMEOUT_MS', '5000');
+  };
+  install();
+  return install;
+});
+vi.mock('dotenv/config', () => ({}));
+beforeEach(installEnvironment);
+afterEach(() => vi.unstubAllEnvs());
 import { performance } from 'node:perf_hooks';
 import { ScannerRpcLimiter } from '../src/scanner-rpc-limiter.js';
 import { ScannerRpcEndpoint,scannerRpcEndpoint,scannerEndpointId,registerScannerRpcGovernor } from '../src/scanner-rpc-transport.js';

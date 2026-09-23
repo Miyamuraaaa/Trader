@@ -98,6 +98,7 @@ export interface AtomicExecutionPlan {
   /** Resolved and RPC-verified ALTs used to compile this exact transaction. */
   lookupTableAccounts?: AddressLookupTableAccount[];
   aggregatorEvidence?: AggregatorCycleEvidence;
+  raydiumEvidence?: import('./raptor-raydium-cycle-builder.js').RaydiumCycleEvidence;
 }
 
 export interface SignerContext {

@@ -18,6 +18,7 @@
     "execution:aggregator-validate": "tsx src/execution-aggregator-validate.ts",
     "execution:jupiter-raptor-validate": "tsx src/execution-aggregator-validate.ts --jupiter-raptor",
     "execution:mixed-validate": "tsx src/execution-mixed-validate.ts",
+    "execution:raptor-raydium-validate": "tsx src/execution-raptor-raydium-validate.ts",
     "execution:latency-benchmark": "tsx src/execution-latency-benchmark.ts",
     "execution:jito-benchmark": "tsx src/execution-jito-benchmark.ts",
     "execution:orca-jupiter-validate": "tsx src/execution-mixed-validate.ts --direction=orca-jupiter",

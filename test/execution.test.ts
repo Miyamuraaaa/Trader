@@ -499,7 +499,18 @@ describe('one-shot broadcaster', () => {
       path.join(dir, 'risk.json'),
     );
     await risk.load();
-    return { approved, journal, journalPath, risk };
+    // Persistence/restart tests exercise ordering, not elapsed filesystem time.
+    // Keep one clock at completed evidence for every broadcaster using this
+    // fixture, including restarts and a duplicate ID with the same signature.
+    // Do not mutate approval timestamps or override production age limits.
+    const evidenceReadyAt = Math.max(
+      approved.plan.quoteReceivedAt,
+      approved.unsignedSimulation.timing.blockhashRetrievedAt,
+      approved.unsignedSimulation.timing.simulationResponseAt,
+      approved.signedSimulation?.timing.simulationResponseAt ?? 0,
+    );
+    const now = () => evidenceReadyAt;
+    return { approved, journal, journalPath, risk, now };
   }
 
   it.each(['journal-boundary','risk-boundary','before-transport'] as const)('crash at %s cannot cause a duplicate send after restart',async boundary=>{
@@ -511,31 +522,31 @@ describe('one-shot broadcaster', () => {
       const original=s.risk.recordSubmissionAttempt.bind(s.risk);
       vi.spyOn(s.risk,'recordSubmissionAttempt').mockImplementation(async id=>{await original(id);throw new Error('injected crash');});
     }
-    const broadcaster=new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard});
+    const broadcaster=new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard,now:s.now});
     await expect(broadcaster.submit(s.approved)).rejects.toThrow('injected');expect(mock.calls).toHaveLength(0);
     const restarted=new PersistentExecutionJournal(s.journalPath);await restarted.load();
-    await expect(new OneShotBroadcaster(mock.transport,restarted,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved)).rejects.toThrow();
+    await expect(new OneShotBroadcaster(mock.transport,restarted,s.risk,{readinessReady:true,guardConfig:liveGuard,now:s.now}).submit(s.approved)).rejects.toThrow();
     expect(mock.calls).toHaveLength(0);vi.restoreAllMocks();
   });
   it.each(['rpc','jito'] as const)('ambiguous %s sends once and never replaces its deterministic signature',async kind=>{
     const s=await setup(`unknown-${kind}`),mock=setupTransport(()=>s.approved.transactionSignature,new Error('ambiguous'));
-    const transport={...mock.transport,kind};const broadcaster=new OneShotBroadcaster(transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard});
+    const transport={...mock.transport,kind};const broadcaster=new OneShotBroadcaster(transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard,now:s.now});
     await expect(broadcaster.submit(s.approved)).rejects.toBeInstanceOf(AmbiguousSubmissionError);
-    await expect(new OneShotBroadcaster(transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved)).rejects.toThrow();
+    await expect(new OneShotBroadcaster(transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard,now:s.now}).submit(s.approved)).rejects.toThrow();
     expect(mock.calls).toHaveLength(1);expect(s.journal.get(s.approved.executionId)).toMatchObject({state:'SUBMISSION_UNKNOWN',signature:s.approved.transactionSignature,transportKind:kind,lastValidBlockHeight:999});
   });
   it('blocks an already journaled signature even under a different execution ID',async()=>{
     const s=await setup('original-signature'),mock=setupTransport(()=>s.approved.transactionSignature);
-    await new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved);
+    await new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard,now:s.now}).submit(s.approved);
     await s.journal.transition(s.approved.executionId,'CONFIRMING');await s.journal.transition(s.approved.executionId,'CONFIRMED');
     const duplicate=approveSignedExecutionForSubmission('different-id',s.approved,s.approved.unsignedSimulation,s.approved.signedSimulation);
     await seedApprovedJournal(s.journal,duplicate);
-    await expect(new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(duplicate)).rejects.toThrow('deterministic signature already journaled');expect(mock.calls).toHaveLength(1);
+    await expect(new OneShotBroadcaster(mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard,now:s.now}).submit(duplicate)).rejects.toThrow('deterministic signature already journaled');expect(mock.calls).toHaveLength(1);
   });
   it('preserves automatic guarded-factory submission with a mock transport and no user-click event',async()=>{
     const s=await setup('automatic-capability'),mock=setupTransport(()=>s.approved.transactionSignature),before=submissionCounters();
     const capability=createSubmissionCapability(false,liveGuard,true);
-    await createSubmissionBroadcaster(capability,()=>mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard}).submit(s.approved);
+    await createSubmissionBroadcaster(capability,()=>mock.transport,s.journal,s.risk,{readinessReady:true,guardConfig:liveGuard,now:s.now}).submit(s.approved);
     const after=submissionCounters();for(const key of Object.keys(before) as Array<keyof typeof before>)expect(after[key]-before[key]).toBe(1);expect(mock.calls).toHaveLength(1);
   });
 
@@ -544,7 +555,7 @@ describe('one-shot broadcaster', () => {
     const mock = setupTransport(() => state.approved.transactionSignature);
     const broadcaster = new OneShotBroadcaster(mock.transport, state.journal, state.risk, {
       readinessReady: true, guardConfig: liveGuard,
-      now: () => state.approved.plan.quoteReceivedAt,
+      now: state.now,
     });
     await expect(broadcaster.submit(state.approved)).resolves.toBe(state.approved.transactionSignature);
     expect(Buffer.from(mock.calls[0] ?? []).equals(Buffer.from(state.approved.transaction.serialize()))).toBe(true);
@@ -562,7 +573,7 @@ describe('one-shot broadcaster', () => {
     const mock = setupTransport(() => state.approved.transactionSignature);
     const broadcaster = new OneShotBroadcaster(mock.transport, state.journal, state.risk, {
       readinessReady: true, guardConfig: liveGuard,
-      now: () => state.approved.plan.quoteReceivedAt,
+      now: state.now,
     });
     await expect(broadcaster.submit(state.approved)).resolves.toBe(state.approved.transactionSignature);
     expect(mock.calls).toHaveLength(1);
@@ -573,7 +584,7 @@ describe('one-shot broadcaster', () => {
     const mock = setupTransport(() => state.approved.transactionSignature);
     const broadcaster = new OneShotBroadcaster(mock.transport, state.journal, state.risk, {
       readinessReady: true, guardConfig: liveGuard,
-      now: () => state.approved.plan.quoteReceivedAt,
+      now: state.now,
     });
     await expect(broadcaster.submit({} as ApprovedSignedExecution)).rejects.toThrow('not an in-process');
     state.approved.transaction.message.recentBlockhash = key();
@@ -586,7 +597,7 @@ describe('one-shot broadcaster', () => {
     const mock = setupTransport(() => state.approved.transactionSignature, new Error('socket closed'));
     const broadcaster = new OneShotBroadcaster(mock.transport, state.journal, state.risk, {
       readinessReady: true, guardConfig: liveGuard,
-      now: () => state.approved.plan.quoteReceivedAt,
+      now: state.now,
     });
     await expect(broadcaster.submit(state.approved)).rejects.toBeInstanceOf(AmbiguousSubmissionError);
     await expect(broadcaster.submit(state.approved)).rejects.toThrow('already attempted');
@@ -767,7 +778,7 @@ describe('untrusted scanner handoff boundary', () => {
     const joined = source.join('\n');
     expect(joined).not.toMatch(/from\s+['"](?:\.\.\/)+(?:meteora|raptor|raydium|jupiter)(?:\.js)?['"]/i);
     expect(joined).not.toMatch(/@solana\/spl-token|bigint-buffer/i);
-    expect(joined).not.toMatch(/(?:generic-cycle|raydium-swap|meteora-swap)-builder/i);
+    expect(joined).not.toMatch(/(?:generic-cycle|meteora-swap)-builder/i);
   });
 });
 

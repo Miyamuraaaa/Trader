@@ -9,6 +9,7 @@ import { PrefilterCoalescer, type PrefilterTrace } from '../src/execution/prefil
 import { RawPrefilterLedger } from '../src/execution/raw-prefilter-ledger.js';
 import { scannerLifecycleDisplay } from '../src/execution/scanner-display-eligibility.js';
 import { isFreshPositiveAuditedExecutionSignal } from '../src/execution/scanner-handoff-eligibility.js';
+import { RAYDIUM_ADAPTER_ID, RAYDIUM_CLMM_PROGRAM } from '../src/execution/raydium-capability.js';
 
 afterEach(() => vi.useRealTimers());
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -31,6 +32,40 @@ const costs = { referenceSolPriceUsdc: 150, estimatedNetworkCostsUsdc: { baseNet
 const supported = async () => ({ status: 'SUPPORTED' as const, rentLamports: 0 });
 
 describe('TEST DATA ONLY: raw-positive constrained prefilter', () => {
+  it('unmarked Raydium discovery intent is requoted, not rejected for missing capability', async () => {
+    const mint='TEST_NON_NATIVE_MINT';
+    const candidate=raw();candidate.buyQuote=quote('raptor',MINTS.USDC,mint,'50000');candidate.sellQuote=quote('raydium',mint,MINTS.USDC,'1000');
+    expect(candidate.sellQuote.executionCapabilityId).toBeUndefined();
+    const quoted=vi.fn(async(provider:QuoteProviderName,input:string,output:string,amount:string)=>{
+      const q=quote(provider,input,output,amount);
+      if(provider==='raydium'){
+        q.executionCapabilityId=RAYDIUM_ADAPTER_ID;
+        q.routePlan=[{percent:100,swapInfo:{label:'Raydium CLMM',programId:RAYDIUM_CLMM_PROGRAM,ammKey:q.poolIds[0]}}];
+      }
+      return q;
+    });
+    const result=await buildExecutableCandidateFromRaw(candidate,costs,{policy:supported,quote:quoted});
+    expect(quoted).toHaveBeenCalledTimes(2);
+    expect(quoted.mock.calls[1]?.[3]).toBe('990');
+    expect(result.status).toBe('EXECUTABLE_CANDIDATE');
+    expect(result.route?.sellQuote.executionCapabilityId).toBe(RAYDIUM_ADAPTER_ID);
+    expect(isFreshPositiveAuditedExecutionSignal(result.route!)).toBe(true);
+  });
+  it.each([1, 2])('rejects observed WSOL Raptor/Raydium intent with %i pools before constrained work', async count => {
+    const candidate = raw();
+    candidate.buyQuote.provider = 'raptor';
+    candidate.sellQuote.provider = 'raydium';
+    candidate.sellQuote.poolIds = Array.from({length:count}, (_, i) => `TEST_RAY_POOL_${i}`);
+    candidate.sellQuote.routePlan = Array.from({length:count}, () => ({swapInfo:{label:'Raydium'}}));
+    const policy = vi.fn(supported), quoted = vi.fn(async (...args: Parameters<typeof quote>) => quote(...args));
+    const result = await buildExecutableCandidateFromRaw(candidate, costs, {policy, quote:quoted});
+    expect(result.status).toBe('ROUTE_POLICY_REJECTED');
+    expect(result.reason).toContain('RAYDIUM_NATIVE_MINT_UNSUPPORTED');
+    expect(result.reason?.includes('RAYDIUM_SINGLE_POOL_REQUIRED')).toBe(count === 2);
+    expect(policy).not.toHaveBeenCalled(); expect(quoted).not.toHaveBeenCalled();
+    expect(result.trace?.constrainedLeg1StartedAt).toBeUndefined();
+    expect(result.trace?.constrainedLeg2StartedAt).toBeUndefined();
+  });
   it('fast lane uses one min-propagated quote and attributes nonpositive economics directly', async () => {
     const buy = quote('jupiter', MINTS.USDC, MINTS.SOL, '50000');
     const sell = vi.fn(async (provider: QuoteProviderName, input: string, output: string, amount: string) => ({ ...quote(provider,input,output,amount),outAmount:'49000',otherAmountThreshold:'48000' }));

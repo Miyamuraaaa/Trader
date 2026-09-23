@@ -46,7 +46,7 @@ const ApiInstructionSchema = z.object({
 }).strict();
 const NullableInstruction = ApiInstructionSchema.nullish();
 
-const RaptorQuoteSchema = z.object({
+export const RaptorQuoteSchema = z.object({
   inputMint: z.string(), outputMint: z.string(), amountIn: z.string(), amountOut: z.string(),
   minAmountOut: z.string(), feeAmount: z.string().optional(), priceImpact: z.number(),
   slippageBps: z.number(), contextSlot: z.number().optional(),
@@ -56,7 +56,7 @@ const RaptorQuoteSchema = z.object({
   }).passthrough()).default([]),
 }).passthrough();
 
-const InstructionBundleSchema = z.object({
+export const InstructionBundleSchema = z.object({
   tokenLedgerInstruction: NullableInstruction,
   computeBudgetInstructions: z.array(ApiInstructionSchema).default([]),
   setupInstructions: z.array(ApiInstructionSchema).default([]),
@@ -106,7 +106,7 @@ async function responseJson(
   return profiler ? profiler.measure(`http.${label}`, 'http', request) : request();
 }
 
-function toInstruction(value: ApiInstruction): TransactionInstruction {
+export function toInstruction(value: ApiInstruction): TransactionInstruction {
   return new TransactionInstruction({
     programId: new PublicKey(value.programId),
     keys: value.accounts.map((account) => ({
@@ -116,7 +116,7 @@ function toInstruction(value: ApiInstruction): TransactionInstruction {
   });
 }
 
-function instructionHash(instruction: TransactionInstruction): string {
+export function instructionHash(instruction: TransactionInstruction): string {
   const hash = createHash('sha256');
   hash.update(instruction.programId.toBuffer());
   for (const key of instruction.keys) hash.update(key.pubkey.toBuffer());

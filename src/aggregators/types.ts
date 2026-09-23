@@ -71,6 +71,8 @@ export interface NormalizedRouteStep {
  * Amounts are atomic-unit strings so no precision is lost.
  */
 export interface Quote {
+  /** Advisory local-builder capability; independently re-derived by executor. */
+  executionCapabilityId?: string;
   provider: QuoteProviderName;
   id: string;
   inputMint: string;

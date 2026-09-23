@@ -202,6 +202,8 @@ async function executableRoutePrograms(
 }
 
 export interface BuildRaptorJupiterCycleInput {
+  /** Intent only; the CLMM builder independently fetches and validates this pool. */
+  raydiumPoolHints?: readonly string[];
   connection: Connection;
   wallet: PublicKey;
   inputAmount: bigint;

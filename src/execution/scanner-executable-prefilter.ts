@@ -35,6 +35,8 @@ import {
 } from './executable-route-policy.js';
 import { assertIntermediateTokenExecutionPolicy } from './token-analysis.js';
 import type { PrefilterTrace } from './prefilter-trace.js';
+import { quoteRaydiumExecutablePool } from './raydium-swap-builder.js';
+import { RAYDIUM_CLMM_PROGRAM } from './raydium-capability.js';
 const SHADOW_CAP_DIAGNOSTIC = Symbol('NON_AUTHORIZING_SHADOW_CAP_DIAGNOSTIC');
 
 export type ExecutablePrefilterStatus =
@@ -175,6 +177,7 @@ async function constrainedQuote(
   amountAtomic: string,
   scheduling?: QuoteParams['scheduling'],
   shadow = false,
+  raydiumCycle = false,
 ): Promise<Quote> {
   const quote = await getProviderQuote(provider, {
     inputMint,
@@ -184,6 +187,7 @@ async function constrainedQuote(
     priority: shadow ? 'DISCOVERY_LOW' : 'EXEC_PREFILTER_HIGH',
     scheduling,
     ...executableQuoteConstraints(provider),
+    ...(raydiumCycle&&provider==='raptor'?{dexes:['Raydium CLMM']}:{}),
   });
   if (!isFullFillQuote(quote)) throw new Error(`${provider} returned a partial executable-prefilter fill`);
   if (!quoteMatchesExecutableProviderPolicy(quote)) {
@@ -235,7 +239,20 @@ export async function buildExecutableCandidateFromRaw(
   if (!isExecutableProviderPair(buyProvider, sellProvider)) {
     return { status: 'UNSUPPORTED_PROVIDER_PAIR' };
   }
-  const quoteWork = options.quote ?? ((provider, input, output, amount, scheduling) => constrainedQuote(provider, input, output, amount, scheduling, options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC));
+  const raydiumCycle=buyProvider==='raptor'&&sellProvider==='raydium';
+  if (raydiumCycle) {
+    // Discovery labels/capability absence are not admission failures: the fresh
+    // local CLMM requote below establishes capability. Report actual intent
+    // blockers separately, before spending any constrained quote/RPC capacity.
+    const blockers: string[] = [];
+    if (raw.buyQuote.outputMint === MINTS.SOL) blockers.push('RAYDIUM_NATIVE_MINT_UNSUPPORTED');
+    if (raw.sellQuote.poolIds.length !== 1) blockers.push('RAYDIUM_SINGLE_POOL_REQUIRED');
+    if (raw.sellQuote.routePlan.length !== 1) blockers.push('RAYDIUM_SINGLE_ROUTE_STEP_REQUIRED');
+    if (blockers.length) return { status: 'ROUTE_POLICY_REJECTED', reason: blockers.join('|') };
+  }
+  const quoteWork = options.quote ?? ((provider, input, output, amount, scheduling) => raydiumCycle&&provider==='raydium'
+    ? scannerRpcContext.run({label:'prefilter.raydiumClmm',priority:'RPC_P0_EXECUTION_CRITICAL',traceId:options.traceId,deadlineMono:scheduling?.deadlineMono,liveDependency:true},()=>quoteRaydiumExecutablePool(scannerPolicyConnection,raw.sellQuote.poolIds[0]!,input,output,amount,CONFIG.slippageBps))
+    : constrainedQuote(provider, input, output, amount, scheduling, options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC,raydiumCycle));
   const quote: typeof quoteWork = (provider, input, output, amount, scheduling) => measuredProviderCall(options.diagnosticCapability === SHADOW_CAP_DIAGNOSTIC ? 'ABOVE_CAP_SHADOW' : raw.sourceLane ?? 'BROAD_MATRIX', provider, () => quoteWork(provider, input, output, amount, scheduling));
   const windowMs = [buyProvider, sellProvider].includes('raptor') ? CONFIG.raptorExecutionQuoteAgeMs : CONFIG.maxExecutionQuoteAgeMs;
   let parentDeadline: number;
@@ -263,11 +280,14 @@ export async function buildExecutableCandidateFromRaw(
     }
   }
   const tokenPolicyPromise = timed('tokenPolicy', () => scannerRpcContext.run({label:'prefilter.tokenPolicy',priority:'RPC_P0_EXECUTION_CRITICAL',traceId:options.traceId,deadlineMono:scheduling.deadlineMono,liveDependency:true},()=>(options.policy ?? classifyIntermediate)(raw.buyQuote.outputMint,'RPC_P0_EXECUTION_CRITICAL')));
+  // Early quote/policy rejection must still observe the independent RPC task.
+  void tokenPolicyPromise.catch(()=>undefined);
   const buyPromise = timed('constrainedLeg1', () => quote(buyProvider, MINTS.USDC, raw.buyQuote.outputMint, raw.buyQuote.inAmount, scheduling));
 
   let buy: Quote;
   try {
     buy = await buyPromise;
+    if(raydiumCycle&&buy.routePlan.some(s=>s.swapInfo.programId!==RAYDIUM_CLMM_PROGRAM))return {status:'ROUTE_POLICY_REJECTED',reason:'RAYDIUM_FIRST_LEG_CAPABILITY_MISMATCH'};
     if (now() - buy.responseTimestamp > CONFIG.maxQuoteAgeMs) return { status: 'PREFILTER_STALE' };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -299,6 +319,7 @@ export async function buildExecutableCandidateFromRaw(
     }
     if (tokenPolicy.status === 'TOKEN_2022') return { status: 'DISCOVERY_ONLY_TOKEN_2022' };
     if (tokenPolicy.status !== 'SUPPORTED') return { status: 'TOKEN_POLICY_REJECTED', reason: tokenPolicy.reason };
+    if(raydiumCycle&&tokenPolicy.rentLamports!==0)return {status:'ROUTE_POLICY_REJECTED',reason:'RAYDIUM_EXISTING_ATA_REQUIRED'};
 
     try {
       if (sellResult.status === 'rejected') throw sellResult.reason;
