@@ -9,6 +9,7 @@ import { opportunityQuality } from './economics/opportunity-quality.js';
 import type { SourceLane } from './execution/source-lane.js';
 import { scannerBreakdown } from './economics/scanner-breakdown.js';
 import { scannerHistoryBuffer } from './scanner-history-buffer.js';
+import { ScanQuotePersistence } from './quote-persistence.js';
 import { scannerRpcLimiter } from './scanner-rpc-limiter.js';
 import { executablePairCoordinator } from './executable-pair-coordinator.js';
 import { constrainedStop } from './soak-controls.js';
@@ -626,13 +627,14 @@ async function persistAndEvaluateRoute(
   scanRowId: string,
   timestamp: string,
   tradeSizeUsdc: number,
+  quotePersistence: ScanQuotePersistence,
   confirm: boolean = true,
 ): Promise<boolean> {
   const paperLedgerEnabled = CONFIG.executionMode === 'paper';
   const { buyQuote: buyLeg, sellQuote: sellLeg, profit } = route;
   if (route.opportunityScope === 'EXECUTABLE_CANDIDATE') {
-    insertQuote(quoteToRow(buyLeg, scanRowId, `EXEC_BUY_${buyLeg.provider.toUpperCase()}`));
-    insertQuote(quoteToRow(sellLeg, scanRowId, `EXEC_SELL_${sellLeg.provider.toUpperCase()}`));
+    quotePersistence.persist(quoteToRow(buyLeg, scanRowId, `EXEC_BUY_${buyLeg.provider.toUpperCase()}`));
+    quotePersistence.persist(quoteToRow(sellLeg, scanRowId, `EXEC_SELL_${sellLeg.provider.toUpperCase()}`));
   }
   const lifecycle = observeOpportunity(route);
   const shouldPrintEstimate = lifecycle.state === 'LIVE_QUOTED'
@@ -913,6 +915,12 @@ export async function scanOnce(
       }
 
       const scanRowId = `${scanId}-${cycle.intermediateToken}-${tradeSizeUsdc}`;
+      const quotePersistence = new ScanQuotePersistence(scanRowId, insertQuote,
+        row => scannerHistoryBuffer.enqueueQuote(row),
+        (row, code) => {
+          scannerStats.quotePersistenceFailures++;
+          log.error(code, { id: row.id, scanId: row.scanId, leg: row.leg });
+        });
       const scanRow: ScanRow = {
         id: scanRowId,
         timestamp,
@@ -954,8 +962,7 @@ export async function scanOnce(
         try {
         recordProviderQuoteResults(results);
         for (const quote of successfulQuotes(results).filter(isFullFillQuote)) {
-          const write = () => insertQuote(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`));
-          if (CONFIG.executionMode === 'live') scannerHistoryBuffer.enqueueQuote(quoteToRow(quote,scanRowId,`BUY_${quote.provider.toUpperCase()}`)); else write();
+          quotePersistence.persist(quoteToRow(quote, scanRowId, `BUY_${quote.provider.toUpperCase()}`), CONFIG.executionMode === 'live');
         }
         return results;
         } finally { finished(); }
@@ -974,7 +981,7 @@ export async function scanOnce(
         const key = `${route.buyQuote.id}:${route.sellQuote.id}`;
         if (persistedQuotePairs.has(key)) return false;
         persistedQuotePairs.add(key);
-        return profileScannerStage('routePersistenceAndBookkeeping', () => persistAndEvaluateRoute(route, scanRowId, timestamp, tradeSizeUsdc, confirm));
+        return profileScannerStage('routePersistenceAndBookkeeping', () => persistAndEvaluateRoute(route, scanRowId, timestamp, tradeSizeUsdc, quotePersistence, confirm));
       };
       const promoteRawImmediately = (route: RoundTripResult) => {
         route.sourceLane ??= route.buyQuote.provider === 'jupiter' || route.buyQuote.provider === 'raptor' ? sourceLane === 'UNRESTRICTED_CONTROL' ? sourceLane : 'BROAD_MATRIX' : 'BROAD_MATRIX';
@@ -1127,7 +1134,7 @@ export async function scanOnce(
         observableRoutes.push(...fastMatrix.routes);
         if (CONFIG.verboseScanOutput || CONFIG.debug) printRoundTripMatrix('JUPITER <-> RAPTOR FAST LANE', fastMatrix);
         for (const route of fastMatrix.routes) {
-          insertQuote(quoteToRow(
+          quotePersistence.persist(quoteToRow(
             route.sellQuote,
             scanRowId,
             `SELL_FAST_${route.buyQuote.provider.toUpperCase()}_TO_${route.sellQuote.provider.toUpperCase()}`,
@@ -1169,7 +1176,7 @@ export async function scanOnce(
       completedRoutes += directMatrix.routes.length;
       if (CONFIG.verboseScanOutput || CONFIG.debug) printRoundTripMatrix('DIRECT CROSS-DEX OPPORTUNITIES', directMatrix);
       for (const route of directMatrix.routes) {
-        insertQuote(quoteToRow(
+        quotePersistence.persist(quoteToRow(
           route.sellQuote,
           scanRowId,
           `SELL_${route.buyQuote.provider.toUpperCase()}_TO_${route.sellQuote.provider.toUpperCase()}`,
@@ -1200,7 +1207,7 @@ export async function scanOnce(
         observableRoutes.push(...mixedMatrix.routes);
         if (CONFIG.verboseScanOutput || CONFIG.debug) printRoundTripMatrix('AGGREGATOR <-> DIRECT DEX ROUTES', mixedMatrix);
         for (const route of mixedMatrix.routes) {
-          insertQuote(quoteToRow(
+          quotePersistence.persist(quoteToRow(
             route.sellQuote,
             scanRowId,
             `SELL_${route.buyQuote.provider.toUpperCase()}_TO_${route.sellQuote.provider.toUpperCase()}`,
@@ -1291,6 +1298,7 @@ export async function scanOnce(
 }
 
 export const scannerStats: {
+  quotePersistenceFailures: number;
   lanes: { aggregatorFirstLegMs: number; directFirstLegMs: number; aggregatorFastLaneEvals60s: number; directLaneEvals60s: number; mixedLaneEvals60s: number; completedScans60s: number; scannerCycleP50: number; scannerCycleP90: number; staleByLane60s: Record<string, number> };
   evaluationsThisMinute: number;
   routesEvaluated: number;
@@ -1329,6 +1337,7 @@ export const scannerStats: {
     rateLimitsPerMinute: number;
   }>;
 } = {
+  quotePersistenceFailures: 0,
   lanes: { aggregatorFirstLegMs: 0, directFirstLegMs: 0, aggregatorFastLaneEvals60s: 0, directLaneEvals60s: 0, mixedLaneEvals60s: 0, completedScans60s: 0, scannerCycleP50: 0, scannerCycleP90: 0, staleByLane60s: {} },
   evaluationsThisMinute: 0,
   routesEvaluated: 0,

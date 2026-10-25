@@ -67,7 +67,7 @@ const InstructionBundleSchema = z.object({
 
 const JupiterBuildSchema = z.object({
   inputMint: z.string(), outputMint: z.string(), inAmount: z.string(), outAmount: z.string(),
-  otherAmountThreshold: z.string(), swapMode: z.literal('ExactIn'), slippageBps: z.number(),
+  otherAmountThreshold: z.string(), swapMode: z.literal('ExactIn'), slippageBps: z.coerce.number().optional(),
   routePlan: z.array(z.object({
     swapInfo: z.object({ ammKey: z.string().optional(), inputMint: z.string(), outputMint: z.string() }).passthrough(),
   }).passthrough()).default([]),
@@ -291,7 +291,7 @@ export async function buildRaptorJupiterCycle(input: BuildRaptorJupiterCycleInpu
     // surplus remains observable WSOL dust and is never counted as USDC P&L.
     amount: raptorQuote.minAmountOut,
     taker: input.wallet.toBase58(),
-    slippageBps: String(input.slippageBps),
+    slippageBps: 'rtse',
     mode: 'fast',
     // Composition must leave room for the first leg and audited WSOL cleanup.
     // Jupiter documents maxAccounts specifically for custom transactions.
@@ -386,6 +386,18 @@ export async function buildRaptorJupiterCycle(input: BuildRaptorJupiterCycleInpu
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
     ...deduped,
   ];
+  profiler.trace('JUPITER_BUILD_TELEMETRY', {
+    requestedSlippage: 'rtse',
+    returnedSlippageBps: jupiterBuild.slippageBps,
+    inAmount: jupiterBuild.inAmount,
+    outAmount: jupiterBuild.outAmount,
+    otherAmountThreshold: jupiterBuild.otherAmountThreshold,
+    swapProgramId: jupiterBuild.swapInstruction.programId,
+    instructionMapping: instructions.reduce<Record<number, string>>((acc, ix, idx) => {
+      acc[idx] = ix.programId.toBase58();
+      return acc;
+    }, {}),
+  });
   const lookupTableAddresses = [
     ...raptorBundle.addressLookupTableAddresses,
     ...Object.keys(jupiterBuild.addressesByLookupTableAddress),
@@ -481,7 +493,7 @@ export async function buildJupiterRaptorCycle(input: BuildRaptorJupiterCycleInpu
     outputMint: intermediateMint,
     amount,
     taker: input.wallet.toBase58(),
-    slippageBps: String(input.slippageBps),
+    slippageBps: 'rtse',
     mode: 'fast',
     maxAccounts: String(EXECUTION_JUPITER_MAX_ACCOUNTS),
     wrapAndUnwrapSol: 'false',
@@ -605,6 +617,18 @@ export async function buildJupiterRaptorCycle(input: BuildRaptorJupiterCycleInpu
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
     ...deduped,
   ];
+  profiler.trace('JUPITER_BUILD_TELEMETRY', {
+    requestedSlippage: 'rtse',
+    returnedSlippageBps: jupiterBuild.slippageBps,
+    inAmount: jupiterBuild.inAmount,
+    outAmount: jupiterBuild.outAmount,
+    otherAmountThreshold: jupiterBuild.otherAmountThreshold,
+    swapProgramId: jupiterBuild.swapInstruction.programId,
+    instructionMapping: instructions.reduce<Record<number, string>>((acc, ix, idx) => {
+      acc[idx] = ix.programId.toBase58();
+      return acc;
+    }, {}),
+  });
   const [lookupTableAccounts, routeProgramIds] = await Promise.all([
     loadLookupTables(input.connection, [
       ...Object.keys(jupiterBuild.addressesByLookupTableAddress),

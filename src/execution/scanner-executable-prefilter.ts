@@ -249,6 +249,19 @@ export async function buildExecutableCandidateFromRaw(
     if (raw.sellQuote.poolIds.length !== 1) blockers.push('RAYDIUM_SINGLE_POOL_REQUIRED');
     if (raw.sellQuote.routePlan.length !== 1) blockers.push('RAYDIUM_SINGLE_ROUTE_STEP_REQUIRED');
     if (blockers.length) return { status: 'ROUTE_POLICY_REJECTED', reason: blockers.join('|') };
+    // Early ATA-existence check from cache only. This never starts RPC; if the
+    // cache is cold the normal parallel flow below will discover the same result.
+    // When the cache already knows the ATA is missing, reject immediately to
+    // avoid spending a raptor HTTP slot on a route that will fail at line 322.
+    if (!options.policy && CONFIG.botWalletAddress) {
+      const peek = peekExecutionPreflight(scannerPolicyConnection, new PublicKey(CONFIG.botWalletAddress), raw.buyQuote.outputMint);
+      if (peek) {
+        try {
+          const [, ata] = await peek;
+          if (ata.creationRentLamports !== 0) return { status: 'ROUTE_POLICY_REJECTED', reason: 'RAYDIUM_EXISTING_ATA_REQUIRED' };
+        } catch { /* cache probe failed — continue to normal parallel flow */ }
+      }
+    }
   }
   const quoteWork = options.quote ?? ((provider, input, output, amount, scheduling) => raydiumCycle&&provider==='raydium'
     ? scannerRpcContext.run({label:'prefilter.raydiumClmm',priority:'RPC_P0_EXECUTION_CRITICAL',traceId:options.traceId,deadlineMono:scheduling?.deadlineMono,liveDependency:true},()=>quoteRaydiumExecutablePool(scannerPolicyConnection,raw.sellQuote.poolIds[0]!,input,output,amount,CONFIG.slippageBps))

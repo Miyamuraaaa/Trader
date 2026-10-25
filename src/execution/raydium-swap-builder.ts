@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Connection, PublicKey, TransactionInstruction, type AccountInfo } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, associatedTokenAddress } from './account-preflight.js';
 import { RAYDIUM_CLMM_PROGRAM, RAYDIUM_CAPABILITY } from './raydium-capability.js';
@@ -147,7 +147,7 @@ export async function quoteRaydiumExecutablePool(connection:Connection,poolId:st
   const s=await loadRaydiumState(connection,poolId,inputMint,outputMint);
   const q=quoteRaydiumCell(BigInt(amount),s.pool.liquidity,s.pool.sqrtPrice,s.pool.tick,s.pool.spacing,s.feeRate,inputMint===s.pool.mint0.toBase58(),slippageBps);
   check(q.expected<(inputMint===s.pool.mint0.toBase58()?s.outputVaultBalance1:s.outputVaultBalance0),'INSUFFICIENT_VAULT');
-  return {provider:'raydium',id:`raydium-clmm-${poolId}-${s.slot}-${amount}`,executionCapabilityId:RAYDIUM_ADAPTER_ID,inputMint,outputMint,inAmount:amount,consumedInAmount:amount,outAmount:String(q.expected),otherAmountThreshold:String(q.minimum),swapMode:'ExactIn',slippageBps,
+  return {provider:'raydium',id:randomUUID(),executionCapabilityId:RAYDIUM_ADAPTER_ID,inputMint,outputMint,inAmount:amount,consumedInAmount:amount,outAmount:String(q.expected),otherAmountThreshold:String(q.minimum),swapMode:'ExactIn',slippageBps,
     routePlan:[{percent:100,swapInfo:{label:'Raydium CLMM',ammKey:poolId,programId:RAYDIUM_CLMM_PROGRAM,inputMint,outputMint,inAmount:amount,outAmount:String(q.expected)}}],poolIds:[poolId],isPartialFill:false,contextSlot:s.slot,
     requestTimestamp:s.evidenceAt,responseTimestamp:s.evidenceAt,latencyMs:Date.now()-s.evidenceAt,rawResponse:JSON.stringify({family:'CLMM',programId:RAYDIUM_CLMM_PROGRAM,capability:RAYDIUM_ADAPTER_ID,poolId,slot:s.slot,stateHash:s.stateHash})};
 }

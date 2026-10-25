@@ -2,6 +2,7 @@ import { performance } from 'node:perf_hooks';
 import { Worker } from 'node:worker_threads';
 import { join } from 'node:path';
 import type { ScanRow, QuoteRow } from './db.js';
+import { log } from './logger.js';
 /** Only lossy scanner history; NEVER journal, risk, raw-terminal outcomes or submission state. */
 export class ScannerHistoryBuffer {
   private worker?:Worker;
@@ -16,10 +17,10 @@ export class ScannerHistoryBuffer {
     if(!this.worker){
       this.worker=new Worker(new URL('../scripts/scanner-history-worker.mjs',import.meta.url),{workerData:{path:join(process.cwd(),'data','terminal.db')},execArgv:[]});this.worker.unref();
       this.worker.on('message',(result:{ok:boolean;writeMs:number})=>{
-        if(result.ok)this.completed++;else this.failed++;
+        if(result.ok)this.completed++;else {this.failed++;log.error('SCANNER_HISTORY_WRITE_FAILED', {failed:this.failed});}
         this.durations.push(result.writeMs);this.durations=this.durations.slice(-256);this.workerBusy=false;this.pumpWorker();
       });
-      this.worker.on('error',()=>{this.workerFailed=true;this.failed++;this.dropped+=this.workerQueue.length;this.workerQueue=[];this.workerBusy=false;});
+      this.worker.on('error',()=>{this.workerFailed=true;this.failed++;this.dropped+=this.workerQueue.length;this.workerQueue=[];this.workerBusy=false;log.error('SCANNER_HISTORY_WORKER_FAILED',{failed:this.failed,dropped:this.dropped});});
       this.worker.unref();
     }
     this.pumpWorker();return true;

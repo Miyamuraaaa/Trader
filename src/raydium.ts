@@ -90,7 +90,10 @@ export function normalizeRaydiumQuote(
 
   return {
     provider: 'raydium',
-    id: parsed.data.id || crypto.randomUUID(),
+    // Always generate a locally unique database ID. The Raydium API
+    // envelope ID (parsed.data.id) is a request-correlation identifier
+    // that will collide across parallel paths or repeated scans.
+    id: crypto.randomUUID(),
     inputMint: q.inputMint,
     outputMint: q.outputMint,
     inAmount: q.inputAmount,
