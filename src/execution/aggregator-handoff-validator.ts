@@ -45,6 +45,8 @@ import { executionQuoteAgeLimit } from './quote-freshness.js';
 import { compareExecutionRouteAlignment } from './execution-route-alignment.js';
 import { EXECUTABLE_POLICY_HASH, EXECUTABLE_POLICY_VERSION } from './executable-route-policy.js';
 import { buildRaptorRaydiumCycle } from './raptor-raydium-cycle-builder.js';
+import { describeSimulationFailure } from './simulation-failure-diagnostics.js';
+import { assertConservativeFloor } from './pre-simulation-floor.js';
 
 export interface AggregatorHandoffValidationResult {
   candidate: AggregatorAtomicHandoff;
@@ -195,6 +197,7 @@ export async function validateAggregatorHandoffForApproval(
     logExecutionStage(identity, 'INSPECTION_PASS', candidate.detectedAt, {
       instructions: inspection.instructionCount,
     });
+    assertConservativeFloor(plan, BigInt(toAtomic(CONFIG.minNetProfitUsdc, DECIMALS.USDC)));
     await transition('SIMULATING');
     logExecutionStage(identity, 'SIMULATION_START', candidate.detectedAt, {
       freshnessEvidenceAt: plan.quoteReceivedAt,
@@ -218,7 +221,10 @@ export async function validateAggregatorHandoffForApproval(
       freshnessEvidenceAt: plan.quoteReceivedAt,
       freshnessLimitMs: executionQuoteAgeLimit(plan),
     });
-    if (!unsignedSimulation.passed) throw new Error(`Aggregator unsigned simulation failed: ${JSON.stringify(unsignedSimulation.error)}`);
+    if (!unsignedSimulation.passed) {
+      const detail = describeSimulationFailure(unsignedSimulation.error, unsignedSimulation.logs, plan.instructions);
+      throw new Error(`Aggregator unsigned simulation failed: ${JSON.stringify(unsignedSimulation.error)} | ${detail.summary}`);
+    }
     logExecutionStage(identity, 'SIMULATION_PASS', candidate.detectedAt, {
       unitsConsumed: unsignedSimulation.unitsConsumed,
       executorToSimulationMs: unsignedSimulation.timing.simulationResponseAt - plan.quoteReceivedAt,

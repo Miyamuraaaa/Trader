@@ -85,7 +85,10 @@ export class QuoteProviderRuntime {
       const semanticKey = semanticQuoteKey(this.provider, params);
       const cached = this.cache.get(semanticKey);
       return this.admission.request(params, (deadline) => this.run(semanticKey, () => this.admission.dispatch(deadline, task), priority, undefined, deadline),
-        cached && cached.expiresAt > Date.now() ? cached.quote : undefined);
+        cached && cached.expiresAt > Date.now() ? cached.quote : undefined)
+        // Admission may return one cached/coalesced object to several callers.
+        // Every delivery gets its own evidence id, as jupiter.ts/raptor.ts do.
+        .then((quote) => ({ ...quote, id: crypto.randomUUID() }));
     }
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
